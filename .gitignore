@@ -39,6 +39,10 @@ Thumbs.db
 
 # Skill runtime config (may contain sensitive values)
 **/config.json
+skills/polymarket-weather-trader/data/paper_trading/state.json
+skills/polymarket-weather-trader/data/research/weather_dataset/*.json
+skills/polymarket-weather-trader/data/research/weather_dataset/*.csv
+skills/polymarket-weather-trader/data/research/.DS_Store
 
 # Claude Code (worktrees, temporary files)
 .claude/
