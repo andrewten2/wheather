@@ -73,6 +73,7 @@ from trader.portfolio.paper_trader import PaperTrader
 from trader.research.backtester import WeatherBacktester, load_json_dataset
 from trader.research.dataset_recorder import (
     DatasetRecorder,
+    build_event_ladder_snapshot,
     build_forecast_snapshot,
     build_market_snapshot,
     build_raw_market_snapshot,
@@ -919,6 +920,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     execution_errors = []
     recorded_forecasts = {}
     recorded_markets = []
+    recorded_event_ladders = []
 
     for event_id, event_markets in events.items():
         # Use event_name from API if available, otherwise parse from question
@@ -957,6 +959,15 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             if provider_error:
                 log(f"  ↪ Forecast provider error: {provider_error}")
             if record_dataset:
+                ladder_snapshot = build_event_ladder_snapshot(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    event_markets=event_markets,
+                    event_info=event_info,
+                    forecast=None,
+                )
+                if ladder_snapshot is not None:
+                    recorded_event_ladders.append(ladder_snapshot)
+            if record_dataset:
                 available_dates = forecast_provider.get_available_forecast_dates(location)
                 for raw_market in event_markets:
                     recorded_markets.append(
@@ -984,6 +995,14 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 forecast=forecast,
             )
+            ladder_snapshot = build_event_ladder_snapshot(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event_markets=event_markets,
+                event_info=event_info,
+                forecast=forecast,
+            )
+            if ladder_snapshot is not None:
+                recorded_event_ladders.append(ladder_snapshot)
 
         candidate = select_candidate_trade(
             event_markets=event_markets,
@@ -1194,6 +1213,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 timestamp=step_timestamp,
                 forecasts=list(recorded_forecasts.values()),
                 markets=recorded_markets,
+                event_ladders=recorded_event_ladders,
                 metadata={
                     "execution_mode": execution_mode.value,
                     "entry_threshold": ENTRY_THRESHOLD,

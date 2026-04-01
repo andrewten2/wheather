@@ -14,6 +14,8 @@ from trader.research.replay_types import (
     BacktestRunResult,
     BacktestStepResult,
     BacktestTradeRecord,
+    HistoricalEventBucketSnapshot,
+    HistoricalEventLadderSnapshot,
     HistoricalForecastSnapshot,
     HistoricalMarketSnapshot,
     HistoricalReplayStep,
@@ -41,11 +43,32 @@ def load_json_dataset(path: str) -> List[HistoricalReplayStep]:
             HistoricalMarketSnapshot(**market)
             for market in step.get("markets", [])
         ]
+        event_ladders = []
+        for ladder in step.get("event_ladders", []):
+            buckets = [
+                HistoricalEventBucketSnapshot(**bucket)
+                for bucket in ladder.get("buckets", [])
+            ]
+            event_ladders.append(
+                HistoricalEventLadderSnapshot(
+                    timestamp=ladder["timestamp"],
+                    event_id=ladder.get("event_id"),
+                    event_name=ladder.get("event_name", ""),
+                    location=ladder.get("location"),
+                    target_date=ladder.get("target_date"),
+                    metric=ladder.get("metric"),
+                    forecast_temp=ladder.get("forecast_temp"),
+                    forecast_unit=ladder.get("forecast_unit"),
+                    buckets=buckets,
+                    metadata=ladder.get("metadata", {}),
+                )
+            )
         steps.append(
             HistoricalReplayStep(
                 timestamp=step["timestamp"],
                 forecasts=forecasts,
                 markets=markets,
+                event_ladders=event_ladders,
                 metadata=step.get("metadata", {}),
             )
         )

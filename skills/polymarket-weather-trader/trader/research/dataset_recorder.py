@@ -8,6 +8,8 @@ from typing import Optional
 
 from trader.markets.market_parser import build_weather_market, parse_temperature_bucket
 from trader.research.replay_types import (
+    HistoricalEventBucketSnapshot,
+    HistoricalEventLadderSnapshot,
     HistoricalForecastSnapshot,
     HistoricalMarketSnapshot,
     HistoricalReplayStep,
@@ -176,5 +178,48 @@ def build_raw_market_snapshot(
             "metric": (event_info or {}).get("metric"),
             "reason": reason,
             "available_forecast_dates": available_forecast_dates or [],
+        },
+    )
+
+
+def build_event_ladder_snapshot(
+    timestamp: str,
+    event_markets: list,
+    event_info: Optional[dict] = None,
+    forecast=None,
+) -> Optional[HistoricalEventLadderSnapshot]:
+    if not event_markets:
+        return None
+
+    first_market = build_weather_market(event_markets[0])
+    buckets = []
+    for raw_market in event_markets:
+        market = build_weather_market(raw_market)
+        bucket = parse_temperature_bucket(market.outcome_name)
+        buckets.append(
+            HistoricalEventBucketSnapshot(
+                market_id=market.market_id,
+                outcome_name=market.outcome_name,
+                price_yes=market.price_yes,
+                bucket_low=None if bucket is None else bucket.low,
+                bucket_high=None if bucket is None else bucket.high,
+                bucket_type=None if bucket is None else bucket.bucket_type,
+                raw_market=dict(market.raw_market or {}),
+            )
+        )
+
+    return HistoricalEventLadderSnapshot(
+        timestamp=timestamp,
+        event_id=first_market.event_id,
+        event_name=first_market.event_name,
+        location=(event_info or {}).get("location"),
+        target_date=(event_info or {}).get("date"),
+        metric=(event_info or {}).get("metric"),
+        forecast_temp=None if forecast is None else forecast.predicted_value,
+        forecast_unit=None if forecast is None else forecast.unit,
+        buckets=buckets,
+        metadata={
+            "bucket_count": len(buckets),
+            "forecast_available": forecast is not None,
         },
     )

@@ -32,10 +32,36 @@ class HistoricalMarketSnapshot:
 
 
 @dataclass
+class HistoricalEventBucketSnapshot:
+    market_id: str
+    outcome_name: str
+    price_yes: float
+    bucket_low: Optional[float] = None
+    bucket_high: Optional[float] = None
+    bucket_type: Optional[str] = None
+    raw_market: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HistoricalEventLadderSnapshot:
+    timestamp: str
+    event_id: Optional[str]
+    event_name: str
+    location: Optional[str]
+    target_date: Optional[str]
+    metric: Optional[str]
+    forecast_temp: Optional[float]
+    forecast_unit: Optional[str] = None
+    buckets: List[HistoricalEventBucketSnapshot] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class HistoricalReplayStep:
     timestamp: str
     forecasts: List[HistoricalForecastSnapshot] = field(default_factory=list)
     markets: List[HistoricalMarketSnapshot] = field(default_factory=list)
+    event_ladders: List[HistoricalEventLadderSnapshot] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
