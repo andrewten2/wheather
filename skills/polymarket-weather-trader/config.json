@@ -1,3 +1,4 @@
 {
-  "max_position_usd": 2.0
+  "max_position_usd": 2.0,
+  "locations": "NYC,Chicago,Seattle,Atlanta,Dallas,Miami"
 }

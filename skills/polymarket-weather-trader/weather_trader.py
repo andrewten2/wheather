@@ -20,10 +20,18 @@ import sys
 import re
 import json
 import argparse
-from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from dataclasses import asdict
+from typing import Optional
+from datetime import date, datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
+
+# Make local repo imports work when running this script directly from the checkout.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if (REPO_ROOT / "simmer_sdk").exists() and str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Force line-buffered stdout so output is visible in non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
@@ -47,6 +55,44 @@ except ImportError:
 # =============================================================================
 
 from simmer_sdk.skill import load_config, update_config, get_config_path
+from trader.adapters.simmer_client import SimmerAdapter, discover_and_import_weather_markets
+from trader.execution.execution_engine import ExecutionEngine
+from trader.models.execution import ExecutionMode
+from trader.forecasting.forecast_provider import ForecastProvider
+from trader.markets.market_parser import (
+    parse_weather_event as parse_weather_event_model,
+    parse_temperature_bucket as parse_temperature_bucket_model,
+)
+from trader.markets.market_selector import group_markets_by_event, select_candidate_trade
+from trader.portfolio.position_manager import (
+    filter_weather_positions,
+    find_position,
+    load_positions,
+)
+from trader.portfolio.paper_trader import PaperTrader
+from trader.research.backtester import WeatherBacktester, load_json_dataset
+from trader.research.dataset_recorder import (
+    DatasetRecorder,
+    build_event_ladder_snapshot,
+    build_forecast_snapshot,
+    build_market_snapshot,
+    build_raw_market_snapshot,
+)
+from trader.research.experiment_runner import (
+    ExperimentRunner,
+    default_comparison_specs,
+    load_experiment_config,
+    save_comparison_csv,
+    save_comparison_json,
+)
+from trader.research.replay_types import HistoricalReplayStep
+from trader.risk.risk_manager import (
+    evaluate_context_safeguards,
+    validate_minimum_position_size,
+)
+from trader.strategy.probability_model import DEFAULT_SIGMA_SCHEDULE, create_probability_model
+from trader.strategy.signal_engine import build_entry_signal
+from trader.telemetry.logger import StructuredLogger
 
 # Configuration schema
 # Note: env var names match autotune registry. Legacy aliases (SIMMER_WEATHER_ENTRY,
@@ -74,6 +120,16 @@ CONFIG_SCHEMA = {
                           "help": "Min allocation floor from vol targeting (stay in market during high vol)."},
     "vol_span":          {"env": "SIMMER_WEATHER_VOL_SPAN",          "default": 10,    "type": int,
                           "help": "EWMA span for volatility calculation (lower = more responsive)."},
+    "probability_model": {"env": "SIMMER_WEATHER_PROBABILITY_MODEL", "default": "constant", "type": str,
+                          "help": "Probability model to use: constant (default) or gaussian."},
+    "temperature_sigma": {"env": "SIMMER_WEATHER_TEMPERATURE_SIGMA", "default": 2.5, "type": float,
+                          "help": "Gaussian temperature model sigma in degrees."},
+    "min_model_probability": {"env": "SIMMER_WEATHER_MIN_MODEL_PROBABILITY", "default": 0.01, "type": float,
+                              "help": "Lower floor applied to model probability estimates."},
+    "model_name":        {"env": "SIMMER_WEATHER_MODEL_NAME",        "default": "gaussian_temperature", "type": str,
+                          "help": "Optional display name for the selected probability model."},
+    "sigma_schedule":    {"env": "SIMMER_WEATHER_SIGMA_SCHEDULE",    "default": "", "type": str,
+                          "help": "Optional JSON sigma schedule for horizon-aware Gaussian model."},
 }
 
 # Backwards-compatible env var aliases (old name -> new name)
@@ -93,26 +149,161 @@ _config = load_config(CONFIG_SCHEMA, __file__, slug="polymarket-weather-trader")
 NOAA_API_BASE = "https://api.weather.gov"
 ORDER_TYPE = (_config.get("order_type") or "GTC").upper()
 
-# SimmerClient singleton
-_client = None
+# SDK adapter / execution singletons
+_adapter = None
+_execution_engine = None
+_forecast_provider = None
+_paper_trader = None
+_probability_model = None
+_dataset_recorder = None
 
-def get_client(live=True):
-    """Lazy-init SimmerClient singleton."""
-    global _client
-    if _client is None:
-        try:
-            from simmer_sdk import SimmerClient
-        except ImportError:
-            print("Error: simmer-sdk not installed. Run: pip install simmer-sdk")
-            sys.exit(1)
-        api_key = os.environ.get("SIMMER_API_KEY")
-        if not api_key:
-            print("Error: SIMMER_API_KEY environment variable not set")
-            print("Get your API key from: simmer.markets/dashboard -> SDK tab")
-            sys.exit(1)
-        venue = os.environ.get("TRADING_VENUE", "polymarket")
-        _client = SimmerClient(api_key=api_key, venue=venue, live=live)
-    return _client
+def get_adapter(live=True):
+    """Lazy-init SDK adapter singleton."""
+    global _adapter
+    if _adapter is None:
+        _adapter = SimmerAdapter.from_env(live=live)
+    return _adapter
+
+def get_execution_engine(live=True, forced_mode=None, logger=None):
+    """Lazy-init execution engine singleton."""
+    global _execution_engine
+    if _execution_engine is None:
+        _execution_engine = ExecutionEngine(
+            adapter=get_adapter(live=live),
+            trade_source=TRADE_SOURCE,
+            skill_slug=SKILL_SLUG,
+            order_type=ORDER_TYPE,
+            forced_mode=forced_mode,
+            paper_trader=get_paper_trader() if forced_mode == ExecutionMode.PAPER else None,
+            logger=logger,
+        )
+    return _execution_engine
+
+
+def get_forecast_provider():
+    """Lazy-init forecast provider singleton."""
+    global _forecast_provider
+    if _forecast_provider is None:
+        _forecast_provider = ForecastProvider(
+            locations=LOCATIONS,
+            international_locations=INTERNATIONAL_LOCATIONS,
+            noaa_api_base=NOAA_API_BASE,
+            open_meteo_base=OPEN_METEO_BASE,
+        )
+    return _forecast_provider
+
+
+def get_paper_trader():
+    """Lazy-init paper trader singleton."""
+    global _paper_trader
+    if _paper_trader is None:
+        state_dir = Path(__file__).resolve().parent / "data" / "paper_trading"
+        _paper_trader = PaperTrader(state_dir=state_dir)
+    return _paper_trader
+
+
+def get_probability_model():
+    """Lazy-init probability model singleton."""
+    global _probability_model
+    if _probability_model is None:
+        sigma_schedule = None
+        raw_schedule = _config.get("sigma_schedule", "")
+        if raw_schedule:
+            try:
+                sigma_schedule = json.loads(raw_schedule) if isinstance(raw_schedule, str) else raw_schedule
+            except Exception:
+                sigma_schedule = None
+        if sigma_schedule is None and _config.get("probability_model", "constant") == "gaussian":
+            sigma_schedule = DEFAULT_SIGMA_SCHEDULE
+        _probability_model = create_probability_model({
+            "probability_model": _config.get("probability_model", "constant"),
+            "temperature_sigma": _config.get("temperature_sigma", 2.5),
+            "min_model_probability": _config.get("min_model_probability", 0.01),
+            "model_name": _config.get("model_name", "gaussian_temperature"),
+            "sigma_schedule": sigma_schedule,
+            "constant_probability": 0.85,
+        })
+    return _probability_model
+
+
+def get_dataset_recorder(output_path: str = None, logger=None):
+    """Lazy-init dataset recorder singleton."""
+    global _dataset_recorder
+    if _dataset_recorder is None:
+        default_path = Path(__file__).resolve().parent / "data" / "research" / "weather_dataset" / "recorded_dataset.json"
+        _dataset_recorder = DatasetRecorder(output_path=Path(output_path) if output_path else default_path, logger=logger)
+    elif output_path is not None:
+        _dataset_recorder.output_path = Path(output_path)
+        _dataset_recorder.output_path.parent.mkdir(parents=True, exist_ok=True)
+        _dataset_recorder.logger = logger or _dataset_recorder.logger
+    elif logger is not None:
+        _dataset_recorder.logger = logger
+    return _dataset_recorder
+
+
+def run_backtest(backtest_file: str, quiet: bool = False) -> dict:
+    """Run deterministic replay from a local JSON dataset."""
+    logger = StructuredLogger(quiet=quiet)
+    probability_model = get_probability_model()
+    steps = load_json_dataset(backtest_file)
+    backtester = WeatherBacktester(
+        probability_model=probability_model,
+        location_aliases=LOCATION_ALIASES,
+        active_locations=ACTIVE_LOCATIONS,
+        entry_threshold=ENTRY_THRESHOLD,
+        exit_threshold=EXIT_THRESHOLD,
+        max_position_usd=MAX_POSITION_USD,
+        smart_sizing_pct=SMART_SIZING_PCT,
+        max_trades_per_run=MAX_TRADES_PER_RUN,
+        min_shares_per_order=MIN_SHARES_PER_ORDER,
+        min_tick_size=MIN_TICK_SIZE,
+        slippage_max_pct=SLIPPAGE_MAX_PCT,
+        min_liquidity_usd=MIN_LIQUIDITY_USD,
+        time_to_resolution_min_hours=TIME_TO_RESOLUTION_MIN_HOURS,
+        binary_only=BINARY_ONLY,
+        use_safeguards=True,
+        smart_sizing=False,
+        logger=logger,
+    )
+    result = backtester.run(steps=steps, initial_cash=1000.0)
+    return result.to_dict()
+
+
+def run_model_comparison(
+    backtest_file: str,
+    quiet: bool = False,
+    experiment_config: str = None,
+    output_json: str = None,
+    output_csv: str = None,
+) -> dict:
+    """Run a multi-model comparison on the same historical dataset."""
+    logger = StructuredLogger(quiet=quiet)
+    runner = ExperimentRunner(
+        dataset_path=backtest_file,
+        location_aliases=LOCATION_ALIASES,
+        active_locations=ACTIVE_LOCATIONS,
+        entry_threshold=ENTRY_THRESHOLD,
+        exit_threshold=EXIT_THRESHOLD,
+        max_position_usd=MAX_POSITION_USD,
+        smart_sizing_pct=SMART_SIZING_PCT,
+        max_trades_per_run=MAX_TRADES_PER_RUN,
+        min_shares_per_order=MIN_SHARES_PER_ORDER,
+        min_tick_size=MIN_TICK_SIZE,
+        slippage_max_pct=SLIPPAGE_MAX_PCT,
+        min_liquidity_usd=MIN_LIQUIDITY_USD,
+        time_to_resolution_min_hours=TIME_TO_RESOLUTION_MIN_HOURS,
+        binary_only=BINARY_ONLY,
+        use_safeguards=True,
+        smart_sizing=False,
+        logger=logger,
+    )
+    experiments = load_experiment_config(experiment_config) if experiment_config else default_comparison_specs()
+    result = runner.run(experiments=experiments, initial_cash=1000.0)
+    if output_json:
+        save_comparison_json(result, output_json)
+    if output_csv:
+        save_comparison_csv(result, output_csv)
+    return result.to_dict()
 
 # Source tag for tracking
 TRADE_SOURCE = "sdk:weather"
@@ -169,6 +360,23 @@ LOCATIONS = {
 _locations_str = _config["locations"]
 ACTIVE_LOCATIONS = [loc.strip().upper() for loc in _locations_str.split(",") if loc.strip()]
 
+LOCATION_ALIASES = {
+    "nyc": "NYC", "new york": "NYC", "laguardia": "NYC", "la guardia": "NYC",
+    "chicago": "Chicago", "o'hare": "Chicago", "ohare": "Chicago",
+    "seattle": "Seattle", "sea-tac": "Seattle",
+    "atlanta": "Atlanta", "hartsfield": "Atlanta",
+    "dallas": "Dallas", "dfw": "Dallas",
+    "miami": "Miami",
+    "tel aviv": "Tel Aviv",
+    "munich": "Munich",
+    "london": "London",
+    "tokyo": "Tokyo",
+    "seoul": "Seoul",
+    "ankara": "Ankara",
+    "lucknow": "Lucknow",
+    "wellington": "Wellington",
+}
+
 # =============================================================================
 # NOAA Weather API
 # =============================================================================
@@ -189,133 +397,18 @@ INTERNATIONAL_LOCATIONS = {
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 
 def get_openmeteo_forecast(city: str) -> dict:
-    """Get Open-Meteo forecast for an international city.
-    Returns dict with date -> {"high_c": temp, "low_c": temp} in Celsius.
-    """
-    loc = INTERNATIONAL_LOCATIONS.get(city)
-    if not loc:
-        return {}
-
-    params = (
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&daily=temperature_2m_max,temperature_2m_min"
-        f"&temperature_unit=celsius"
-        f"&timezone={loc['tz'].replace('/', '%2F')}"
-        f"&forecast_days=10"
-    )
-    url = OPEN_METEO_BASE + params
-    try:
-        from urllib.request import urlopen
-        import json as _json
-        with urlopen(url, timeout=15) as resp:
-            data = _json.loads(resp.read().decode())
-    except Exception as e:
-        print(f"  Open-Meteo error for {city}: {e}")
-        return {}
-
-    daily = data.get("daily", {})
-    dates = daily.get("time", [])
-    highs = daily.get("temperature_2m_max", [])
-    lows  = daily.get("temperature_2m_min", [])
-
-    forecasts = {}
-    for d, h, l in zip(dates, highs, lows):
-        forecasts[d] = {
-            "high_c": round(h) if h is not None else None,
-            "low_c":  round(l) if l is not None else None,
-        }
-    return forecasts
+    """Compatibility wrapper for forecast provider."""
+    return get_forecast_provider().get_openmeteo_forecast(city)
 
 
 def fetch_json(url, headers=None):
-    """Fetch JSON from URL with error handling."""
-    try:
-        req = Request(url, headers=headers or {})
-        with urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode())
-    except HTTPError as e:
-        print(f"  HTTP Error {e.code}: {url}")
-        return None
-    except URLError as e:
-        print(f"  URL Error: {e.reason}")
-        return None
-    except Exception as e:
-        print(f"  Error fetching {url}: {e}")
-        return None
+    """Compatibility wrapper for forecast provider."""
+    return get_forecast_provider().fetch_json(url, headers=headers)
 
 
 def get_noaa_forecast(location: str) -> dict:
-    """Get NOAA forecast for a location. Returns dict with date -> {"high": temp, "low": temp}"""
-    if location not in LOCATIONS:
-        print(f"  Unknown location: {location}")
-        return {}
-
-    loc = LOCATIONS[location]
-    headers = {
-        "User-Agent": "SimmerWeatherSkill/1.0 (https://simmer.markets)",
-        "Accept": "application/geo+json",
-    }
-
-    points_url = f"{NOAA_API_BASE}/points/{loc['lat']},{loc['lon']}"
-    points_data = fetch_json(points_url, headers)
-
-    if not points_data or "properties" not in points_data:
-        print(f"  Failed to get NOAA grid for {location}")
-        return {}
-
-    forecast_url = points_data["properties"].get("forecast")
-    if not forecast_url:
-        print(f"  No forecast URL for {location}")
-        return {}
-
-    forecast_data = fetch_json(forecast_url, headers)
-    if not forecast_data or "properties" not in forecast_data:
-        print(f"  Failed to get NOAA forecast for {location}")
-        return {}
-
-    periods = forecast_data["properties"].get("periods", [])
-    forecasts = {}
-
-    for period in periods:
-        start_time = period.get("startTime", "")
-        if not start_time:
-            continue
-
-        date_str = start_time[:10]
-        temp = period.get("temperature")
-        is_daytime = period.get("isDaytime", True)
-
-        if date_str not in forecasts:
-            forecasts[date_str] = {"high": None, "low": None}
-
-        if is_daytime:
-            forecasts[date_str]["high"] = temp
-        else:
-            forecasts[date_str]["low"] = temp
-
-    # Supplement with NOAA observations for today (D+0)
-    # /forecast often starts from the next period, missing today's daytime high
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if today_str not in forecasts or forecasts[today_str].get("high") is None:
-        station_id = loc.get("station")
-        if station_id:
-            try:
-                obs_url = f"{NOAA_API_BASE}/stations/{station_id}/observations/latest"
-                obs_data = fetch_json(obs_url, headers)
-                if obs_data and "properties" in obs_data:
-                    temp_c = obs_data["properties"].get("temperature", {}).get("value")
-                    if temp_c is not None:
-                        temp_f = round(temp_c * 9 / 5 + 32)
-                        if today_str not in forecasts:
-                            forecasts[today_str] = {"high": None, "low": None}
-                        if forecasts[today_str]["high"] is None:
-                            forecasts[today_str]["high"] = temp_f
-                        if forecasts[today_str]["low"] is None:
-                            forecasts[today_str]["low"] = temp_f
-            except Exception:
-                pass  # Observation fetch is best-effort
-
-    return forecasts
+    """Compatibility wrapper for forecast provider."""
+    return get_forecast_provider().get_noaa_forecast(location)
 
 
 # =============================================================================
@@ -324,111 +417,16 @@ def get_noaa_forecast(location: str) -> dict:
 
 def parse_weather_event(event_name: str) -> dict:
     """Parse weather event name to extract location, date, metric."""
-    if not event_name:
-        return None
-
-    event_lower = event_name.lower()
-
-    if 'highest' in event_lower or 'high temp' in event_lower:
-        metric = 'high'
-    elif 'lowest' in event_lower or 'low temp' in event_lower:
-        metric = 'low'
-    else:
-        metric = 'high'
-
-    location = None
-    location_aliases = {
-        'nyc': 'NYC', 'new york': 'NYC', 'laguardia': 'NYC', 'la guardia': 'NYC',
-        'chicago': 'Chicago', "o'hare": 'Chicago', 'ohare': 'Chicago',
-        'seattle': 'Seattle', 'sea-tac': 'Seattle',
-        'atlanta': 'Atlanta', 'hartsfield': 'Atlanta',
-        'dallas': 'Dallas', 'dfw': 'Dallas',
-        'miami': 'Miami',
-        # International cities (Open-Meteo)
-        'tel aviv': 'Tel Aviv',
-        'munich': 'Munich',
-        'london': 'London',
-        'tokyo': 'Tokyo',
-        'seoul': 'Seoul',
-        'ankara': 'Ankara',
-        'lucknow': 'Lucknow',
-        'wellington': 'Wellington',
-    }
-
-    for alias, loc in location_aliases.items():
-        if alias in event_lower:
-            location = loc
-            break
-
-    if not location:
-        return None
-
-    # Detect temperature unit from event name
-    temp_unit = 'C' if '°c' in event_lower or re.search(r'\d+°?c\b', event_lower, re.IGNORECASE) else 'F'
-
-    month_day_match = re.search(r'on\s+([a-zA-Z]+)\s+(\d{1,2})', event_name, re.IGNORECASE)
-    if not month_day_match:
-        return None
-
-    month_name = month_day_match.group(1).lower()
-    day = int(month_day_match.group(2))
-
-    month_map = {
-        'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
-        'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6, 'july': 7, 'jul': 7,
-        'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'october': 10, 'oct': 10,
-        'november': 11, 'nov': 11, 'december': 12, 'dec': 12,
-    }
-
-    month = month_map.get(month_name)
-    if not month:
-        return None
-
-    now = datetime.now(timezone.utc)
-    year = now.year
-    try:
-        target_date = datetime(year, month, day, tzinfo=timezone.utc)
-        if target_date < now - timedelta(days=7):
-            year += 1
-        date_str = f"{year}-{month:02d}-{day:02d}"
-    except ValueError:
-        return None
-
-    return {"location": location, "date": date_str, "metric": metric, "unit": temp_unit}
+    return parse_weather_event_model(event_name, LOCATION_ALIASES, min_date=date.today())
 
 
 def parse_temperature_bucket(outcome_name: str) -> tuple:
     """Parse temperature bucket from outcome name. Works for both °F and °C markets,
     including single-degree exact buckets (e.g. '22°C') and ranges (e.g. '54-55°F')."""
-    if not outcome_name:
+    bucket = parse_temperature_bucket_model(outcome_name)
+    if not bucket:
         return None
-
-    below_match = re.search(r'(\d+)\s*°?[fFcC]?\s*(or below|or less)', outcome_name, re.IGNORECASE)
-    if below_match:
-        return (-999, int(below_match.group(1)))
-
-    above_match = re.search(r'(\d+)\s*°?[fFcC]?\s*(or higher|or above|or more)', outcome_name, re.IGNORECASE)
-    if above_match:
-        return (int(above_match.group(1)), 999)
-
-    range_match = re.search(r'(\d+)\s*(?:°?\s*[fFcC])?\s*(?:-|–|to)\s*(\d+)', outcome_name)
-    if range_match:
-        low, high = int(range_match.group(1)), int(range_match.group(2))
-        return (min(low, high), max(low, high))
-
-    # Single exact-degree bucket: "be 22°C on" or "22°F"
-    exact_match = re.search(r'\b(\d+)\s*°[fFcC]\b', outcome_name)
-    if exact_match:
-        t = int(exact_match.group(1))
-        return (t, t)
-
-    # Bare integer in short outcome names like "22°C"
-    bare_match = re.match(r'^\s*(\d+)\s*°?[cCfF]?\s*$', outcome_name.strip())
-    if bare_match:
-        t = int(bare_match.group(1))
-        return (t, t)
-
-    return None
+    return (bucket.low, bucket.high)
 
 
 # =============================================================================
@@ -442,7 +440,10 @@ def parse_temperature_bucket(outcome_name: str) -> tuple:
 def get_portfolio() -> dict:
     """Get portfolio summary from SDK."""
     try:
-        return get_client().get_portfolio()
+        execution_engine = get_execution_engine()
+        if execution_engine.get_mode() == ExecutionMode.PAPER:
+            return get_paper_trader().get_portfolio(get_adapter())
+        return get_adapter().get_portfolio()
     except Exception as e:
         print(f"  ⚠️  Portfolio fetch failed: {e}")
         return None
@@ -451,10 +452,7 @@ def get_portfolio() -> dict:
 def get_market_context(market_id: str, my_probability: float = None) -> dict:
     """Get market context with safeguards and optional edge analysis."""
     try:
-        if my_probability is not None:
-            return get_client()._request("GET", f"/api/sdk/context/{market_id}",
-                                         params={"my_probability": my_probability})
-        return get_client().get_market_context(market_id)
+        return get_adapter().get_market_context(market_id, my_probability=my_probability)
     except Exception:
         return None
 
@@ -462,7 +460,7 @@ def get_market_context(market_id: str, my_probability: float = None) -> dict:
 def get_price_history(market_id: str) -> list:
     """Get price history for trend detection."""
     try:
-        return get_client().get_price_history(market_id)
+        return get_adapter().get_price_history(market_id)
     except Exception:
         return []
 
@@ -475,77 +473,14 @@ def check_context_safeguards(context: dict, use_edge: bool = True) -> tuple:
         context: Context response from SDK
         use_edge: If True, respect edge recommendation (TRADE/HOLD/SKIP)
     """
-    if not context:
-        return True, []  # No context = proceed (fail open)
-
-    reasons = []
-    market = context.get("market", {})
-    warnings = context.get("warnings", [])
-    discipline = context.get("discipline", {})
-    slippage = context.get("slippage", {})
-    edge = context.get("edge", {})
-
-    # Check for deal-breakers in warnings
-    for warning in warnings:
-        if "MARKET RESOLVED" in str(warning).upper():
-            return False, ["Market already resolved"]
-
-    # Check flip-flop warning
-    warning_level = discipline.get("warning_level", "none")
-    if warning_level == "severe":
-        return False, [f"Severe flip-flop warning: {discipline.get('flip_flop_warning', '')}"]
-    elif warning_level == "mild":
-        reasons.append("Mild flip-flop warning (proceed with caution)")
-
-    # Check time to resolution
-    time_str = market.get("time_to_resolution", "")
-    if time_str:
-        try:
-            hours = 0
-            if "d" in time_str:
-                days = int(time_str.split("d")[0].strip())
-                hours += days * 24
-            if "h" in time_str:
-                h_part = time_str.split("h")[0]
-                if "d" in h_part:
-                    h_part = h_part.split("d")[-1].strip()
-                hours += int(h_part)
-
-            if hours < TIME_TO_RESOLUTION_MIN_HOURS:
-                return False, [f"Resolves in {hours}h - too soon"]
-        except (ValueError, IndexError):
-            pass
-
-    # Check liquidity (pre-filter before slippage, avoids wasting a context call)
-    if MIN_LIQUIDITY_USD > 0:
-        liquidity = market.get("liquidity", 0) or 0
-        if liquidity < MIN_LIQUIDITY_USD:
-            return False, [f"Liquidity too low: ${liquidity:.0f} < ${MIN_LIQUIDITY_USD:.0f} min"]
-
-    # Check slippage
-    estimates = slippage.get("estimates", []) if slippage else []
-    if estimates:
-        slippage_pct = estimates[0].get("slippage_pct", 0)
-        if slippage_pct > SLIPPAGE_MAX_PCT:
-            return False, [f"Slippage too high: {slippage_pct:.1%} (max {SLIPPAGE_MAX_PCT:.0%})"]
-
-    # Check edge recommendation (if available and use_edge=True)
-    if use_edge and edge:
-        recommendation = edge.get("recommendation")
-        user_edge = edge.get("user_edge")
-        threshold = edge.get("suggested_threshold", 0)
-        
-        if recommendation == "SKIP":
-            return False, ["Edge analysis: SKIP (market resolved or invalid)"]
-        elif recommendation == "HOLD":
-            if user_edge is not None and threshold:
-                reasons.append(f"Edge {user_edge:.1%} below threshold {threshold:.1%} - marginal opportunity")
-            else:
-                reasons.append("Edge analysis recommends HOLD")
-        elif recommendation == "TRADE":
-            reasons.append(f"Edge {user_edge:.1%} ≥ threshold {threshold:.1%} - good opportunity")
-
-    return True, reasons
+    decision = evaluate_context_safeguards(
+        context=context,
+        slippage_max_pct=SLIPPAGE_MAX_PCT,
+        min_liquidity_usd=MIN_LIQUIDITY_USD,
+        time_to_resolution_min_hours=TIME_TO_RESOLUTION_MIN_HOURS,
+        use_edge=use_edge,
+    )
+    return decision.allowed, decision.reasons + decision.warnings
 
 
 def detect_price_trend(history: list) -> dict:
@@ -582,7 +517,7 @@ def detect_price_trend(history: list) -> dict:
 
 import math
 
-def calculate_ewma_vol(history: list, span: int = 10) -> float | None:
+def calculate_ewma_vol(history: list, span: int = 10) -> Optional[float]:
     """
     Calculate annualized EWMA volatility from price history points.
 
@@ -620,7 +555,7 @@ def calculate_ewma_vol(history: list, span: int = 10) -> float | None:
     return annualized
 
 
-def apply_vol_targeting(base_size: float, current_vol: float | None,
+def apply_vol_targeting(base_size: float, current_vol: Optional[float],
                         target_vol: float = TARGET_VOL,
                         max_leverage: float = VOL_MAX_LEVERAGE,
                         min_allocation: float = VOL_MIN_ALLOCATION) -> tuple:
@@ -653,7 +588,6 @@ def apply_vol_targeting(base_size: float, current_vol: float | None,
 
     return round(base_size * leverage, 2), meta
 
-
 # =============================================================================
 # Market Discovery - Auto-import from Polymarket
 # =============================================================================
@@ -676,63 +610,6 @@ LOCATION_SEARCH_TERMS = {
     "Miami": ["temperature miami"],
 }
 
-
-def discover_and_import_weather_markets(log=print):
-    """Discover weather markets on Polymarket and auto-import to Simmer.
-
-    Searches the importable markets endpoint for weather events matching
-    ACTIVE_LOCATIONS, then imports any that aren't already in Simmer.
-
-    Returns count of newly imported markets.
-    """
-    client = get_client()
-    imported_count = 0
-    seen_urls = set()
-
-    for location in ACTIVE_LOCATIONS:
-        search_terms = LOCATION_SEARCH_TERMS.get(location, [f"temperature {location.lower()}"])
-
-        for term in search_terms:
-            try:
-                results = client.list_importable_markets(
-                    q=term, venue="polymarket", min_volume=1000, limit=20
-                )
-            except Exception as e:
-                log(f"  Discovery search failed for '{term}': {e}")
-                continue
-
-            for m in results:
-                url = m.get("url", "")
-                question = (m.get("question") or "").lower()
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-
-                # Filter: must be a temperature market on Polymarket
-                if "temperature" not in question:
-                    continue
-                if not url.startswith("https://polymarket.com/"):
-                    continue
-
-                # Try to import
-                try:
-                    result = client.import_market(url)
-                    status = result.get("status", "") if result else ""
-                    if status == "imported":
-                        imported_count += 1
-                        log(f"  Imported: {m.get('question', url)[:70]}")
-                    elif status == "already_exists":
-                        pass  # Expected for most
-                except Exception as e:
-                    err_str = str(e)
-                    if "rate limit" in err_str.lower() or "429" in err_str:
-                        log(f"  Import rate limit reached — stopping discovery")
-                        return imported_count
-                    log(f"  Import failed for {url[:50]}: {e}")
-
-    return imported_count
-
-
 # =============================================================================
 # Simmer API - Trading
 # =============================================================================
@@ -740,62 +617,64 @@ def discover_and_import_weather_markets(log=print):
 def fetch_weather_markets():
     """Fetch weather-tagged markets from Simmer API."""
     try:
-        result = get_client()._request("GET", "/api/sdk/markets",
-                                       params={"tags": "weather", "status": "active", "limit": 100})
-        return result.get("markets", [])
+        return get_adapter().fetch_weather_markets()
     except Exception:
         print("  Failed to fetch markets from Simmer API")
         return []
 
 
 def execute_trade(market_id: str, side: str, amount: float, reasoning: str = None, signal_data: dict = None) -> dict:
-    """Execute a buy trade via Simmer SDK with source tagging."""
-    try:
-        result = get_client().trade(
-            market_id=market_id, side=side, amount=amount, source=TRADE_SOURCE, skill_slug=SKILL_SLUG,
-            reasoning=reasoning, signal_data=signal_data, order_type=ORDER_TYPE,
-        )
-        out = {
-            "success": result.success, "trade_id": result.trade_id,
-            "shares_bought": result.shares_bought, "shares": result.shares_bought,
-            "error": result.error, "simulated": result.simulated,
-            "order_status": result.order_status,
-        }
-        if result.order_status == "live":
-            print(f"  [GTC] Order placed on book — waiting for fill (trade {result.trade_id})")
-        return out
-    except Exception as e:
-        return {"error": str(e)}
+    """Execute a buy trade via execution layer with source tagging."""
+    result = get_execution_engine().buy(
+        market_id=market_id,
+        side=side,
+        amount=amount,
+        reasoning=reasoning,
+        signal_data=signal_data,
+    )
+    out = {
+        "success": result.success,
+        "trade_id": result.trade_id,
+        "shares_bought": result.filled_shares,
+        "shares": result.filled_shares,
+        "error": result.error,
+        "simulated": result.simulated,
+        "order_status": result.order_status,
+        "is_submitted_only": result.is_submitted_only,
+        "is_filled": result.is_filled,
+    }
+    if result.is_submitted_only:
+        print(f"  [GTC] Order placed on book — waiting for fill (trade {result.trade_id})")
+    return out
 
 
 def execute_sell(market_id: str, shares: float) -> dict:
-    """Execute a sell trade via Simmer SDK with source tagging."""
-    try:
-        result = get_client().trade(
-            market_id=market_id, side="yes", action="sell",
-            shares=shares, source=TRADE_SOURCE, skill_slug=SKILL_SLUG,
-            order_type=ORDER_TYPE,
-        )
-        out = {
-            "success": result.success, "trade_id": result.trade_id,
-            "error": result.error, "simulated": result.simulated,
-            "order_status": result.order_status,
-        }
-        if result.order_status == "live":
-            print(f"  [GTC] Sell order placed on book — waiting for fill (trade {result.trade_id})")
-        return out
-    except Exception as e:
-        return {"error": str(e)}
+    """Execute a sell trade via execution layer with source tagging."""
+    result = get_execution_engine().sell(market_id=market_id, side="yes", shares=shares)
+    out = {
+        "success": result.success,
+        "trade_id": result.trade_id,
+        "error": result.error,
+        "simulated": result.simulated,
+        "order_status": result.order_status,
+        "is_submitted_only": result.is_submitted_only,
+        "is_filled": result.is_filled,
+    }
+    if result.is_submitted_only:
+        print(f"  [GTC] Sell order placed on book — waiting for fill (trade {result.trade_id})")
+    return out
 
 
 def get_positions(venue: str = None) -> list:
     """Get current positions as list of dicts, filtered by venue."""
     try:
-        client = get_client()
-        # Default to the client's configured venue to avoid cross-venue positions
-        effective_venue = venue or client.venue
-        positions = client.get_positions(venue=effective_venue)
-        from dataclasses import asdict
+        execution_engine = get_execution_engine()
+        positions = load_positions(
+            get_adapter(),
+            venue=venue,
+            execution_mode=execution_engine.get_mode(),
+            paper_trader=get_paper_trader() if execution_engine.get_mode() == ExecutionMode.PAPER else None,
+        )
         return [asdict(p) for p in positions]
     except Exception as e:
         print(f"  Error fetching positions: {e}")
@@ -829,20 +708,18 @@ def calculate_position_size(default_size: float, smart_sizing: bool) -> float:
 # Exit Strategy
 # =============================================================================
 
-def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True) -> tuple:
+def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True, execution_mode: ExecutionMode = None) -> tuple:
     """Check open positions for exit opportunities. Returns: (exits_found, exits_executed)"""
-    positions = get_positions()
+    positions = load_positions(
+        get_adapter(),
+        execution_mode=execution_mode,
+        paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
+    )
 
     if not positions:
         return 0, 0
 
-    weather_positions = []
-    for pos in positions:
-        question = pos.get("question", "").lower()
-        sources = pos.get("sources", [])
-        # Check if from weather skill OR has weather keywords
-        if TRADE_SOURCE in sources or any(kw in question for kw in ["temperature", "°f", "highest temp", "lowest temp"]):
-            weather_positions.append(pos)
+    weather_positions = filter_weather_positions(positions, TRADE_SOURCE)
 
     if not weather_positions:
         return 0, 0
@@ -853,10 +730,10 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True)
     exits_executed = 0
 
     for pos in weather_positions:
-        market_id = pos.get("market_id")
-        current_price = pos.get("current_price") or pos.get("price_yes") or 0
-        shares = pos.get("shares_yes") or pos.get("shares") or 0
-        question = pos.get("question", "Unknown")[:50]
+        market_id = pos.market_id
+        current_price = pos.current_price or 0
+        shares = pos.shares_yes or 0
+        question = pos.question[:50] if pos.question else "Unknown"
 
         if shares < MIN_SHARES_PER_ORDER:
             continue
@@ -877,10 +754,14 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True)
                     print(f"     ⚠️  Warnings: {'; '.join(reasons)}")
 
             # Re-fetch fresh share count to avoid selling more than available
-            fresh_positions = get_positions()
-            fresh_pos = next((p for p in fresh_positions if p.get("market_id") == market_id), None)
+            fresh_positions = load_positions(
+                get_adapter(),
+                execution_mode=execution_mode,
+                paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
+            )
+            fresh_pos = find_position(fresh_positions, market_id)
             if fresh_pos:
-                fresh_shares = fresh_pos.get("shares_yes") or fresh_pos.get("shares") or 0
+                fresh_shares = fresh_pos.shares_yes or 0
                 if fresh_shares < MIN_SHARES_PER_ORDER:
                     print(f"     ⏭️  Skipped: fresh share count {fresh_shares:.1f} below minimum")
                     continue
@@ -922,17 +803,27 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True)
 def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                          show_config: bool = False, smart_sizing: bool = False,
                          use_safeguards: bool = True, use_trends: bool = True,
-                         quiet: bool = False, vol_targeting: bool = VOL_TARGETING):
+                         quiet: bool = False, vol_targeting: bool = VOL_TARGETING,
+                         paper: bool = False, record_dataset: bool = False,
+                         dataset_output: str = None):
     """Run the weather trading strategy."""
+    logger = StructuredLogger(quiet=quiet)
+    if paper:
+        get_paper_trader().logger = logger
+    forecast_provider = get_forecast_provider()
+    probability_model = get_probability_model()
+    dataset_recorder = get_dataset_recorder(output_path=dataset_output, logger=logger) if record_dataset else None
+
     def log(msg, force=False):
         """Print unless quiet mode is on. force=True always prints."""
-        if not quiet or force:
-            print(msg)
+        logger.log(msg, force=force)
 
     log("🌤️  Simmer Weather Trading Skill")
     log("=" * 50)
 
-    if dry_run:
+    if paper:
+        log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
+    elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
 
     log(f"\n⚙️  Configuration:")
@@ -964,8 +855,12 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         log("     SIMMER_WEATHER_ENTRY=0.20")
         return
 
-    # Initialize client early to validate API key
-    get_client(live=not dry_run)
+    # Initialize adapter/execution layer early to validate API key and execution mode
+    forced_mode = ExecutionMode.PAPER if paper else None
+    adapter = get_adapter(live=(paper or not dry_run))
+    execution_engine = get_execution_engine(live=(paper or not dry_run), forced_mode=forced_mode, logger=logger)
+    execution_mode = execution_engine.get_mode()
+    log(f"  Execution mode:  {execution_mode.value}")
 
     # Show portfolio if smart sizing enabled
     if smart_sizing:
@@ -981,18 +876,26 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
     if positions_only:
         log("\n📊 Current Positions:")
-        positions = get_positions()
+        positions = load_positions(
+            adapter,
+            execution_mode=execution_mode,
+            paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
+        )
         if not positions:
             log("  No open positions")
         else:
             for pos in positions:
-                log(f"  • {pos.get('question', 'Unknown')[:50]}...")
-                sources = pos.get('sources', [])
-                log(f"    YES: {pos.get('shares_yes', 0):.1f} | NO: {pos.get('shares_no', 0):.1f} | P&L: ${pos.get('pnl', 0):.2f} | Sources: {sources}")
+                log(f"  • {pos.question[:50]}...")
+                log(f"    YES: {pos.shares_yes:.1f} | NO: {pos.shares_no:.1f} | P&L: ${pos.pnl or 0:.2f} | Sources: {pos.sources}")
         return
 
     log("\n🔍 Discovering new weather markets on Polymarket...")
-    newly_imported = discover_and_import_weather_markets(log=log)
+    newly_imported = discover_and_import_weather_markets(
+        adapter=adapter,
+        active_locations=ACTIVE_LOCATIONS,
+        location_search_terms=LOCATION_SEARCH_TERMS,
+        log=log,
+    )
     if newly_imported:
         log(f"  Auto-imported {newly_imported} new market(s)")
     else:
@@ -1006,26 +909,18 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         log("  No weather markets available")
         return
 
-    events = {}
-    for market in markets:
-        # Group by event_id if available, otherwise derive from question
-        event_key = market.get("event_id")
-        if not event_key:
-            # Fall back: parse question to derive (location, date) grouping key
-            info = parse_weather_event(market.get("event_name") or market.get("question", ""))
-            event_key = f"{info['location']}_{info['date']}" if info else "unknown"
-        if event_key not in events:
-            events[event_key] = []
-        events[event_key].append(market)
+    events = group_markets_by_event(markets, LOCATION_ALIASES, min_date=date.today())
 
     log(f"  Grouped into {len(events)} events")
 
-    forecast_cache = {}
     trades_executed = 0
     total_usd_spent = 0.0
     opportunities_found = 0
     skip_reasons = []
     execution_errors = []
+    recorded_forecasts = {}
+    recorded_markets = []
+    recorded_event_ladders = []
 
     for event_id, event_markets in events.items():
         # Use event_name from API if available, otherwise parse from question
@@ -1051,49 +946,79 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
         # Determine forecast source: NOAA for US cities, Open-Meteo for international
         is_international = location in INTERNATIONAL_LOCATIONS
-        temp_unit = event_info.get("unit", "F")
-
-        if location not in forecast_cache:
+        if not forecast_provider.has_cached_location(location):
             if is_international:
                 log(f"  Fetching Open-Meteo forecast...")
-                raw = get_openmeteo_forecast(location)
-                # Normalise to {"high": temp, "low": temp} using Celsius keys
-                forecast_cache[location] = {
-                    d: {"high": v.get("high_c"), "low": v.get("low_c")}
-                    for d, v in raw.items()
-                }
             else:
                 log(f"  Fetching NOAA forecast...")
-                forecast_cache[location] = get_noaa_forecast(location)
 
-        forecasts = forecast_cache[location]
-        day_forecast = forecasts.get(date_str, {})
-        forecast_temp = day_forecast.get(metric)
-
-        if forecast_temp is None:
+        forecast = forecast_provider.get_forecast(location, date_str, metric)
+        if not forecast:
             log(f"  ⚠️  No forecast available for {date_str}")
+            provider_error = forecast_provider.get_last_error(location)
+            if provider_error:
+                log(f"  ↪ Forecast provider error: {provider_error}")
+            if record_dataset:
+                ladder_snapshot = build_event_ladder_snapshot(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    event_markets=event_markets,
+                    event_info=event_info,
+                    forecast=None,
+                )
+                if ladder_snapshot is not None:
+                    recorded_event_ladders.append(ladder_snapshot)
+            if record_dataset:
+                available_dates = forecast_provider.get_available_forecast_dates(location)
+                for raw_market in event_markets:
+                    recorded_markets.append(
+                        build_raw_market_snapshot(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            raw_market=raw_market,
+                            event_info=event_info,
+                            reason="forecast_unavailable",
+                            available_forecast_dates=available_dates,
+                        )
+                    )
             continue
 
-        unit_label = "°C" if is_international else "°F"
+        forecast_temp = forecast.predicted_value
+        unit_label = "°C" if forecast.unit == "C" else "°F"
         source_label = "Open-Meteo" if is_international else "NOAA"
         log(f"  {source_label} forecast: {forecast_temp}{unit_label}")
+        if forecast.fallback_date:
+            log(
+                f"  ↪ Forecast fallback: using {forecast.fallback_date} "
+                f"({forecast.fallback_reason}) for market date {date_str}"
+            )
+        if record_dataset:
+            recorded_forecasts[(forecast.location_key, forecast.target_date, forecast.metric)] = build_forecast_snapshot(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                forecast=forecast,
+            )
+            ladder_snapshot = build_event_ladder_snapshot(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event_markets=event_markets,
+                event_info=event_info,
+                forecast=forecast,
+            )
+            if ladder_snapshot is not None:
+                recorded_event_ladders.append(ladder_snapshot)
 
-        matching_market = None
-        for market in event_markets:
-            outcome_name = market.get("outcome_name") or market.get("question", "")
-            bucket = parse_temperature_bucket(outcome_name)
-
-            if bucket and bucket[0] <= forecast_temp <= bucket[1]:
-                matching_market = market
-                break
-
-        if not matching_market:
+        candidate = select_candidate_trade(
+            event_markets=event_markets,
+            forecast_temp=forecast_temp,
+            unit_label=unit_label,
+            location=location,
+            date_str=date_str,
+            metric=metric,
+        )
+        if not candidate:
             log(f"  ⚠️  No bucket found for {forecast_temp}{unit_label}")
             continue
 
-        outcome_name = matching_market.get("outcome_name", "")
-        price = matching_market.get("external_price_yes") or 0.5
-        market_id = matching_market.get("id")
+        outcome_name = candidate.outcome_name
+        price = candidate.price_yes
+        market_id = candidate.market_id
 
         log(f"  Matching bucket: {outcome_name} @ ${price:.2f}")
 
@@ -1107,14 +1032,49 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             continue
 
         # Check safeguards with edge analysis
-        # NOAA forecasts are ~85% accurate for 1-2 day predictions when in-bucket
-        noaa_probability = 0.85
+        probability_estimate = probability_model.estimate(
+            candidate_trade=candidate,
+            forecast=forecast,
+            market=candidate.market,
+            config={"entry_threshold": ENTRY_THRESHOLD},
+        )
+        model_probability = probability_estimate.estimated_probability
+        log(
+            f"  📐 Probability model: {probability_estimate.model_name} {probability_estimate.model_version} "
+            f"-> horizon={probability_estimate.metadata.get('horizon_hours')}, "
+            f"sigma={probability_estimate.metadata.get('sigma_used')}, "
+            f"p={model_probability:.0%}, market={price:.0%}, edge={probability_estimate.edge:.1%}"
+        )
         if use_safeguards:
-            context = get_market_context(market_id, my_probability=noaa_probability)
+            context = get_market_context(market_id, my_probability=model_probability)
+            if not context and execution_mode == ExecutionMode.LIVE_ENABLED:
+                log("  ⏭️  Safeguard blocked: market context unavailable in live mode")
+                skip_reasons.append("safeguard: context unavailable")
+                if record_dataset:
+                    recorded_markets.append(
+                        build_market_snapshot(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            candidate=candidate,
+                            context=context,
+                            probability_estimate=probability_estimate,
+                            signal=None,
+                        )
+                    )
+                continue
             should_trade, reasons = check_context_safeguards(context)
             if not should_trade:
                 log(f"  ⏭️  Safeguard blocked: {'; '.join(reasons)}")
                 skip_reasons.append(f"safeguard: {reasons[0]}")
+                if record_dataset:
+                    recorded_markets.append(
+                        build_market_snapshot(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            candidate=candidate,
+                            context=context,
+                            probability_estimate=probability_estimate,
+                            signal=None,
+                        )
+                    )
                 continue
             if reasons:
                 log(f"  ⚠️  Warnings: {'; '.join(reasons)}")
@@ -1151,9 +1111,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 else:
                     log(f"  📊 Vol targeting: insufficient price data — using base size")
 
-            min_cost_for_shares = MIN_SHARES_PER_ORDER * price
-            if min_cost_for_shares > position_size:
-                log(f"  ⚠️  Position size ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
+            size_decision = validate_minimum_position_size(position_size, price, MIN_SHARES_PER_ORDER)
+            if not size_decision.allowed:
+                log(f"  ⚠️  {size_decision.reasons[0]}")
                 skip_reasons.append("position too small")
                 continue
 
@@ -1166,24 +1126,38 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 skip_reasons.append("max trades reached")
                 continue
 
-            tag = "SIMULATED" if dry_run else "LIVE"
+            if execution_mode == ExecutionMode.PAPER:
+                tag = "PAPER"
+            else:
+                tag = "SIMULATED" if dry_run else "LIVE"
             log(f"  Executing trade ({tag})...", force=True)
-            edge = noaa_probability - price
-            signal = {
-                    "edge": round(edge, 4),
-                    "confidence": noaa_probability,
-                    "signal_source": "noaa_forecast",
-                    "forecast_temp": forecast_temp,
-                    "bucket_range": outcome_name,
-                    "market_price": round(price, 4),
-                    "threshold": ENTRY_THRESHOLD,
-            }
-            if vol_meta:
-                signal["vol_targeting"] = vol_meta
+            signal = build_entry_signal(
+                market_id=market_id,
+                market_price=price,
+                forecast_temp=forecast_temp,
+                outcome_name=outcome_name,
+                unit_label=unit_label,
+                entry_threshold=ENTRY_THRESHOLD,
+                probability_estimate=probability_estimate,
+                signal_source="noaa_forecast",
+                source_label="NOAA",
+                vol_meta=vol_meta,
+            )
+            if record_dataset:
+                recorded_markets.append(
+                    build_market_snapshot(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        candidate=candidate,
+                        context=context if use_safeguards else None,
+                        probability_estimate=probability_estimate,
+                        signal=signal,
+                        price_history=history,
+                    )
+                )
             result = execute_trade(
                 market_id, "yes", position_size,
-                reasoning=f"NOAA forecasts {forecast_temp}{unit_label} → bucket {outcome_name} underpriced at {price:.0%}",
-                signal_data=signal,
+                reasoning=signal.reasoning,
+                signal_data=signal.metadata,
             )
 
             if result.get("success"):
@@ -1218,8 +1192,38 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 execution_errors.append(error[:120])
         else:
             log(f"  ⏸️  Price ${price:.2f} above threshold ${ENTRY_THRESHOLD:.2f} - skip")
+            if record_dataset:
+                recorded_markets.append(
+                    build_market_snapshot(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        candidate=candidate,
+                        context=context if use_safeguards else None,
+                        probability_estimate=probability_estimate,
+                        signal=None,
+                        price_history=history,
+                    )
+                )
 
-    exits_found, exits_executed = check_exit_opportunities(dry_run, use_safeguards)
+    exits_found, exits_executed = check_exit_opportunities(dry_run, use_safeguards, execution_mode=execution_mode)
+
+    if record_dataset and dataset_recorder is not None:
+        step_timestamp = datetime.now(timezone.utc).isoformat()
+        dataset_recorder.record_step(
+            step=HistoricalReplayStep(
+                timestamp=step_timestamp,
+                forecasts=list(recorded_forecasts.values()),
+                markets=recorded_markets,
+                event_ladders=recorded_event_ladders,
+                metadata={
+                    "execution_mode": execution_mode.value,
+                    "entry_threshold": ENTRY_THRESHOLD,
+                    "exit_threshold": EXIT_THRESHOLD,
+                    "locations": ACTIVE_LOCATIONS,
+                    "signals_generated": opportunities_found,
+                    "trades_executed": trades_executed + exits_executed,
+                },
+            )
+        )
 
     log("\n" + "=" * 50)
     total_trades = trades_executed + exits_executed
@@ -1242,7 +1246,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         print(json.dumps({"automaton": report}))
         _automaton_reported = True
 
-    if dry_run and show_summary:
+    if (dry_run or paper) and show_summary:
         print("\n  [PAPER MODE - trades simulated with real prices]")
 
 
@@ -1254,6 +1258,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simmer Weather Trading Skill")
     parser.add_argument("--live", action="store_true", help="Execute real trades (default is dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="(Default) Show opportunities without trading")
+    parser.add_argument("--paper", action="store_true", help="Simulate trades and persist paper positions/PnL locally")
+    parser.add_argument("--backtest-file", help="Run a deterministic backtest from a local JSON dataset")
+    parser.add_argument("--compare-models", action="store_true", help="Run a side-by-side model comparison on a backtest dataset")
+    parser.add_argument("--experiment-config", help="JSON experiment config file for model comparison runs")
+    parser.add_argument("--experiment-output-json", help="Optional path to save comparison results as JSON")
+    parser.add_argument("--experiment-output-csv", help="Optional path to save comparison results as CSV")
+    parser.add_argument("--record-dataset", action="store_true", help="Record forecast/market snapshots for future research backtests")
+    parser.add_argument("--dataset-output", help="Optional path for recorded research dataset JSON")
     parser.add_argument("--positions", action="store_true", help="Show current positions only")
     parser.add_argument("--config", action="store_true", help="Show current config")
     parser.add_argument("--set", action="append", metavar="KEY=VALUE",
@@ -1299,9 +1311,29 @@ if __name__ == "__main__":
             globals()["VOL_SPAN"] = _config["vol_span"]
             _locations_str = _config["locations"]
             globals()["ACTIVE_LOCATIONS"] = [loc.strip().upper() for loc in _locations_str.split(",") if loc.strip()]
+            globals()["_probability_model"] = None
+
+    if args.compare_models:
+        if not args.backtest_file:
+            print("Error: --compare-models requires --backtest-file")
+            sys.exit(1)
+        result = run_model_comparison(
+            backtest_file=args.backtest_file,
+            quiet=args.quiet,
+            experiment_config=args.experiment_config,
+            output_json=args.experiment_output_json,
+            output_csv=args.experiment_output_csv,
+        )
+        print(json.dumps({"comparison": result}, indent=2))
+        sys.exit(0)
+
+    if args.backtest_file:
+        result = run_backtest(args.backtest_file, quiet=args.quiet)
+        print(json.dumps({"backtest": result}, indent=2))
+        sys.exit(0)
 
     # Default to dry-run unless --live is explicitly passed
-    dry_run = not args.live
+    dry_run = not args.live and not args.paper
 
     run_weather_strategy(
         dry_run=dry_run,
@@ -1312,6 +1344,9 @@ if __name__ == "__main__":
         use_trends=not args.no_trends,
         quiet=args.quiet,
         vol_targeting=args.vol_targeting or VOL_TARGETING,
+        paper=args.paper,
+        record_dataset=args.record_dataset,
+        dataset_output=args.dataset_output,
     )
 
     # Fallback report for automaton if the strategy returned early (no signal)
