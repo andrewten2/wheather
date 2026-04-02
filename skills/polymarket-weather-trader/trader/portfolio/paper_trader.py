@@ -68,6 +68,12 @@ class PaperTrader:
     def has_trade_for_market(self, market_id: str) -> bool:
         return any(trade.get("market_id") == market_id for trade in self.state.get("trades", []))
 
+    def has_open_position_for_market(self, market_id: str) -> bool:
+        position = (self.state.get("positions") or {}).get(market_id)
+        if not position:
+            return False
+        return float(position.get("shares", 0.0) or 0.0) > 0.0
+
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
         try:
             context = adapter.get_market_context(market_id)

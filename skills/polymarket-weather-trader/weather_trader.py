@@ -87,6 +87,7 @@ from trader.research.experiment_runner import (
 )
 from trader.research.replay_types import HistoricalReplayStep
 from trader.risk.risk_manager import (
+    compute_side_aware_slippage_metrics,
     evaluate_context_safeguards,
     validate_minimum_position_size,
 )
@@ -257,6 +258,7 @@ STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
+PAPER_SLIPPAGE_MAX_PCT = 0.25
 
 
 def log_strategy_v1_decision(
@@ -269,6 +271,8 @@ def log_strategy_v1_decision(
     edge_yes: float,
     edge_no: float,
     selected_side: str = None,
+    open_position_exists: bool = None,
+    historical_trade_exists: bool = None,
 ) -> None:
     bucket_type = getattr(candidate.bucket, "bucket_type", None) if candidate and candidate.bucket else None
     logger.event(
@@ -284,6 +288,8 @@ def log_strategy_v1_decision(
         gaussian_probability=round(gaussian_probability, 6) if gaussian_probability is not None else None,
         edge_yes=round(edge_yes, 6) if edge_yes is not None else None,
         edge_no=round(edge_no, 6) if edge_no is not None else None,
+        open_position_exists=open_position_exists,
+        historical_trade_exists=historical_trade_exists,
     )
 
 
@@ -297,6 +303,9 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
     gaussian_probability = probability_estimate.estimated_probability
     edge_yes = gaussian_probability - price_yes
     edge_no = price_yes - gaussian_probability
+    paper_trader = get_paper_trader()
+    open_position_exists = paper_trader.has_open_position_for_market(candidate.market_id)
+    historical_trade_exists = paper_trader.has_trade_for_market(candidate.market_id)
 
     if city not in STRATEGY_V1_ALLOWED_CITIES:
         return {
@@ -306,6 +315,8 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
+            "open_position_exists": open_position_exists,
+            "historical_trade_exists": historical_trade_exists,
         }
     if bucket_type not in STRATEGY_V1_ALLOWED_BUCKET_TYPES:
         return {
@@ -315,6 +326,8 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
+            "open_position_exists": open_position_exists,
+            "historical_trade_exists": historical_trade_exists,
         }
     if price_yes is None or not (STRATEGY_V1_MIN_PRICE <= price_yes <= STRATEGY_V1_MAX_PRICE):
         return {
@@ -324,15 +337,19 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
+            "open_position_exists": open_position_exists,
+            "historical_trade_exists": historical_trade_exists,
         }
-    if get_paper_trader().has_trade_for_market(candidate.market_id):
+    if open_position_exists:
         return {
             "action": "skip",
-            "reason": "market already traded",
+            "reason": "open position exists",
             "price_yes": price_yes,
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
+            "open_position_exists": open_position_exists,
+            "historical_trade_exists": historical_trade_exists,
         }
     if edge_no > STRATEGY_V1_NO_EDGE_THRESHOLD:
         return {
@@ -345,6 +362,8 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
+            "open_position_exists": open_position_exists,
+            "historical_trade_exists": historical_trade_exists,
         }
     if edge_yes > STRATEGY_V1_YES_EDGE_THRESHOLD:
         return {
@@ -357,6 +376,8 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
+            "open_position_exists": open_position_exists,
+            "historical_trade_exists": historical_trade_exists,
         }
     return {
         "action": "skip",
@@ -365,6 +386,8 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
         "gaussian_probability": gaussian_probability,
         "edge_yes": edge_yes,
         "edge_no": edge_no,
+        "open_position_exists": open_position_exists,
+        "historical_trade_exists": historical_trade_exists,
     }
 
 
@@ -607,7 +630,12 @@ def get_price_history(market_id: str) -> list:
         return []
 
 
-def check_context_safeguards(context: dict, use_edge: bool = True) -> tuple:
+def check_context_safeguards(
+    context: dict,
+    use_edge: bool = True,
+    slippage_max_pct: float = None,
+    ignore_slippage: bool = False,
+) -> tuple:
     """
     Check context for safeguards. Returns (should_trade, reasons).
     
@@ -617,12 +645,64 @@ def check_context_safeguards(context: dict, use_edge: bool = True) -> tuple:
     """
     decision = evaluate_context_safeguards(
         context=context,
-        slippage_max_pct=SLIPPAGE_MAX_PCT,
+        slippage_max_pct=SLIPPAGE_MAX_PCT if slippage_max_pct is None else slippage_max_pct,
         min_liquidity_usd=MIN_LIQUIDITY_USD,
         time_to_resolution_min_hours=TIME_TO_RESOLUTION_MIN_HOURS,
         use_edge=use_edge,
+        ignore_slippage=ignore_slippage,
     )
     return decision.allowed, decision.reasons + decision.warnings
+
+
+def evaluate_paper_slippage_guard(
+    logger: StructuredLogger,
+    context: dict,
+    selected_side: str,
+    reference_price_yes: float,
+):
+    metrics = compute_side_aware_slippage_metrics(
+        context=context,
+        selected_side=selected_side,
+        reference_price_yes=reference_price_yes,
+    )
+    if not metrics:
+        return True, None
+
+    computed_slippage = metrics.get("computed_slippage")
+    logger.event(
+        "paper_slippage_decision",
+        selected_side=metrics.get("selected_side"),
+        reference_price=round(metrics.get("reference_price"), 6) if metrics.get("reference_price") is not None else None,
+        execution_price=round(metrics.get("execution_price"), 6) if metrics.get("execution_price") is not None else None,
+        computed_slippage=round(computed_slippage, 6) if computed_slippage is not None else None,
+        max_allowed_slippage=PAPER_SLIPPAGE_MAX_PCT,
+        reason="paper_slippage_check",
+    )
+
+    if computed_slippage is not None and computed_slippage > PAPER_SLIPPAGE_MAX_PCT:
+        logger.event(
+            "paper_slippage_decision",
+            selected_side=metrics.get("selected_side"),
+            reference_price=round(metrics.get("reference_price"), 6) if metrics.get("reference_price") is not None else None,
+            execution_price=round(metrics.get("execution_price"), 6) if metrics.get("execution_price") is not None else None,
+            computed_slippage=round(computed_slippage, 6) if computed_slippage is not None else None,
+            max_allowed_slippage=PAPER_SLIPPAGE_MAX_PCT,
+            reason="slippage_blocked",
+        )
+        return False, (
+            f"Slippage too high: {computed_slippage:.1%} "
+            f"(max {PAPER_SLIPPAGE_MAX_PCT:.0%})"
+        )
+    logger.event(
+        "paper_slippage_decision",
+        selected_side=metrics.get("selected_side"),
+        reference_price=round(metrics.get("reference_price"), 6) if metrics.get("reference_price") is not None else None,
+        execution_price=round(metrics.get("execution_price"), 6) if metrics.get("execution_price") is not None else None,
+        computed_slippage=round(computed_slippage, 6) if computed_slippage is not None else None,
+        max_allowed_slippage=PAPER_SLIPPAGE_MAX_PCT,
+        reason="slippage_allowed",
+    )
+    return True, None
 
 
 def detect_price_trend(history: list) -> dict:
@@ -1238,6 +1318,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             f"sigma={probability_estimate.metadata.get('sigma_used')}, "
             f"p={model_probability:.0%}, market={price:.0%}, edge={probability_estimate.edge:.1%}"
         )
+        preliminary_strategy_v1_decision = None
+        if execution_mode == ExecutionMode.PAPER:
+            preliminary_strategy_v1_decision = select_strategy_v1_trade(candidate, probability_estimate, execution_mode)
         if use_safeguards:
             context = get_market_context(market_id, my_probability=model_probability)
             if not context and execution_mode == ExecutionMode.LIVE_ENABLED:
@@ -1254,7 +1337,20 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                         )
                     )
                 continue
-            should_trade, reasons = check_context_safeguards(context)
+            if execution_mode == ExecutionMode.PAPER:
+                should_trade, reasons = check_context_safeguards(context, ignore_slippage=True)
+                if should_trade and preliminary_strategy_v1_decision and preliminary_strategy_v1_decision.get("action") == "trade":
+                    slippage_ok, slippage_reason = evaluate_paper_slippage_guard(
+                        logger=logger,
+                        context=context,
+                        selected_side=preliminary_strategy_v1_decision.get("selected_side"),
+                        reference_price_yes=price,
+                    )
+                    if not slippage_ok and slippage_reason:
+                        should_trade = False
+                        reasons = [slippage_reason] + list(reasons or [])
+            else:
+                should_trade, reasons = check_context_safeguards(context)
             if not should_trade:
                 log(f"  ⏭️  Safeguard blocked: {'; '.join(reasons)}")
                 skip_reasons.append(f"safeguard: {reasons[0]}")
@@ -1288,7 +1384,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
         strategy_v1_decision = None
         if execution_mode == ExecutionMode.PAPER:
-            strategy_v1_decision = select_strategy_v1_trade(candidate, probability_estimate, execution_mode)
+            strategy_v1_decision = preliminary_strategy_v1_decision or select_strategy_v1_trade(candidate, probability_estimate, execution_mode)
             log_strategy_v1_decision(
                 logger=logger,
                 action=strategy_v1_decision["action"],
@@ -1299,6 +1395,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 edge_yes=strategy_v1_decision.get("edge_yes"),
                 edge_no=strategy_v1_decision.get("edge_no"),
                 selected_side=strategy_v1_decision.get("selected_side"),
+                open_position_exists=strategy_v1_decision.get("open_position_exists"),
+                historical_trade_exists=strategy_v1_decision.get("historical_trade_exists"),
             )
 
         should_trade = False

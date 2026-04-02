@@ -1,6 +1,55 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from trader.models.risk import RiskDecision
+
+
+def compute_side_aware_slippage_metrics(
+    context: dict,
+    selected_side: str,
+    reference_price_yes: Optional[float],
+):
+    slippage = (context or {}).get("slippage", {}) or {}
+    estimates = slippage.get("estimates", []) if slippage else []
+    if not estimates or reference_price_yes is None:
+        return None
+
+    estimate = estimates[0] or {}
+    execution_price_yes = estimate.get("avg_price")
+    if execution_price_yes is None:
+        return None
+
+    try:
+        ref_yes = float(reference_price_yes)
+        exec_yes = float(execution_price_yes)
+    except (TypeError, ValueError):
+        return None
+
+    side = (selected_side or "yes").lower()
+    if side == "no":
+        reference_price = max(0.0, 1.0 - ref_yes)
+        execution_price = max(0.0, 1.0 - exec_yes)
+    else:
+        reference_price = ref_yes
+        execution_price = exec_yes
+
+    if reference_price <= 0:
+        computed_slippage = None
+    else:
+        computed_slippage = abs(execution_price - reference_price) / reference_price
+
+    return {
+        "selected_side": side,
+        "reference_price": reference_price,
+        "execution_price": execution_price,
+        "computed_slippage": computed_slippage,
+        "raw_avg_price_yes": exec_yes,
+        "raw_reference_price_yes": ref_yes,
+        "sdk_slippage_pct": estimate.get("slippage_pct"),
+        "shares": estimate.get("shares"),
+        "amount_usd": estimate.get("amount_usd"),
+    }
 
 
 def evaluate_context_safeguards(
@@ -9,6 +58,7 @@ def evaluate_context_safeguards(
     min_liquidity_usd: float,
     time_to_resolution_min_hours: int,
     use_edge: bool = True,
+    ignore_slippage: bool = False,
 ) -> RiskDecision:
     if not context:
         return RiskDecision(allowed=True, mode="allow")
@@ -70,7 +120,7 @@ def evaluate_context_safeguards(
 
     estimates = slippage.get("estimates", []) if slippage else []
     slippage_pct = None
-    if estimates:
+    if estimates and not ignore_slippage:
         slippage_pct = estimates[0].get("slippage_pct", 0)
         if slippage_pct > slippage_max_pct:
             return RiskDecision(
