@@ -65,6 +65,9 @@ class PaperTrader:
         if self.logger:
             self.logger.event(event, **fields)
 
+    def has_trade_for_market(self, market_id: str) -> bool:
+        return any(trade.get("market_id") == market_id for trade in self.state.get("trades", []))
+
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
         try:
             context = adapter.get_market_context(market_id)
@@ -250,6 +253,7 @@ class PaperTrader:
             simulated=True,
             is_submitted_only=False,
             is_filled=True,
+            realized_pnl=realized_pnl if action == "sell" else None,
         )
 
     def get_positions(self, adapter) -> List[Position]:

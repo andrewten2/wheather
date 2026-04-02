@@ -82,6 +82,8 @@ class ExecutionEngine:
                 signal_source = signal_data.get("signal_source")
                 market_price = signal_data.get("market_price")
                 market_question = signal_data.get("question") or signal_data.get("event_name")
+                if side == "no" and market_price is not None:
+                    market_price = signal_data.get("market_price_no", 1.0 - market_price)
             return self.paper_trader.simulate_order(
                 adapter=self.adapter,
                 market_id=market_id,

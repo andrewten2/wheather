@@ -93,6 +93,7 @@ from trader.risk.risk_manager import (
 from trader.strategy.probability_model import DEFAULT_SIGMA_SCHEDULE, create_probability_model
 from trader.strategy.signal_engine import build_entry_signal
 from trader.telemetry.logger import StructuredLogger
+from trader.models.signal import TradeSignal
 
 # Configuration schema
 # Note: env var names match autotune registry. Legacy aliases (SIMMER_WEATHER_ENTRY,
@@ -155,6 +156,7 @@ _execution_engine = None
 _forecast_provider = None
 _paper_trader = None
 _probability_model = None
+_strategy_v1_probability_model = None
 _dataset_recorder = None
 
 def get_adapter(live=True):
@@ -224,6 +226,146 @@ def get_probability_model():
             "constant_probability": 0.85,
         })
     return _probability_model
+
+
+def get_strategy_v1_probability_model():
+    """Gaussian-only model for paper strategy_v1 research trading."""
+    global _strategy_v1_probability_model
+    if _strategy_v1_probability_model is None:
+        sigma_schedule = None
+        raw_schedule = _config.get("sigma_schedule", "")
+        if raw_schedule:
+            try:
+                sigma_schedule = json.loads(raw_schedule) if isinstance(raw_schedule, str) else raw_schedule
+            except Exception:
+                sigma_schedule = None
+        if sigma_schedule is None:
+            sigma_schedule = DEFAULT_SIGMA_SCHEDULE
+        _strategy_v1_probability_model = create_probability_model({
+            "probability_model": "gaussian",
+            "temperature_sigma": _config.get("temperature_sigma", 2.5),
+            "min_model_probability": _config.get("min_model_probability", 0.01),
+            "model_name": "strategy_v1_gaussian",
+            "sigma_schedule": sigma_schedule,
+        })
+    return _strategy_v1_probability_model
+
+
+STRATEGY_V1_ALLOWED_CITIES = {"DALLAS", "CHICAGO", "ATLANTA", "NYC"}
+STRATEGY_V1_ALLOWED_BUCKET_TYPES = {"range", "below", "above"}
+STRATEGY_V1_MIN_PRICE = 0.02
+STRATEGY_V1_MAX_PRICE = 0.80
+STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
+STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
+
+
+def log_strategy_v1_decision(
+    logger: StructuredLogger,
+    action: str,
+    reason: str,
+    candidate,
+    price_yes: float,
+    gaussian_probability: float,
+    edge_yes: float,
+    edge_no: float,
+    selected_side: str = None,
+) -> None:
+    bucket_type = getattr(candidate.bucket, "bucket_type", None) if candidate and candidate.bucket else None
+    logger.event(
+        "strategy_v1_trade_decision",
+        action=action,
+        reason=reason,
+        selected_side=selected_side,
+        city=getattr(candidate, "location", None),
+        bucket_type=bucket_type,
+        market_id=getattr(candidate, "market_id", None),
+        outcome_name=getattr(candidate, "outcome_name", None),
+        market_price=round(price_yes, 6) if price_yes is not None else None,
+        gaussian_probability=round(gaussian_probability, 6) if gaussian_probability is not None else None,
+        edge_yes=round(edge_yes, 6) if edge_yes is not None else None,
+        edge_no=round(edge_no, 6) if edge_no is not None else None,
+    )
+
+
+def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: ExecutionMode):
+    if execution_mode != ExecutionMode.PAPER:
+        return None
+
+    city = (candidate.location or "").upper()
+    bucket_type = getattr(candidate.bucket, "bucket_type", None)
+    price_yes = candidate.price_yes
+    gaussian_probability = probability_estimate.estimated_probability
+    edge_yes = gaussian_probability - price_yes
+    edge_no = price_yes - gaussian_probability
+
+    if city not in STRATEGY_V1_ALLOWED_CITIES:
+        return {
+            "action": "skip",
+            "reason": "city filter",
+            "price_yes": price_yes,
+            "gaussian_probability": gaussian_probability,
+            "edge_yes": edge_yes,
+            "edge_no": edge_no,
+        }
+    if bucket_type not in STRATEGY_V1_ALLOWED_BUCKET_TYPES:
+        return {
+            "action": "skip",
+            "reason": "bucket type filter",
+            "price_yes": price_yes,
+            "gaussian_probability": gaussian_probability,
+            "edge_yes": edge_yes,
+            "edge_no": edge_no,
+        }
+    if price_yes is None or not (STRATEGY_V1_MIN_PRICE <= price_yes <= STRATEGY_V1_MAX_PRICE):
+        return {
+            "action": "skip",
+            "reason": "liquidity filter",
+            "price_yes": price_yes,
+            "gaussian_probability": gaussian_probability,
+            "edge_yes": edge_yes,
+            "edge_no": edge_no,
+        }
+    if get_paper_trader().has_trade_for_market(candidate.market_id):
+        return {
+            "action": "skip",
+            "reason": "market already traded",
+            "price_yes": price_yes,
+            "gaussian_probability": gaussian_probability,
+            "edge_yes": edge_yes,
+            "edge_no": edge_no,
+        }
+    if edge_no > STRATEGY_V1_NO_EDGE_THRESHOLD:
+        return {
+            "action": "trade",
+            "reason": "primary no edge",
+            "selected_side": "no",
+            "threshold": STRATEGY_V1_NO_EDGE_THRESHOLD,
+            "selected_edge": edge_no,
+            "price_yes": price_yes,
+            "gaussian_probability": gaussian_probability,
+            "edge_yes": edge_yes,
+            "edge_no": edge_no,
+        }
+    if edge_yes > STRATEGY_V1_YES_EDGE_THRESHOLD:
+        return {
+            "action": "trade",
+            "reason": "secondary yes edge",
+            "selected_side": "yes",
+            "threshold": STRATEGY_V1_YES_EDGE_THRESHOLD,
+            "selected_edge": edge_yes,
+            "price_yes": price_yes,
+            "gaussian_probability": gaussian_probability,
+            "edge_yes": edge_yes,
+            "edge_no": edge_no,
+        }
+    return {
+        "action": "skip",
+        "reason": "edge below thresholds",
+        "price_yes": price_yes,
+        "gaussian_probability": gaussian_probability,
+        "edge_yes": edge_yes,
+        "edge_no": edge_no,
+    }
 
 
 def get_dataset_recorder(output_path: str = None, logger=None):
@@ -648,9 +790,9 @@ def execute_trade(market_id: str, side: str, amount: float, reasoning: str = Non
     return out
 
 
-def execute_sell(market_id: str, shares: float) -> dict:
+def execute_sell(market_id: str, shares: float, side: str = "yes") -> dict:
     """Execute a sell trade via execution layer with source tagging."""
-    result = get_execution_engine().sell(market_id=market_id, side="yes", shares=shares)
+    result = get_execution_engine().sell(market_id=market_id, side=side, shares=shares)
     out = {
         "success": result.success,
         "trade_id": result.trade_id,
@@ -659,6 +801,9 @@ def execute_sell(market_id: str, shares: float) -> dict:
         "order_status": result.order_status,
         "is_submitted_only": result.is_submitted_only,
         "is_filled": result.is_filled,
+        "realized_pnl": result.realized_pnl,
+        "avg_fill_price": result.avg_fill_price,
+        "side": result.side,
     }
     if result.is_submitted_only:
         print(f"  [GTC] Sell order placed on book — waiting for fill (trade {result.trade_id})")
@@ -704,11 +849,22 @@ def calculate_position_size(default_size: float, smart_sizing: bool) -> float:
     return smart_size
 
 
+def get_position_side(pos) -> str:
+    if (pos.shares_no or 0) > 0:
+        return "no"
+    return "yes"
+
+
 # =============================================================================
 # Exit Strategy
 # =============================================================================
 
-def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True, execution_mode: ExecutionMode = None) -> tuple:
+def check_exit_opportunities(
+    dry_run: bool = False,
+    use_safeguards: bool = True,
+    execution_mode: ExecutionMode = None,
+    logger: StructuredLogger = None,
+) -> tuple:
     """Check open positions for exit opportunities. Returns: (exits_found, exits_executed)"""
     positions = load_positions(
         get_adapter(),
@@ -732,7 +888,9 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True,
     for pos in weather_positions:
         market_id = pos.market_id
         current_price = pos.current_price or 0
-        shares = pos.shares_yes or 0
+        position_side = get_position_side(pos) if execution_mode == ExecutionMode.PAPER else "yes"
+        shares = (pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and position_side == "no") else (pos.shares_yes or 0)
+        entry_price = pos.avg_cost or 0
         question = pos.question[:50] if pos.question else "Unknown"
 
         if shares < MIN_SHARES_PER_ORDER:
@@ -741,7 +899,10 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True,
         if current_price >= EXIT_THRESHOLD:
             exits_found += 1
             print(f"  📤 {question}...")
-            print(f"     Price ${current_price:.2f} >= exit threshold ${EXIT_THRESHOLD:.2f}")
+            if execution_mode == ExecutionMode.PAPER and position_side == "no":
+                print(f"     NO price ${current_price:.2f} >= exit threshold ${EXIT_THRESHOLD:.2f}")
+            else:
+                print(f"     Price ${current_price:.2f} >= exit threshold ${EXIT_THRESHOLD:.2f}")
 
             # Check safeguards before selling
             if use_safeguards:
@@ -761,22 +922,38 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True,
             )
             fresh_pos = find_position(fresh_positions, market_id)
             if fresh_pos:
-                fresh_shares = fresh_pos.shares_yes or 0
+                fresh_side = get_position_side(fresh_pos) if execution_mode == ExecutionMode.PAPER else "yes"
+                fresh_shares = (fresh_pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and fresh_side == "no") else (fresh_pos.shares_yes or 0)
                 if fresh_shares < MIN_SHARES_PER_ORDER:
                     print(f"     ⏭️  Skipped: fresh share count {fresh_shares:.1f} below minimum")
                     continue
                 if fresh_shares != shares:
                     print(f"     ℹ️  Share count updated: {shares:.1f} → {fresh_shares:.1f}")
                     shares = fresh_shares
+                position_side = fresh_side
 
             tag = "SIMULATED" if dry_run else "LIVE"
-            print(f"     Selling {shares:.1f} shares ({tag})...")
-            result = execute_sell(market_id, shares)
+            side_label = position_side.upper()
+            print(f"     Selling {side_label} {shares:.1f} shares ({tag})...")
+            result = execute_sell(market_id, shares, side=position_side)
 
             if result.get("success"):
                 exits_executed += 1
                 trade_id = result.get("trade_id")
-                print(f"     ✅ {'[PAPER] ' if result.get('simulated') else ''}Sold {shares:.1f} shares @ ${current_price:.2f}")
+                print(
+                    f"     ✅ {'[PAPER] ' if result.get('simulated') else ''}"
+                    f"Sold {position_side.upper()} {shares:.1f} shares @ ${current_price:.2f}"
+                )
+                if execution_mode == ExecutionMode.PAPER and logger is not None:
+                    logger.event(
+                        "strategy_v1_exit_decision",
+                        selected_side=position_side,
+                        market_id=market_id,
+                        entry_price=round(entry_price, 6) if entry_price else 0.0,
+                        current_price=round(current_price, 6),
+                        realized_pnl=result.get("realized_pnl"),
+                        reason_for_exit=f"{position_side}_price_reached_exit_threshold",
+                    )
 
                 # Log sell trade context for journal (skip for paper trades)
                 if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
@@ -791,7 +968,10 @@ def check_exit_opportunities(dry_run: bool = False, use_safeguards: bool = True,
                 print(f"     ❌ Sell failed: {error}")
         else:
             print(f"  📊 {question}...")
-            print(f"     Price ${current_price:.2f} < exit threshold ${EXIT_THRESHOLD:.2f} - hold")
+            if execution_mode == ExecutionMode.PAPER and position_side == "no":
+                print(f"     NO price ${current_price:.2f} < exit threshold ${EXIT_THRESHOLD:.2f} - hold")
+            else:
+                print(f"     Price ${current_price:.2f} < exit threshold ${EXIT_THRESHOLD:.2f} - hold")
 
     return exits_found, exits_executed
 
@@ -812,6 +992,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         get_paper_trader().logger = logger
     forecast_provider = get_forecast_provider()
     probability_model = get_probability_model()
+    strategy_v1_probability_model = get_strategy_v1_probability_model() if paper else None
     dataset_recorder = get_dataset_recorder(output_path=dataset_output, logger=logger) if record_dataset else None
 
     def log(msg, force=False):
@@ -823,6 +1004,17 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
     if paper:
         log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
+        logger.event(
+            "strategy_v1_mode_enabled",
+            strategy="strategy_v1",
+            mode="paper_only",
+            allowed_cities=sorted(STRATEGY_V1_ALLOWED_CITIES),
+            allowed_bucket_types=sorted(STRATEGY_V1_ALLOWED_BUCKET_TYPES),
+            no_edge_threshold=STRATEGY_V1_NO_EDGE_THRESHOLD,
+            yes_edge_threshold=STRATEGY_V1_YES_EDGE_THRESHOLD,
+            min_market_price=STRATEGY_V1_MIN_PRICE,
+            max_market_price=STRATEGY_V1_MAX_PRICE,
+        )
     elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
 
@@ -1032,7 +1224,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             continue
 
         # Check safeguards with edge analysis
-        probability_estimate = probability_model.estimate(
+        active_probability_model = strategy_v1_probability_model if execution_mode == ExecutionMode.PAPER else probability_model
+        probability_estimate = active_probability_model.estimate(
             candidate_trade=candidate,
             forecast=forecast,
             market=candidate.market,
@@ -1093,7 +1286,39 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             elif trend["direction"] == "up":
                 trend_bonus = f" 📈 (up {trend['change_24h']:.0%} in 24h)"
 
-        if price < ENTRY_THRESHOLD:
+        strategy_v1_decision = None
+        if execution_mode == ExecutionMode.PAPER:
+            strategy_v1_decision = select_strategy_v1_trade(candidate, probability_estimate, execution_mode)
+            log_strategy_v1_decision(
+                logger=logger,
+                action=strategy_v1_decision["action"],
+                reason=strategy_v1_decision["reason"],
+                candidate=candidate,
+                price_yes=strategy_v1_decision.get("price_yes"),
+                gaussian_probability=strategy_v1_decision.get("gaussian_probability"),
+                edge_yes=strategy_v1_decision.get("edge_yes"),
+                edge_no=strategy_v1_decision.get("edge_no"),
+                selected_side=strategy_v1_decision.get("selected_side"),
+            )
+
+        should_trade = False
+        selected_side = "yes"
+        selected_threshold = ENTRY_THRESHOLD
+        selected_edge = probability_estimate.edge
+        signal_source = "noaa_forecast"
+        source_label_for_signal = "NOAA"
+        if execution_mode == ExecutionMode.PAPER:
+            should_trade = strategy_v1_decision is not None and strategy_v1_decision.get("action") == "trade"
+            if should_trade:
+                selected_side = strategy_v1_decision["selected_side"]
+                selected_threshold = strategy_v1_decision["threshold"]
+                selected_edge = strategy_v1_decision["selected_edge"]
+                signal_source = "strategy_v1_gaussian"
+                source_label_for_signal = "Gaussian"
+        else:
+            should_trade = price < ENTRY_THRESHOLD
+
+        if should_trade:
             position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
 
             # Apply volatility targeting
@@ -1118,7 +1343,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 continue
 
             opportunities_found += 1
-            log(f"  ✅ Below threshold (${ENTRY_THRESHOLD:.2f}) - BUY opportunity!{trend_bonus}")
+            if execution_mode == ExecutionMode.PAPER:
+                log(
+                    f"  ✅ strategy_v1 {selected_side.upper()} opportunity "
+                    f"(edge_yes={strategy_v1_decision['edge_yes']:.1%}, edge_no={strategy_v1_decision['edge_no']:.1%})!{trend_bonus}"
+                )
+            else:
+                log(f"  ✅ Below threshold (${ENTRY_THRESHOLD:.2f}) - BUY opportunity!{trend_bonus}")
 
             # Check rate limit
             if trades_executed >= MAX_TRADES_PER_RUN:
@@ -1137,12 +1368,49 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 forecast_temp=forecast_temp,
                 outcome_name=outcome_name,
                 unit_label=unit_label,
-                entry_threshold=ENTRY_THRESHOLD,
+                entry_threshold=selected_threshold,
                 probability_estimate=probability_estimate,
-                signal_source="noaa_forecast",
-                source_label="NOAA",
+                signal_source=signal_source,
+                source_label=source_label_for_signal,
                 vol_meta=vol_meta,
             )
+            if signal is None:
+                signal = TradeSignal(
+                    signal_type="entry",
+                    market_id=market_id,
+                    side=selected_side,
+                    model_probability=model_probability,
+                    market_price=price,
+                    edge=selected_edge,
+                    threshold_used=selected_threshold,
+                    forecast_value=forecast_temp,
+                    signal_source=signal_source,
+                    reasoning="",
+                    metadata={},
+                )
+            if signal:
+                signal.side = selected_side
+                signal.edge = selected_edge
+                signal.metadata["trade_side"] = selected_side
+                signal.metadata["edge_yes"] = round(strategy_v1_decision["edge_yes"], 6) if strategy_v1_decision else None
+                signal.metadata["edge_no"] = round(strategy_v1_decision["edge_no"], 6) if strategy_v1_decision else None
+                signal.metadata["strategy"] = "strategy_v1" if execution_mode == ExecutionMode.PAPER else "legacy_threshold"
+                signal.metadata["bucket_type"] = getattr(candidate.bucket, "bucket_type", None)
+                signal.metadata["city"] = candidate.location
+                signal.metadata["question"] = candidate.market.question
+                signal.metadata["event_name"] = candidate.event_name
+                signal.metadata["market_price"] = round(price, 6)
+                signal.metadata["market_price_yes"] = round(price, 6)
+                signal.metadata["market_price_no"] = round(1.0 - price, 6)
+                signal.metadata["selected_edge"] = round(selected_edge, 6)
+                signal.metadata["gaussian_probability"] = round(model_probability, 6)
+                if execution_mode == ExecutionMode.PAPER:
+                    signal.reasoning = (
+                        f"strategy_v1 {selected_side.upper()} "
+                        f"{candidate.location} {outcome_name} at YES ${price:.2f} "
+                        f"(p={model_probability:.0%}, edge_yes={strategy_v1_decision['edge_yes']:.1%}, "
+                        f"edge_no={strategy_v1_decision['edge_no']:.1%})"
+                    )
             if record_dataset:
                 recorded_markets.append(
                     build_market_snapshot(
@@ -1155,7 +1423,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     )
                 )
             result = execute_trade(
-                market_id, "yes", position_size,
+                market_id, selected_side, position_size,
                 reasoning=signal.reasoning,
                 signal_data=signal.metadata,
             )
@@ -1165,7 +1433,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 total_usd_spent += position_size
                 shares = result.get("shares_bought") or result.get("shares") or 0
                 trade_id = result.get("trade_id")
-                log(f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} shares @ ${price:.2f}", force=True)
+                log(
+                    f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {selected_side.upper()} "
+                    f"{shares:.1f} shares @ ${price:.2f}",
+                    force=True,
+                )
 
                 # Log trade context for journal (skip for paper trades)
                 if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
@@ -1191,7 +1463,10 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 log(f"  ❌ Trade failed: {error}", force=True)
                 execution_errors.append(error[:120])
         else:
-            log(f"  ⏸️  Price ${price:.2f} above threshold ${ENTRY_THRESHOLD:.2f} - skip")
+            if execution_mode == ExecutionMode.PAPER and strategy_v1_decision:
+                log(f"  ⏸️  strategy_v1 skip: {strategy_v1_decision['reason']}")
+            else:
+                log(f"  ⏸️  Price ${price:.2f} above threshold ${ENTRY_THRESHOLD:.2f} - skip")
             if record_dataset:
                 recorded_markets.append(
                     build_market_snapshot(
@@ -1204,7 +1479,12 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     )
                 )
 
-    exits_found, exits_executed = check_exit_opportunities(dry_run, use_safeguards, execution_mode=execution_mode)
+    exits_found, exits_executed = check_exit_opportunities(
+        dry_run,
+        use_safeguards,
+        execution_mode=execution_mode,
+        logger=logger,
+    )
 
     if record_dataset and dataset_recorder is not None:
         step_timestamp = datetime.now(timezone.utc).isoformat()
@@ -1312,6 +1592,7 @@ if __name__ == "__main__":
             _locations_str = _config["locations"]
             globals()["ACTIVE_LOCATIONS"] = [loc.strip().upper() for loc in _locations_str.split(",") if loc.strip()]
             globals()["_probability_model"] = None
+            globals()["_strategy_v1_probability_model"] = None
 
     if args.compare_models:
         if not args.backtest_file:

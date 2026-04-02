@@ -27,5 +27,5 @@ class ExecutionResult:
     simulated: bool = False
     is_submitted_only: bool = False
     is_filled: bool = False
+    realized_pnl: Optional[float] = None
     error: Optional[str] = None
-
