@@ -21,6 +21,8 @@ var/
 wheels/
 *.egg-info/
 *.egg
+# local datasets / backtests
+data/
 
 # Virtual environments
 .env
