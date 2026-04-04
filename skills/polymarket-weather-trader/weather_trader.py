@@ -252,12 +252,16 @@ def get_strategy_v1_probability_model():
     return _strategy_v1_probability_model
 
 
-STRATEGY_V1_ALLOWED_CITIES = {"DALLAS", "CHICAGO", "ATLANTA", "NYC"}
 STRATEGY_V1_ALLOWED_BUCKET_TYPES = {"range", "below", "above"}
 STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
+STRATEGY_V1_MAX_POSITION_PER_MARKET_USD = 40.0
+STRATEGY_V1_MAX_BUYS_PER_MARKET = 5
+STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES = 20
+STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR = 0.95
+STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN = 10
 PAPER_SLIPPAGE_MAX_PCT = 0.25
 
 
@@ -273,6 +277,11 @@ def log_strategy_v1_decision(
     selected_side: str = None,
     open_position_exists: bool = None,
     historical_trade_exists: bool = None,
+    buy_count: int = None,
+    last_buy_at: str = None,
+    last_buy_price: float = None,
+    position_cost_usd: float = None,
+    current_side_price: float = None,
 ) -> None:
     bucket_type = getattr(candidate.bucket, "bucket_type", None) if candidate and candidate.bucket else None
     logger.event(
@@ -290,34 +299,119 @@ def log_strategy_v1_decision(
         edge_no=round(edge_no, 6) if edge_no is not None else None,
         open_position_exists=open_position_exists,
         historical_trade_exists=historical_trade_exists,
+        buy_count=buy_count,
+        last_buy_at=last_buy_at,
+        last_buy_price=round(last_buy_price, 6) if last_buy_price is not None else None,
+        position_cost_usd=round(position_cost_usd, 6) if position_cost_usd is not None else None,
+        current_side_price=round(current_side_price, 6) if current_side_price is not None else None,
     )
+
+
+def get_strategy_v1_rebuy_context(
+    paper_trader: PaperTrader,
+    market_id: str,
+    selected_side: str,
+    current_side_price: float,
+) -> dict:
+    position = paper_trader.get_open_position_state(market_id)
+    if not position:
+        return {
+            "open_position_exists": False,
+            "rebuy_allowed": True,
+            "buy_count": 0,
+            "position_cost_usd": 0.0,
+            "last_buy_at": None,
+            "last_buy_price": None,
+            "reason": None,
+        }
+
+    position_side = position.get("side")
+    buy_count = int(position.get("buy_count", 0) or 0)
+    position_cost_usd = float(position.get("position_cost_usd", position.get("cost_basis", 0.0)) or 0.0)
+    last_buy_at = position.get("last_buy_at")
+    last_buy_price = position.get("last_buy_price")
+
+    if position_side != selected_side:
+        return {
+            "open_position_exists": True,
+            "rebuy_allowed": False,
+            "buy_count": buy_count,
+            "position_cost_usd": position_cost_usd,
+            "last_buy_at": last_buy_at,
+            "last_buy_price": last_buy_price,
+            "reason": "open position exists",
+        }
+    if position_cost_usd >= STRATEGY_V1_MAX_POSITION_PER_MARKET_USD:
+        return {
+            "open_position_exists": True,
+            "rebuy_allowed": False,
+            "buy_count": buy_count,
+            "position_cost_usd": position_cost_usd,
+            "last_buy_at": last_buy_at,
+            "last_buy_price": last_buy_price,
+            "reason": "max_position_per_market",
+        }
+    if buy_count >= STRATEGY_V1_MAX_BUYS_PER_MARKET:
+        return {
+            "open_position_exists": True,
+            "rebuy_allowed": False,
+            "buy_count": buy_count,
+            "position_cost_usd": position_cost_usd,
+            "last_buy_at": last_buy_at,
+            "last_buy_price": last_buy_price,
+            "reason": "max_buys_per_market",
+        }
+    if last_buy_at:
+        try:
+            last_buy_dt = datetime.fromisoformat(str(last_buy_at).replace("Z", "+00:00"))
+            if last_buy_dt.tzinfo is None:
+                last_buy_dt = last_buy_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < last_buy_dt + timedelta(minutes=STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES):
+                return {
+                    "open_position_exists": True,
+                    "rebuy_allowed": False,
+                    "buy_count": buy_count,
+                    "position_cost_usd": position_cost_usd,
+                    "last_buy_at": last_buy_at,
+                    "last_buy_price": last_buy_price,
+                    "reason": "cooldown_between_buys",
+                }
+        except Exception:
+            pass
+    if last_buy_price is not None and current_side_price > float(last_buy_price) * STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR:
+        return {
+            "open_position_exists": True,
+            "rebuy_allowed": False,
+            "buy_count": buy_count,
+            "position_cost_usd": position_cost_usd,
+            "last_buy_at": last_buy_at,
+            "last_buy_price": last_buy_price,
+            "reason": "rebuy_price_not_better",
+        }
+    return {
+        "open_position_exists": True,
+        "rebuy_allowed": True,
+        "buy_count": buy_count,
+        "position_cost_usd": position_cost_usd,
+        "last_buy_at": last_buy_at,
+        "last_buy_price": last_buy_price,
+        "reason": "controlled_rebuy_allowed",
+    }
 
 
 def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: ExecutionMode):
     if execution_mode != ExecutionMode.PAPER:
         return None
 
-    city = (candidate.location or "").upper()
     bucket_type = getattr(candidate.bucket, "bucket_type", None)
     price_yes = candidate.price_yes
     gaussian_probability = probability_estimate.estimated_probability
     edge_yes = gaussian_probability - price_yes
     edge_no = price_yes - gaussian_probability
     paper_trader = get_paper_trader()
-    open_position_exists = paper_trader.has_open_position_for_market(candidate.market_id)
     historical_trade_exists = paper_trader.has_trade_for_market(candidate.market_id)
+    open_position_exists = paper_trader.has_open_position_for_market(candidate.market_id)
 
-    if city not in STRATEGY_V1_ALLOWED_CITIES:
-        return {
-            "action": "skip",
-            "reason": "city filter",
-            "price_yes": price_yes,
-            "gaussian_probability": gaussian_probability,
-            "edge_yes": edge_yes,
-            "edge_no": edge_no,
-            "open_position_exists": open_position_exists,
-            "historical_trade_exists": historical_trade_exists,
-        }
     if bucket_type not in STRATEGY_V1_ALLOWED_BUCKET_TYPES:
         return {
             "action": "skip",
@@ -340,18 +434,31 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "open_position_exists": open_position_exists,
             "historical_trade_exists": historical_trade_exists,
         }
-    if open_position_exists:
-        return {
-            "action": "skip",
-            "reason": "open position exists",
-            "price_yes": price_yes,
-            "gaussian_probability": gaussian_probability,
-            "edge_yes": edge_yes,
-            "edge_no": edge_no,
-            "open_position_exists": open_position_exists,
-            "historical_trade_exists": historical_trade_exists,
-        }
     if edge_no > STRATEGY_V1_NO_EDGE_THRESHOLD:
+        current_side_price = 1.0 - price_yes
+        rebuy_context = get_strategy_v1_rebuy_context(
+            paper_trader=paper_trader,
+            market_id=candidate.market_id,
+            selected_side="no",
+            current_side_price=current_side_price,
+        )
+        if not rebuy_context["rebuy_allowed"]:
+            return {
+                "action": "skip",
+                "reason": rebuy_context["reason"],
+                "selected_side": "no",
+                "price_yes": price_yes,
+                "gaussian_probability": gaussian_probability,
+                "edge_yes": edge_yes,
+                "edge_no": edge_no,
+                "open_position_exists": rebuy_context["open_position_exists"],
+                "historical_trade_exists": historical_trade_exists,
+                "buy_count": rebuy_context["buy_count"],
+                "last_buy_at": rebuy_context["last_buy_at"],
+                "last_buy_price": rebuy_context["last_buy_price"],
+                "position_cost_usd": rebuy_context["position_cost_usd"],
+                "current_side_price": current_side_price,
+            }
         return {
             "action": "trade",
             "reason": "primary no edge",
@@ -362,10 +469,39 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
-            "open_position_exists": open_position_exists,
+            "open_position_exists": rebuy_context["open_position_exists"],
             "historical_trade_exists": historical_trade_exists,
+            "buy_count": rebuy_context["buy_count"],
+            "last_buy_at": rebuy_context["last_buy_at"],
+            "last_buy_price": rebuy_context["last_buy_price"],
+            "position_cost_usd": rebuy_context["position_cost_usd"],
+            "current_side_price": current_side_price,
         }
     if edge_yes > STRATEGY_V1_YES_EDGE_THRESHOLD:
+        current_side_price = price_yes
+        rebuy_context = get_strategy_v1_rebuy_context(
+            paper_trader=paper_trader,
+            market_id=candidate.market_id,
+            selected_side="yes",
+            current_side_price=current_side_price,
+        )
+        if not rebuy_context["rebuy_allowed"]:
+            return {
+                "action": "skip",
+                "reason": rebuy_context["reason"],
+                "selected_side": "yes",
+                "price_yes": price_yes,
+                "gaussian_probability": gaussian_probability,
+                "edge_yes": edge_yes,
+                "edge_no": edge_no,
+                "open_position_exists": rebuy_context["open_position_exists"],
+                "historical_trade_exists": historical_trade_exists,
+                "buy_count": rebuy_context["buy_count"],
+                "last_buy_at": rebuy_context["last_buy_at"],
+                "last_buy_price": rebuy_context["last_buy_price"],
+                "position_cost_usd": rebuy_context["position_cost_usd"],
+                "current_side_price": current_side_price,
+            }
         return {
             "action": "trade",
             "reason": "secondary yes edge",
@@ -376,8 +512,13 @@ def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: Ex
             "gaussian_probability": gaussian_probability,
             "edge_yes": edge_yes,
             "edge_no": edge_no,
-            "open_position_exists": open_position_exists,
+            "open_position_exists": rebuy_context["open_position_exists"],
             "historical_trade_exists": historical_trade_exists,
+            "buy_count": rebuy_context["buy_count"],
+            "last_buy_at": rebuy_context["last_buy_at"],
+            "last_buy_price": rebuy_context["last_buy_price"],
+            "position_cost_usd": rebuy_context["position_cost_usd"],
+            "current_side_price": current_side_price,
         }
     return {
         "action": "skip",
@@ -1088,12 +1229,17 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "strategy_v1_mode_enabled",
             strategy="strategy_v1",
             mode="paper_only",
-            allowed_cities=sorted(STRATEGY_V1_ALLOWED_CITIES),
+            allowed_cities="all_active_locations",
             allowed_bucket_types=sorted(STRATEGY_V1_ALLOWED_BUCKET_TYPES),
             no_edge_threshold=STRATEGY_V1_NO_EDGE_THRESHOLD,
             yes_edge_threshold=STRATEGY_V1_YES_EDGE_THRESHOLD,
             min_market_price=STRATEGY_V1_MIN_PRICE,
             max_market_price=STRATEGY_V1_MAX_PRICE,
+            max_position_per_market_usd=STRATEGY_V1_MAX_POSITION_PER_MARKET_USD,
+            max_buys_per_market=STRATEGY_V1_MAX_BUYS_PER_MARKET,
+            cooldown_between_buys_minutes=STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES,
+            rebuy_price_improvement_factor=STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR,
+            paper_max_trades_per_run=STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN,
         )
     elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
@@ -1102,7 +1248,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
     log(f"  Exit threshold:  {EXIT_THRESHOLD:.0%} (sell above this)")
     log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
-    log(f"  Max trades/run:  {MAX_TRADES_PER_RUN}")
+    effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
+    log(f"  Max trades/run:  {effective_max_trades_per_run}")
     log(f"  Locations:       {', '.join(ACTIVE_LOCATIONS)}")
     log(f"  Smart sizing:    {'✓ Enabled' if smart_sizing else '✗ Disabled'}")
     log(f"  Safeguards:      {'✓ Enabled' if use_safeguards else '✗ Disabled'}")
@@ -1397,6 +1544,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 selected_side=strategy_v1_decision.get("selected_side"),
                 open_position_exists=strategy_v1_decision.get("open_position_exists"),
                 historical_trade_exists=strategy_v1_decision.get("historical_trade_exists"),
+                buy_count=strategy_v1_decision.get("buy_count"),
+                last_buy_at=strategy_v1_decision.get("last_buy_at"),
+                last_buy_price=strategy_v1_decision.get("last_buy_price"),
+                position_cost_usd=strategy_v1_decision.get("position_cost_usd"),
+                current_side_price=strategy_v1_decision.get("current_side_price"),
             )
 
         should_trade = False
@@ -1450,8 +1602,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 log(f"  ✅ Below threshold (${ENTRY_THRESHOLD:.2f}) - BUY opportunity!{trend_bonus}")
 
             # Check rate limit
-            if trades_executed >= MAX_TRADES_PER_RUN:
-                log(f"  ⏸️  Max trades per run ({MAX_TRADES_PER_RUN}) reached - skipping")
+            current_run_trade_cap = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if execution_mode == ExecutionMode.PAPER else MAX_TRADES_PER_RUN
+            if trades_executed >= current_run_trade_cap:
+                log(f"  ⏸️  Max trades per run ({current_run_trade_cap}) reached - skipping")
                 skip_reasons.append("max trades reached")
                 continue
 

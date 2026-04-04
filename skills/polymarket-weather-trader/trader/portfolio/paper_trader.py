@@ -74,6 +74,31 @@ class PaperTrader:
             return False
         return float(position.get("shares", 0.0) or 0.0) > 0.0
 
+    def get_open_position_state(self, market_id: str) -> Optional[dict]:
+        position = (self.state.get("positions") or {}).get(market_id)
+        if not position:
+            return None
+        if float(position.get("shares", 0.0) or 0.0) <= 0.0:
+            return None
+        state = dict(position)
+        buy_trades = [
+            trade
+            for trade in self.state.get("trades", [])
+            if trade.get("market_id") == market_id
+            and trade.get("action") == "buy"
+            and trade.get("side") == state.get("side")
+        ]
+        state.setdefault("buy_count", len(buy_trades))
+        state.setdefault("position_cost_usd", state.get("cost_basis", 0.0))
+        if buy_trades:
+            latest_buy = max(buy_trades, key=lambda trade: str(trade.get("timestamp") or ""))
+            state.setdefault("last_buy_at", latest_buy.get("timestamp"))
+            state.setdefault("last_buy_price", latest_buy.get("simulated_fill_price"))
+        else:
+            state.setdefault("last_buy_at", None)
+            state.setdefault("last_buy_price", None)
+        return state
+
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
         try:
             context = adapter.get_market_context(market_id)
@@ -153,6 +178,10 @@ class PaperTrader:
             "shares": 0.0,
             "avg_cost": 0.0,
             "cost_basis": 0.0,
+            "position_cost_usd": 0.0,
+            "buy_count": 0,
+            "last_buy_at": None,
+            "last_buy_price": None,
             "opened_at": timestamp,
             "updated_at": timestamp,
             "sources": ["sdk:weather"] if signal_source else [],
@@ -166,7 +195,11 @@ class PaperTrader:
             new_cost_basis = position["cost_basis"] + cost
             position["shares"] = new_total_shares
             position["cost_basis"] = new_cost_basis
+            position["position_cost_usd"] = new_cost_basis
             position["avg_cost"] = (new_cost_basis / new_total_shares) if new_total_shares > 0 else 0.0
+            position["buy_count"] = int(position.get("buy_count", 0) or 0) + 1
+            position["last_buy_at"] = timestamp
+            position["last_buy_price"] = price
             self.state["cash_balance"] -= cost
             self._log_event(
                 "paper_position_opened",
@@ -174,6 +207,8 @@ class PaperTrader:
                 side=side,
                 shares=round(position["shares"], 6),
                 avg_cost=round(position["avg_cost"], 6),
+                buy_count=position["buy_count"],
+                position_cost_usd=round(position["position_cost_usd"], 6),
             )
         else:
             available = position.get("shares", 0.0)
@@ -196,6 +231,7 @@ class PaperTrader:
             remaining_cost_basis = max(0.0, position.get("cost_basis", 0.0) - (filled_shares * avg_cost))
             position["shares"] = remaining_shares
             position["cost_basis"] = remaining_cost_basis
+            position["position_cost_usd"] = remaining_cost_basis
             position["avg_cost"] = (remaining_cost_basis / remaining_shares) if remaining_shares > 0 else 0.0
             self.state["cash_balance"] += proceeds
             self.state["realized_pnl"] += realized_pnl
@@ -213,6 +249,8 @@ class PaperTrader:
                     side=side,
                     shares=round(position["shares"], 6),
                     avg_cost=round(position["avg_cost"], 6),
+                    buy_count=position.get("buy_count"),
+                    position_cost_usd=round(position.get("position_cost_usd", 0.0), 6),
                 )
 
         position["updated_at"] = timestamp
