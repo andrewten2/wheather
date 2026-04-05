@@ -1128,7 +1128,11 @@ def check_exit_opportunities(
         no_price = None
         chosen_exit_price = pos.current_price
         if execution_mode == ExecutionMode.PAPER:
-            price_snapshot = get_paper_trader().get_market_price_snapshot(get_adapter(), market_id)
+            price_snapshot = get_paper_trader().get_market_price_snapshot(
+                get_adapter(),
+                market_id,
+                stored_question=pos.question,
+            )
             if price_snapshot:
                 yes_price = price_snapshot.get("yes_price")
                 no_price = price_snapshot.get("no_price")

@@ -105,14 +105,9 @@ class PaperTrader:
             return None
         return snapshot.get("no_price") if side == "no" else snapshot.get("yes_price")
 
-    def get_market_price_snapshot(self, adapter, market_id: str) -> Optional[dict]:
-        try:
-            context = adapter.get_market_context(market_id)
-        except Exception:
+    def _build_price_snapshot_from_market(self, market: dict) -> Optional[dict]:
+        if not market:
             return None
-        if not context or "market" not in context:
-            return None
-        market = context["market"]
         raw_price_yes = market.get("external_price_yes")
         if raw_price_yes is None:
             raw_price_yes = market.get("current_probability")
@@ -126,15 +121,55 @@ class PaperTrader:
             "market": market,
         }
 
+    def _fallback_market_lookup(self, adapter, market_id: str, stored_question: Optional[str] = None) -> Optional[dict]:
+        try:
+            markets = adapter.fetch_weather_markets()
+        except Exception:
+            return None
+
+        if not markets:
+            return None
+
+        for market in markets:
+            if market.get("id") == market_id:
+                return market
+
+        normalized_question = (stored_question or "").strip().lower()
+        if normalized_question and normalized_question != market_id.lower():
+            for market in markets:
+                question = (market.get("question") or "").strip().lower()
+                event_name = (market.get("event_name") or "").strip().lower()
+                if normalized_question == question or normalized_question == event_name:
+                    return market
+        return None
+
+    def get_market_price_snapshot(self, adapter, market_id: str, stored_question: Optional[str] = None) -> Optional[dict]:
+        try:
+            context = adapter.get_market_context(market_id)
+        except Exception:
+            context = None
+        if context and "market" in context:
+            snapshot = self._build_price_snapshot_from_market(context["market"])
+            if snapshot is not None:
+                return snapshot
+
+        fallback_market = self._fallback_market_lookup(adapter, market_id, stored_question=stored_question)
+        if fallback_market:
+            return self._build_price_snapshot_from_market(fallback_market)
+        return None
+
     def _get_market_question(self, adapter, market_id: str) -> str:
         try:
             context = adapter.get_market_context(market_id)
         except Exception:
-            return market_id
-        if not context or "market" not in context:
-            return market_id
-        market = context["market"]
-        return market.get("question") or market.get("event_name") or market_id
+            context = None
+        if context and "market" in context:
+            market = context["market"]
+            return market.get("question") or market.get("event_name") or market_id
+        fallback_market = self._fallback_market_lookup(adapter, market_id)
+        if fallback_market:
+            return fallback_market.get("question") or fallback_market.get("event_name") or market_id
+        return market_id
 
     def simulate_order(
         self,
@@ -319,7 +354,7 @@ class PaperTrader:
     def get_positions(self, adapter) -> List[Position]:
         positions = []
         for market_id, stored in self.state["positions"].items():
-            price_snapshot = self.get_market_price_snapshot(adapter, market_id)
+            price_snapshot = self.get_market_price_snapshot(adapter, market_id, stored_question=stored.get("question"))
             side = stored.get("side", "yes")
             price = None if not price_snapshot else (price_snapshot.get("no_price") if side == "no" else price_snapshot.get("yes_price"))
             shares = stored.get("shares", 0.0)
