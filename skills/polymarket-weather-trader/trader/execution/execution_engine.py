@@ -55,12 +55,21 @@ class ExecutionEngine:
             signal_data=signal_data,
         )
 
-    def sell(self, market_id: str, side: str, shares: float) -> ExecutionResult:
+    def sell(
+        self,
+        market_id: str,
+        side: str,
+        shares: float,
+        market_price: Optional[float] = None,
+        market_question: Optional[str] = None,
+    ) -> ExecutionResult:
         return self._submit_trade(
             market_id=market_id,
             side=side,
             action="sell",
             shares=shares,
+            market_price=market_price,
+            market_question=market_question,
         )
 
     def _submit_trade(
@@ -72,18 +81,22 @@ class ExecutionEngine:
         shares: Optional[float] = None,
         reasoning: str = None,
         signal_data: dict = None,
+        market_price: Optional[float] = None,
+        market_question: Optional[str] = None,
     ) -> ExecutionResult:
         mode = self.get_mode()
         if mode == ExecutionMode.PAPER and self.paper_trader is not None:
             signal_source = None
-            market_price = None
-            market_question = None
+            resolved_market_price = market_price
+            resolved_market_question = market_question
             if signal_data:
                 signal_source = signal_data.get("signal_source")
-                market_price = signal_data.get("market_price")
-                market_question = signal_data.get("question") or signal_data.get("event_name")
-                if side == "no" and market_price is not None:
-                    market_price = signal_data.get("market_price_no", 1.0 - market_price)
+                if resolved_market_price is None:
+                    resolved_market_price = signal_data.get("market_price")
+                    if side == "no" and resolved_market_price is not None:
+                        resolved_market_price = signal_data.get("market_price_no", 1.0 - resolved_market_price)
+                if resolved_market_question is None:
+                    resolved_market_question = signal_data.get("question") or signal_data.get("event_name")
             return self.paper_trader.simulate_order(
                 adapter=self.adapter,
                 market_id=market_id,
@@ -92,8 +105,8 @@ class ExecutionEngine:
                 amount=amount,
                 shares=shares,
                 signal_source=signal_source,
-                market_price=market_price,
-                market_question=market_question,
+                market_price=resolved_market_price,
+                market_question=resolved_market_question,
             )
 
         try:

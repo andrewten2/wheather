@@ -100,6 +100,12 @@ class PaperTrader:
         return state
 
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
+        snapshot = self.get_market_price_snapshot(adapter, market_id)
+        if not snapshot:
+            return None
+        return snapshot.get("no_price") if side == "no" else snapshot.get("yes_price")
+
+    def get_market_price_snapshot(self, adapter, market_id: str) -> Optional[dict]:
         try:
             context = adapter.get_market_context(market_id)
         except Exception:
@@ -107,8 +113,18 @@ class PaperTrader:
         if not context or "market" not in context:
             return None
         market = context["market"]
-        price_yes = float(market.get("external_price_yes") or market.get("current_probability") or 0.5)
-        return (1.0 - price_yes) if side == "no" else price_yes
+        raw_price_yes = market.get("external_price_yes")
+        if raw_price_yes is None:
+            raw_price_yes = market.get("current_probability")
+        if raw_price_yes is None:
+            return None
+        price_yes = float(raw_price_yes)
+        price_no = 1.0 - price_yes
+        return {
+            "yes_price": price_yes,
+            "no_price": price_no,
+            "market": market,
+        }
 
     def _get_market_question(self, adapter, market_id: str) -> str:
         try:
@@ -303,10 +319,12 @@ class PaperTrader:
     def get_positions(self, adapter) -> List[Position]:
         positions = []
         for market_id, stored in self.state["positions"].items():
-            price = self._get_market_price(adapter, market_id, stored.get("side", "yes")) or 0.0
+            price_snapshot = self.get_market_price_snapshot(adapter, market_id)
+            side = stored.get("side", "yes")
+            price = None if not price_snapshot else (price_snapshot.get("no_price") if side == "no" else price_snapshot.get("yes_price"))
             shares = stored.get("shares", 0.0)
-            current_value = shares * price
-            pnl = current_value - stored.get("cost_basis", 0.0)
+            current_value = (shares * price) if price is not None else None
+            pnl = (current_value - stored.get("cost_basis", 0.0)) if current_value is not None else None
             positions.append(
                 Position(
                     market_id=market_id,

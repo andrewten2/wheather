@@ -1011,9 +1011,21 @@ def execute_trade(market_id: str, side: str, amount: float, reasoning: str = Non
     return out
 
 
-def execute_sell(market_id: str, shares: float, side: str = "yes") -> dict:
+def execute_sell(
+    market_id: str,
+    shares: float,
+    side: str = "yes",
+    market_price: float = None,
+    market_question: str = None,
+) -> dict:
     """Execute a sell trade via execution layer with source tagging."""
-    result = get_execution_engine().sell(market_id=market_id, side=side, shares=shares)
+    result = get_execution_engine().sell(
+        market_id=market_id,
+        side=side,
+        shares=shares,
+        market_price=market_price,
+        market_question=market_question,
+    )
     out = {
         "success": result.success,
         "trade_id": result.trade_id,
@@ -1108,13 +1120,48 @@ def check_exit_opportunities(
 
     for pos in weather_positions:
         market_id = pos.market_id
-        current_price = pos.current_price or 0
         position_side = get_position_side(pos) if execution_mode == ExecutionMode.PAPER else "yes"
         shares = (pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and position_side == "no") else (pos.shares_yes or 0)
         entry_price = pos.avg_cost or 0
         question = pos.question[:50] if pos.question else "Unknown"
+        yes_price = None
+        no_price = None
+        chosen_exit_price = pos.current_price
+        if execution_mode == ExecutionMode.PAPER:
+            price_snapshot = get_paper_trader().get_market_price_snapshot(get_adapter(), market_id)
+            if price_snapshot:
+                yes_price = price_snapshot.get("yes_price")
+                no_price = price_snapshot.get("no_price")
+                chosen_exit_price = no_price if position_side == "no" else yes_price
+            if logger is not None:
+                logger.event(
+                    "exit_price_check",
+                    market_id=market_id,
+                    outcome_name=pos.question,
+                    side=position_side,
+                    yes_price=round(yes_price, 6) if yes_price is not None else None,
+                    no_price=round(no_price, 6) if no_price is not None else None,
+                    chosen_exit_price=round(chosen_exit_price, 6) if chosen_exit_price is not None else None,
+                )
+        current_price = chosen_exit_price
 
         if shares < MIN_SHARES_PER_ORDER:
+            continue
+
+        if current_price is None:
+            print(f"  📊 {question}...")
+            print(f"     ⏭️  Skip exit: price not found")
+            if logger is not None:
+                logger.event(
+                    "exit_price_check",
+                    market_id=market_id,
+                    outcome_name=pos.question,
+                    side=position_side,
+                    yes_price=round(yes_price, 6) if yes_price is not None else None,
+                    no_price=round(no_price, 6) if no_price is not None else None,
+                    chosen_exit_price=None,
+                    reason="skip exit: price not found",
+                )
             continue
 
         if current_price >= EXIT_THRESHOLD:
@@ -1156,7 +1203,13 @@ def check_exit_opportunities(
             tag = "SIMULATED" if dry_run else "LIVE"
             side_label = position_side.upper()
             print(f"     Selling {side_label} {shares:.1f} shares ({tag})...")
-            result = execute_sell(market_id, shares, side=position_side)
+            result = execute_sell(
+                market_id,
+                shares,
+                side=position_side,
+                market_price=current_price,
+                market_question=pos.question,
+            )
 
             if result.get("success"):
                 exits_executed += 1
