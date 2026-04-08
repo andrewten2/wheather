@@ -60,6 +60,7 @@ from trader.execution.execution_engine import ExecutionEngine
 from trader.models.execution import ExecutionMode
 from trader.forecasting.forecast_provider import ForecastProvider
 from trader.markets.market_parser import (
+    build_weather_market,
     parse_weather_event as parse_weather_event_model,
     parse_temperature_bucket as parse_temperature_bucket_model,
 )
@@ -95,6 +96,7 @@ from trader.strategy.probability_model import DEFAULT_SIGMA_SCHEDULE, create_pro
 from trader.strategy.signal_engine import build_entry_signal
 from trader.telemetry.logger import StructuredLogger
 from trader.models.signal import TradeSignal
+from trader.models.signal import CandidateTrade
 
 # Configuration schema
 # Note: env var names match autotune registry. Legacy aliases (SIMMER_WEATHER_ENTRY,
@@ -262,6 +264,7 @@ STRATEGY_V1_MAX_BUYS_PER_MARKET = 5
 STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES = 20
 STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR = 0.95
 STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN = 10
+MARKET_EXIT_COOLDOWN_MINUTES = 120
 PAPER_SLIPPAGE_MAX_PCT = 0.25
 
 
@@ -315,6 +318,24 @@ def get_strategy_v1_rebuy_context(
 ) -> dict:
     position = paper_trader.get_open_position_state(market_id)
     if not position:
+        last_exit_at = paper_trader.get_last_exit_time(market_id)
+        if last_exit_at:
+            try:
+                last_exit_dt = datetime.fromisoformat(str(last_exit_at).replace("Z", "+00:00"))
+                if last_exit_dt.tzinfo is None:
+                    last_exit_dt = last_exit_dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < last_exit_dt + timedelta(minutes=MARKET_EXIT_COOLDOWN_MINUTES):
+                    return {
+                        "open_position_exists": False,
+                        "rebuy_allowed": False,
+                        "buy_count": 0,
+                        "position_cost_usd": 0.0,
+                        "last_buy_at": None,
+                        "last_buy_price": None,
+                        "reason": "market_exit_cooldown",
+                    }
+            except Exception:
+                pass
         return {
             "open_position_exists": False,
             "rebuy_allowed": True,
@@ -1088,6 +1109,92 @@ def get_position_side(pos) -> str:
     return "yes"
 
 
+def get_position_entry_price(pos, execution_mode: ExecutionMode) -> float:
+    if execution_mode == ExecutionMode.PAPER:
+        position_state = get_paper_trader().get_open_position_state(pos.market_id)
+        if position_state:
+            entry_price = position_state.get("entry_price")
+            if entry_price is not None:
+                return float(entry_price)
+    return float(pos.avg_cost or 0.0)
+
+
+def get_exit_targets(entry_price: float, side: str) -> tuple[float, float]:
+    if side == "no":
+        take_profit = min(1.0, entry_price + 0.12)
+        stop_loss = max(0.0, entry_price - 0.10)
+    else:
+        take_profit = min(1.0, entry_price + 0.15)
+        stop_loss = max(0.0, entry_price - 0.08)
+    return take_profit, stop_loss
+
+
+def build_market_price_snapshot(raw_market: dict) -> Optional[dict]:
+    if not raw_market:
+        return None
+    raw_price_yes = raw_market.get("external_price_yes")
+    if raw_price_yes is None:
+        raw_price_yes = raw_market.get("current_probability")
+    if raw_price_yes is None:
+        return None
+    price_yes = float(raw_price_yes)
+    return {
+        "yes_price": price_yes,
+        "no_price": 1.0 - price_yes,
+        "market": raw_market,
+    }
+
+
+def compute_position_exit_edge(market_snapshot: dict) -> Optional[dict]:
+    if not market_snapshot:
+        return None
+    raw_market = market_snapshot.get("market")
+    if not raw_market:
+        return None
+
+    market = build_weather_market(raw_market)
+    event_info = parse_weather_event_model(market.event_name, LOCATION_ALIASES)
+    bucket = parse_temperature_bucket_model(market.outcome_name)
+    if not event_info or bucket is None:
+        return None
+
+    forecast = get_forecast_provider().get_forecast(
+        event_info["location"],
+        event_info["date"],
+        event_info["metric"],
+    )
+    if not forecast:
+        return None
+
+    candidate = CandidateTrade(
+        market_id=market.market_id,
+        event_name=market.event_name,
+        outcome_name=market.outcome_name,
+        price_yes=float(market.price_yes),
+        forecast_temp=float(forecast.predicted_value),
+        unit_label="°C" if forecast.unit == "C" else "°F",
+        location=event_info["location"],
+        target_date=event_info["date"],
+        metric=event_info["metric"],
+        market=market,
+        bucket=bucket,
+    )
+    probability_estimate = get_strategy_v1_probability_model().estimate(
+        candidate_trade=candidate,
+        forecast=forecast,
+        market=market,
+        config=_config,
+    )
+    gaussian_probability = probability_estimate.estimated_probability
+    edge_yes = gaussian_probability - float(market.price_yes)
+    edge_no = float(market.price_yes) - gaussian_probability
+    return {
+        "gaussian_probability": gaussian_probability,
+        "edge_yes": edge_yes,
+        "edge_no": edge_no,
+    }
+
+
 # =============================================================================
 # Exit Strategy
 # =============================================================================
@@ -1122,11 +1229,12 @@ def check_exit_opportunities(
         market_id = pos.market_id
         position_side = get_position_side(pos) if execution_mode == ExecutionMode.PAPER else "yes"
         shares = (pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and position_side == "no") else (pos.shares_yes or 0)
-        entry_price = pos.avg_cost or 0
+        entry_price = get_position_entry_price(pos, execution_mode)
         question = pos.question[:50] if pos.question else "Unknown"
         yes_price = None
         no_price = None
         chosen_exit_price = pos.current_price
+        price_snapshot = None
         if execution_mode == ExecutionMode.PAPER:
             price_snapshot = get_paper_trader().get_market_price_snapshot(
                 get_adapter(),
@@ -1147,6 +1255,10 @@ def check_exit_opportunities(
                     no_price=round(no_price, 6) if no_price is not None else None,
                     chosen_exit_price=round(chosen_exit_price, 6) if chosen_exit_price is not None else None,
                 )
+        else:
+            context = get_market_context(market_id)
+            if context and context.get("market"):
+                price_snapshot = build_market_price_snapshot(context["market"])
         current_price = chosen_exit_price
 
         if shares < MIN_SHARES_PER_ORDER:
@@ -1168,13 +1280,38 @@ def check_exit_opportunities(
                 )
             continue
 
-        if current_price >= EXIT_THRESHOLD:
+        take_profit, stop_loss = get_exit_targets(entry_price, position_side)
+        exit_reason = None
+        if current_price >= take_profit:
+            exit_reason = "take_profit"
+        elif current_price <= stop_loss:
+            exit_reason = "stop_loss"
+        else:
+            exit_edge = compute_position_exit_edge(price_snapshot)
+            if exit_edge is not None:
+                current_edge = exit_edge.get("edge_no") if position_side == "no" else exit_edge.get("edge_yes")
+                if current_edge is not None and current_edge < 0:
+                    exit_reason = "edge_invalidated"
+
+        if logger is not None:
+            logger.event(
+                "exit_check",
+                market_id=market_id,
+                side=position_side,
+                entry_price=round(entry_price, 6),
+                current_price=round(current_price, 6),
+                take_profit=round(take_profit, 6),
+                stop_loss=round(stop_loss, 6),
+                exit_reason=exit_reason,
+            )
+
+        if exit_reason is not None:
             exits_found += 1
             print(f"  📤 {question}...")
-            if execution_mode == ExecutionMode.PAPER and position_side == "no":
-                print(f"     NO price ${current_price:.2f} >= exit threshold ${EXIT_THRESHOLD:.2f}")
-            else:
-                print(f"     Price ${current_price:.2f} >= exit threshold ${EXIT_THRESHOLD:.2f}")
+            print(
+                f"     {position_side.upper()} entry ${entry_price:.2f} -> current ${current_price:.2f} "
+                f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_reason}"
+            )
 
             # Check safeguards before selling
             if use_safeguards:
@@ -1227,10 +1364,10 @@ def check_exit_opportunities(
                         "strategy_v1_exit_decision",
                         selected_side=position_side,
                         market_id=market_id,
-                        entry_price=round(entry_price, 6) if entry_price else 0.0,
+                        entry_price=round(entry_price, 6),
                         current_price=round(current_price, 6),
                         realized_pnl=result.get("realized_pnl"),
-                        reason_for_exit=f"{position_side}_price_reached_exit_threshold",
+                        reason_for_exit=exit_reason,
                     )
 
                 # Log sell trade context for journal (skip for paper trades)
@@ -1238,7 +1375,11 @@ def check_exit_opportunities(
                     log_trade(
                         trade_id=trade_id,
                         source=TRADE_SOURCE, skill_slug=SKILL_SLUG,
-                        thesis=f"Exit: price ${current_price:.2f} reached exit threshold ${EXIT_THRESHOLD:.2f}",
+                        thesis=(
+                            f"Exit: {position_side.upper()} current ${current_price:.2f} "
+                            f"vs entry ${entry_price:.2f} "
+                            f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_reason}"
+                        ),
                         action="sell",
                     )
             else:
@@ -1246,10 +1387,10 @@ def check_exit_opportunities(
                 print(f"     ❌ Sell failed: {error}")
         else:
             print(f"  📊 {question}...")
-            if execution_mode == ExecutionMode.PAPER and position_side == "no":
-                print(f"     NO price ${current_price:.2f} < exit threshold ${EXIT_THRESHOLD:.2f} - hold")
-            else:
-                print(f"     Price ${current_price:.2f} < exit threshold ${EXIT_THRESHOLD:.2f} - hold")
+            print(
+                f"     {position_side.upper()} hold: entry ${entry_price:.2f}, current ${current_price:.2f}, "
+                f"tp ${take_profit:.2f}, sl ${stop_loss:.2f}"
+            )
 
     return exits_found, exits_executed
 
@@ -1297,13 +1438,18 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             cooldown_between_buys_minutes=STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES,
             rebuy_price_improvement_factor=STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR,
             paper_max_trades_per_run=STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN,
+            market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
+            yes_take_profit_delta=0.15,
+            yes_stop_loss_delta=0.08,
+            no_take_profit_delta=0.12,
+            no_stop_loss_delta=0.10,
         )
     elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
 
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
-    log(f"  Exit threshold:  {EXIT_THRESHOLD:.0%} (sell above this)")
+    log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")

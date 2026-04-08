@@ -30,6 +30,7 @@ class PaperTrader:
             "initial_cash": self.initial_cash,
             "cash_balance": self.initial_cash,
             "realized_pnl": 0.0,
+            "market_exit_times": {},
             "positions": {},
             "orders": [],
             "trades": [],
@@ -49,6 +50,7 @@ class PaperTrader:
         state.setdefault("positions", {})
         state.setdefault("orders", [])
         state.setdefault("trades", [])
+        state.setdefault("market_exit_times", {})
         state.setdefault("cash_balance", state.get("initial_cash", self.initial_cash))
         state.setdefault("realized_pnl", 0.0)
         state.setdefault("updated_at", self._now())
@@ -91,13 +93,19 @@ class PaperTrader:
         state.setdefault("buy_count", len(buy_trades))
         state.setdefault("position_cost_usd", state.get("cost_basis", 0.0))
         if buy_trades:
+            earliest_buy = min(buy_trades, key=lambda trade: str(trade.get("timestamp") or ""))
             latest_buy = max(buy_trades, key=lambda trade: str(trade.get("timestamp") or ""))
+            state.setdefault("entry_price", earliest_buy.get("simulated_fill_price"))
             state.setdefault("last_buy_at", latest_buy.get("timestamp"))
             state.setdefault("last_buy_price", latest_buy.get("simulated_fill_price"))
         else:
+            state.setdefault("entry_price", state.get("avg_cost"))
             state.setdefault("last_buy_at", None)
             state.setdefault("last_buy_price", None)
         return state
+
+    def get_last_exit_time(self, market_id: str) -> Optional[str]:
+        return (self.state.get("market_exit_times") or {}).get(market_id)
 
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
         snapshot = self.get_market_price_snapshot(adapter, market_id)
@@ -229,6 +237,7 @@ class PaperTrader:
             "shares": 0.0,
             "avg_cost": 0.0,
             "cost_basis": 0.0,
+            "entry_price": price,
             "position_cost_usd": 0.0,
             "buy_count": 0,
             "last_buy_at": None,
@@ -244,6 +253,7 @@ class PaperTrader:
             cost = amount or 0.0
             new_total_shares = position["shares"] + filled_shares
             new_cost_basis = position["cost_basis"] + cost
+            position.setdefault("entry_price", price)
             position["shares"] = new_total_shares
             position["cost_basis"] = new_cost_basis
             position["position_cost_usd"] = new_cost_basis
@@ -287,6 +297,7 @@ class PaperTrader:
             self.state["cash_balance"] += proceeds
             self.state["realized_pnl"] += realized_pnl
             if remaining_shares == 0:
+                self.state.setdefault("market_exit_times", {})[market_id] = timestamp
                 self._log_event(
                     "paper_position_closed",
                     market_id=market_id,
