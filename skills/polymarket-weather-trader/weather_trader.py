@@ -259,6 +259,16 @@ STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
+STRATEGY_V1_MID_NO_EDGE_THRESHOLD = 0.30
+STRATEGY_V1_MID_YES_EDGE_THRESHOLD = 0.35
+STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.60
+STRATEGY_V1_MID_YES_MAX_PRICE = 0.30
+STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
+STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
+STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.90
+STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
+STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
+STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
 STRATEGY_V1_MAX_POSITION_PER_MARKET_USD = 40.0
 STRATEGY_V1_MAX_BUYS_PER_MARKET = 5
 STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES = 20
@@ -308,6 +318,391 @@ def log_strategy_v1_decision(
         position_cost_usd=round(position_cost_usd, 6) if position_cost_usd is not None else None,
         current_side_price=round(current_side_price, 6) if current_side_price is not None else None,
     )
+
+
+def log_entry_regime_decision(
+    logger: StructuredLogger,
+    market_id: str = None,
+    bucket_range: str = None,
+    forecast_value: float = None,
+    bucket_relation: str = None,
+    mode: str = None,
+    yes_price: float = None,
+    no_price: float = None,
+    decision: str = None,
+    reason: str = None,
+) -> None:
+    logger.event(
+        "entry_regime_decision",
+        market_id=market_id,
+        bucket_range=bucket_range,
+        forecast_value=round(forecast_value, 6) if forecast_value is not None else None,
+        bucket_relation=bucket_relation,
+        mode=mode,
+        yes_price=round(yes_price, 6) if yes_price is not None else None,
+        no_price=round(no_price, 6) if no_price is not None else None,
+        decision=decision,
+        reason=reason,
+    )
+
+
+def get_forecast_horizon_hours(forecast) -> Optional[float]:
+    timestamp = getattr(forecast, "timestamp", None) or getattr(forecast, "retrieved_at", None)
+    target_date = getattr(forecast, "target_date", None)
+    if not timestamp or not target_date:
+        return None
+    try:
+        forecast_ts = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        if forecast_ts.tzinfo is None:
+            forecast_ts = forecast_ts.replace(tzinfo=timezone.utc)
+        target_ts = datetime.fromisoformat(f"{target_date}T23:59:59+00:00")
+    except Exception:
+        return None
+    return max(0.0, (target_ts - forecast_ts.astimezone(timezone.utc)).total_seconds() / 3600.0)
+
+
+def get_forecast_age_hours(forecast) -> Optional[float]:
+    timestamp = getattr(forecast, "timestamp", None) or getattr(forecast, "retrieved_at", None)
+    if not timestamp:
+        return None
+    try:
+        forecast_ts = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        if forecast_ts.tzinfo is None:
+            forecast_ts = forecast_ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - forecast_ts.astimezone(timezone.utc)).total_seconds() / 3600.0)
+
+
+def classify_market_regime(forecast) -> str:
+    horizon_hours = get_forecast_horizon_hours(forecast)
+    if horizon_hours is None:
+        return "mid"
+    if horizon_hours >= STRATEGY_V1_EARLY_MARKET_MIN_HOURS:
+        return "early"
+    if horizon_hours <= STRATEGY_V1_LATE_MARKET_MAX_HOURS:
+        return "late"
+    return "mid"
+
+
+def is_forecast_fresh(forecast) -> bool:
+    age_hours = get_forecast_age_hours(forecast)
+    if age_hours is None:
+        return False
+    return age_hours <= STRATEGY_V1_FORECAST_FRESH_MAX_HOURS
+
+
+def _bucket_distance_to_forecast(bucket, forecast_temp: float) -> float:
+    if bucket.low <= forecast_temp <= bucket.high:
+        return 0.0
+    return min(abs(forecast_temp - float(bucket.low)), abs(forecast_temp - float(bucket.high)))
+
+
+def _select_central_bucket_index(candidates: list, forecast_temp: float) -> int:
+    containing = [
+        idx for idx, item in enumerate(candidates)
+        if item["bucket"].low <= forecast_temp <= item["bucket"].high
+    ]
+    if containing:
+        return containing[0]
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda item: (
+            _bucket_distance_to_forecast(item[1]["bucket"], forecast_temp),
+            abs(((float(item[1]["bucket"].low) + float(item[1]["bucket"].high)) / 2.0) - forecast_temp),
+        ),
+    )
+    return ranked[0][0]
+
+
+def _classify_bucket_relation(index: int, central_index: int) -> str:
+    bucket_distance = abs(index - central_index)
+    if bucket_distance == 0:
+        return "central"
+    if bucket_distance == 1:
+        return "near"
+    if bucket_distance <= 3:
+        return "far"
+    return "almost_impossible"
+
+
+def build_strategy_v1_event_candidates(
+    event_markets: list,
+    forecast,
+    unit_label: str,
+    location: str,
+    date_str: str,
+    metric: str,
+) -> list:
+    probability_model = get_strategy_v1_probability_model()
+    ranked_candidates = []
+    for raw_market in event_markets:
+        weather_market = build_weather_market(raw_market)
+        bucket = parse_temperature_bucket_model(weather_market.outcome_name)
+        if bucket is None or bucket.bucket_type not in STRATEGY_V1_ALLOWED_BUCKET_TYPES:
+            continue
+        candidate = CandidateTrade(
+            market_id=weather_market.market_id,
+            event_name=weather_market.event_name,
+            outcome_name=weather_market.outcome_name,
+            price_yes=weather_market.price_yes,
+            forecast_temp=float(forecast.predicted_value),
+            unit_label=unit_label,
+            location=location,
+            target_date=date_str,
+            metric=metric,
+            market=weather_market,
+            bucket=bucket,
+        )
+        probability_estimate = probability_model.estimate(
+            candidate_trade=candidate,
+            forecast=forecast,
+            market=weather_market,
+            config=_config,
+        )
+        ranked_candidates.append(
+            {
+                "candidate": candidate,
+                "probability_estimate": probability_estimate,
+                "bucket": bucket,
+                "yes_price": float(candidate.price_yes),
+                "no_price": 1.0 - float(candidate.price_yes),
+                "edge_yes": probability_estimate.estimated_probability - float(candidate.price_yes),
+                "edge_no": float(candidate.price_yes) - probability_estimate.estimated_probability,
+                "gaussian_probability": probability_estimate.estimated_probability,
+            }
+        )
+
+    ranked_candidates.sort(key=lambda item: (float(item["bucket"].low), float(item["bucket"].high), item["candidate"].market_id))
+    if not ranked_candidates:
+        return ranked_candidates
+    central_index = _select_central_bucket_index(ranked_candidates, float(forecast.predicted_value))
+    for idx, item in enumerate(ranked_candidates):
+        item["bucket_relation"] = _classify_bucket_relation(idx, central_index)
+    return ranked_candidates
+
+
+def _apply_strategy_v1_rebuy_guard(entry: dict, selected_side: str) -> dict:
+    paper_trader = get_paper_trader()
+    current_side_price = entry["no_price"] if selected_side == "no" else entry["yes_price"]
+    rebuy_context = get_strategy_v1_rebuy_context(
+        paper_trader=paper_trader,
+        market_id=entry["candidate"].market_id,
+        selected_side=selected_side,
+        current_side_price=current_side_price,
+    )
+    historical_trade_exists = paper_trader.has_trade_for_market(entry["candidate"].market_id)
+    if not rebuy_context["rebuy_allowed"]:
+        return {
+            "action": "skip",
+            "reason": rebuy_context["reason"],
+            "selected_side": selected_side,
+            "price_yes": entry["yes_price"],
+            "gaussian_probability": entry["gaussian_probability"],
+            "edge_yes": entry["edge_yes"],
+            "edge_no": entry["edge_no"],
+            "open_position_exists": rebuy_context["open_position_exists"],
+            "historical_trade_exists": historical_trade_exists,
+            "buy_count": rebuy_context["buy_count"],
+            "last_buy_at": rebuy_context["last_buy_at"],
+            "last_buy_price": rebuy_context["last_buy_price"],
+            "position_cost_usd": rebuy_context["position_cost_usd"],
+            "current_side_price": current_side_price,
+        }
+    return {
+        "action": "trade",
+        "selected_side": selected_side,
+        "price_yes": entry["yes_price"],
+        "gaussian_probability": entry["gaussian_probability"],
+        "edge_yes": entry["edge_yes"],
+        "edge_no": entry["edge_no"],
+        "open_position_exists": rebuy_context["open_position_exists"],
+        "historical_trade_exists": historical_trade_exists,
+        "buy_count": rebuy_context["buy_count"],
+        "last_buy_at": rebuy_context["last_buy_at"],
+        "last_buy_price": rebuy_context["last_buy_price"],
+        "position_cost_usd": rebuy_context["position_cost_usd"],
+        "current_side_price": current_side_price,
+    }
+
+
+def select_strategy_v1_event_trade(
+    event_markets: list,
+    forecast,
+    unit_label: str,
+    location: str,
+    date_str: str,
+    metric: str,
+    execution_mode: ExecutionMode,
+):
+    if execution_mode != ExecutionMode.PAPER:
+        return None
+
+    regime_mode = classify_market_regime(forecast)
+    forecast_fresh = is_forecast_fresh(forecast)
+    ranked_candidates = build_strategy_v1_event_candidates(
+        event_markets=event_markets,
+        forecast=forecast,
+        unit_label=unit_label,
+        location=location,
+        date_str=date_str,
+        metric=metric,
+    )
+    if not ranked_candidates:
+        return {
+            "action": "skip",
+            "reason": "no parsed buckets",
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        }
+
+    if not forecast_fresh:
+        first = ranked_candidates[0]
+        return {
+            "action": "skip",
+            "reason": "forecast not fresh",
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+            "candidate": first["candidate"],
+            "probability_estimate": first["probability_estimate"],
+            "bucket_relation": first["bucket_relation"],
+            "price_yes": first["yes_price"],
+            "gaussian_probability": first["gaussian_probability"],
+            "edge_yes": first["edge_yes"],
+            "edge_no": first["edge_no"],
+        }
+
+    if regime_mode == "early":
+        eligible = [
+            item for item in ranked_candidates
+            if item["bucket_relation"] == "central" and item["yes_price"] <= STRATEGY_V1_EARLY_YES_MAX_PRICE
+        ]
+        if not eligible:
+            first = ranked_candidates[0]
+            return {
+                "action": "skip",
+                "reason": "early central yes not cheap",
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": first["candidate"],
+                "probability_estimate": first["probability_estimate"],
+                "bucket_relation": first["bucket_relation"],
+                "price_yes": first["yes_price"],
+                "gaussian_probability": first["gaussian_probability"],
+                "edge_yes": first["edge_yes"],
+                "edge_no": first["edge_no"],
+            }
+        selected = sorted(eligible, key=lambda item: (item["yes_price"], -item["gaussian_probability"]))[0]
+        decision = _apply_strategy_v1_rebuy_guard(selected, "yes")
+        decision.update({
+            "reason": "early central yes" if decision["action"] == "trade" else decision["reason"],
+            "threshold": STRATEGY_V1_EARLY_YES_MAX_PRICE,
+            "selected_edge": selected["edge_yes"],
+            "candidate": selected["candidate"],
+            "probability_estimate": selected["probability_estimate"],
+            "bucket_relation": selected["bucket_relation"],
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        })
+        return decision
+
+    if regime_mode == "late":
+        eligible = []
+        for item in ranked_candidates:
+            relation = item["bucket_relation"]
+            if relation not in {"far", "almost_impossible"}:
+                continue
+            if item["no_price"] > STRATEGY_V1_NO_MAX_ENTRY_PRICE:
+                continue
+            max_probability = (
+                STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY
+                if relation == "almost_impossible"
+                else STRATEGY_V1_LATE_FAR_MAX_PROBABILITY
+            )
+            if item["gaussian_probability"] <= max_probability:
+                eligible.append(item)
+        if not eligible:
+            first = ranked_candidates[0]
+            return {
+                "action": "skip",
+                "reason": "late no price too high" if any(
+                    item["bucket_relation"] in {"far", "almost_impossible"}
+                    and item["no_price"] > STRATEGY_V1_NO_MAX_ENTRY_PRICE
+                    for item in ranked_candidates
+                ) else "late far no not extreme enough",
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": first["candidate"],
+                "probability_estimate": first["probability_estimate"],
+                "bucket_relation": first["bucket_relation"],
+                "price_yes": first["yes_price"],
+                "gaussian_probability": first["gaussian_probability"],
+                "edge_yes": first["edge_yes"],
+                "edge_no": first["edge_no"],
+            }
+        selected = sorted(eligible, key=lambda item: (item["gaussian_probability"], -item["edge_no"]))[0]
+        decision = _apply_strategy_v1_rebuy_guard(selected, "no")
+        decision.update({
+            "reason": "late far no" if decision["action"] == "trade" else decision["reason"],
+            "threshold": STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
+            "selected_edge": selected["edge_no"],
+            "candidate": selected["candidate"],
+            "probability_estimate": selected["probability_estimate"],
+            "bucket_relation": selected["bucket_relation"],
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        })
+        return decision
+
+    no_candidates = [
+        item for item in ranked_candidates
+        if item["bucket_relation"] in {"far", "almost_impossible"} and item["edge_no"] > STRATEGY_V1_MID_NO_EDGE_THRESHOLD
+    ]
+    yes_candidates = [
+        item for item in ranked_candidates
+        if item["bucket_relation"] == "central"
+        and item["edge_yes"] > STRATEGY_V1_MID_YES_EDGE_THRESHOLD
+        and item["yes_price"] <= STRATEGY_V1_MID_YES_MAX_PRICE
+    ]
+    selected = None
+    selected_side = None
+    if no_candidates:
+        selected = max(no_candidates, key=lambda item: item["edge_no"])
+        selected_side = "no"
+    if yes_candidates:
+        best_yes = max(yes_candidates, key=lambda item: item["edge_yes"])
+        if selected is None or best_yes["edge_yes"] > selected["edge_no"]:
+            selected = best_yes
+            selected_side = "yes"
+    if selected is None:
+        first = ranked_candidates[0]
+        return {
+            "action": "skip",
+                "reason": "mid market no strong edge",
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": first["candidate"],
+                "probability_estimate": first["probability_estimate"],
+            "bucket_relation": first["bucket_relation"],
+            "price_yes": first["yes_price"],
+            "gaussian_probability": first["gaussian_probability"],
+            "edge_yes": first["edge_yes"],
+            "edge_no": first["edge_no"],
+        }
+    decision = _apply_strategy_v1_rebuy_guard(selected, selected_side)
+    decision.update({
+        "reason": f"mid {selected_side} strong edge" if decision["action"] == "trade" else decision["reason"],
+        "threshold": STRATEGY_V1_MID_NO_EDGE_THRESHOLD if selected_side == "no" else STRATEGY_V1_MID_YES_EDGE_THRESHOLD,
+        "selected_edge": selected["edge_no"] if selected_side == "no" else selected["edge_yes"],
+        "candidate": selected["candidate"],
+        "probability_estimate": selected["probability_estimate"],
+        "bucket_relation": selected["bucket_relation"],
+        "mode": regime_mode,
+        "forecast_fresh": forecast_fresh,
+    })
+    if decision["action"] == "trade":
+        decision["reason"] = "mid market extreme edge"
+    return decision
 
 
 def get_strategy_v1_rebuy_context(
@@ -1427,6 +1822,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "strategy_v1_mode_enabled",
             strategy="strategy_v1",
             mode="paper_only",
+            strategy_style="forecast_first",
             allowed_cities="all_active_locations",
             allowed_bucket_types=sorted(STRATEGY_V1_ALLOWED_BUCKET_TYPES),
             no_edge_threshold=STRATEGY_V1_NO_EDGE_THRESHOLD,
@@ -1443,6 +1839,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             yes_stop_loss_delta=0.08,
             no_take_profit_delta=0.12,
             no_stop_loss_delta=0.10,
+            early_market_min_hours=STRATEGY_V1_EARLY_MARKET_MIN_HOURS,
+            late_market_max_hours=STRATEGY_V1_LATE_MARKET_MAX_HOURS,
+            forecast_fresh_max_hours=STRATEGY_V1_FORECAST_FRESH_MAX_HOURS,
+            early_yes_max_price=STRATEGY_V1_EARLY_YES_MAX_PRICE,
+            mid_yes_max_price=STRATEGY_V1_MID_YES_MAX_PRICE,
+            late_far_max_probability=STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
+            late_almost_impossible_max_probability=STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY,
         )
     elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
@@ -1450,6 +1853,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
     log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
+    if paper:
+        log(
+            "  Entry regimes:   early=central YES, late=far NO, "
+            "mid=only strong edge"
+        )
     log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")
@@ -1626,23 +2034,67 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             if ladder_snapshot is not None:
                 recorded_event_ladders.append(ladder_snapshot)
 
-        candidate = select_candidate_trade(
-            event_markets=event_markets,
-            forecast_temp=forecast_temp,
-            unit_label=unit_label,
-            location=location,
-            date_str=date_str,
-            metric=metric,
-        )
-        if not candidate:
-            log(f"  ⚠️  No bucket found for {forecast_temp}{unit_label}")
+        strategy_v1_decision = None
+        candidate = None
+        probability_estimate = None
+        if execution_mode == ExecutionMode.PAPER:
+            strategy_v1_decision = select_strategy_v1_event_trade(
+                event_markets=event_markets,
+                forecast=forecast,
+                unit_label=unit_label,
+                location=location,
+                date_str=date_str,
+                metric=metric,
+                execution_mode=execution_mode,
+            )
+            candidate = strategy_v1_decision.get("candidate") if strategy_v1_decision else None
+            probability_estimate = strategy_v1_decision.get("probability_estimate") if strategy_v1_decision else None
+            log_entry_regime_decision(
+                logger=logger,
+                market_id=getattr(candidate, "market_id", None),
+                bucket_range=getattr(candidate, "outcome_name", None),
+                forecast_value=forecast_temp,
+                bucket_relation=strategy_v1_decision.get("bucket_relation") if strategy_v1_decision else None,
+                mode=strategy_v1_decision.get("mode") if strategy_v1_decision else None,
+                yes_price=strategy_v1_decision.get("price_yes") if strategy_v1_decision else None,
+                no_price=(1.0 - strategy_v1_decision.get("price_yes")) if strategy_v1_decision and strategy_v1_decision.get("price_yes") is not None else None,
+                decision=strategy_v1_decision.get("action") if strategy_v1_decision else "skip",
+                reason=strategy_v1_decision.get("reason") if strategy_v1_decision else "no strategy decision",
+            )
+        else:
+            candidate = select_candidate_trade(
+                event_markets=event_markets,
+                forecast_temp=forecast_temp,
+                unit_label=unit_label,
+                location=location,
+                date_str=date_str,
+                metric=metric,
+            )
+            if candidate:
+                probability_estimate = probability_model.estimate(
+                    candidate_trade=candidate,
+                    forecast=forecast,
+                    market=candidate.market,
+                    config={"entry_threshold": ENTRY_THRESHOLD},
+                )
+
+        if not candidate or probability_estimate is None:
+            skip_reason = strategy_v1_decision.get("reason") if strategy_v1_decision else f"No bucket found for {forecast_temp}{unit_label}"
+            log(f"  ⏸️  {skip_reason}")
             continue
 
         outcome_name = candidate.outcome_name
         price = candidate.price_yes
         market_id = candidate.market_id
 
-        log(f"  Matching bucket: {outcome_name} @ ${price:.2f}")
+        log(
+            f"  Selected bucket: {outcome_name} @ YES ${price:.2f}"
+            + (
+                f" ({strategy_v1_decision.get('mode')}/{strategy_v1_decision.get('bucket_relation')})"
+                if execution_mode == ExecutionMode.PAPER and strategy_v1_decision
+                else ""
+            )
+        )
 
         if price < MIN_TICK_SIZE:
             log(f"  ⏸️  Price ${price:.4f} below min tick ${MIN_TICK_SIZE} - skip (market at extreme)")
@@ -1653,14 +2105,6 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             skip_reasons.append("price at extreme")
             continue
 
-        # Check safeguards with edge analysis
-        active_probability_model = strategy_v1_probability_model if execution_mode == ExecutionMode.PAPER else probability_model
-        probability_estimate = active_probability_model.estimate(
-            candidate_trade=candidate,
-            forecast=forecast,
-            market=candidate.market,
-            config={"entry_threshold": ENTRY_THRESHOLD},
-        )
         model_probability = probability_estimate.estimated_probability
         log(
             f"  📐 Probability model: {probability_estimate.model_name} {probability_estimate.model_version} "
@@ -1668,9 +2112,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             f"sigma={probability_estimate.metadata.get('sigma_used')}, "
             f"p={model_probability:.0%}, market={price:.0%}, edge={probability_estimate.edge:.1%}"
         )
-        preliminary_strategy_v1_decision = None
-        if execution_mode == ExecutionMode.PAPER:
-            preliminary_strategy_v1_decision = select_strategy_v1_trade(candidate, probability_estimate, execution_mode)
+        preliminary_strategy_v1_decision = strategy_v1_decision if execution_mode == ExecutionMode.PAPER else None
         if use_safeguards:
             context = get_market_context(market_id, my_probability=model_probability)
             if not context and execution_mode == ExecutionMode.LIVE_ENABLED:
@@ -1734,7 +2176,15 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
         strategy_v1_decision = None
         if execution_mode == ExecutionMode.PAPER:
-            strategy_v1_decision = preliminary_strategy_v1_decision or select_strategy_v1_trade(candidate, probability_estimate, execution_mode)
+            strategy_v1_decision = preliminary_strategy_v1_decision or select_strategy_v1_event_trade(
+                event_markets=event_markets,
+                forecast=forecast,
+                unit_label=unit_label,
+                location=location,
+                date_str=date_str,
+                metric=metric,
+                execution_mode=execution_mode,
+            )
             log_strategy_v1_decision(
                 logger=logger,
                 action=strategy_v1_decision["action"],
