@@ -259,13 +259,12 @@ STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
-STRATEGY_V1_MID_NO_EDGE_THRESHOLD = 0.30
-STRATEGY_V1_MID_YES_EDGE_THRESHOLD = 0.35
-STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.60
-STRATEGY_V1_MID_YES_MAX_PRICE = 0.30
+STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
+STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.40
 STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
-STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.90
+STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
+STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.98
 STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
 STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
 STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
@@ -573,15 +572,12 @@ def select_strategy_v1_event_trade(
         }
 
     if regime_mode == "early":
-        eligible = [
-            item for item in ranked_candidates
-            if item["bucket_relation"] == "central" and item["yes_price"] <= STRATEGY_V1_EARLY_YES_MAX_PRICE
-        ]
-        if not eligible:
+        central_candidates = [item for item in ranked_candidates if item["bucket_relation"] == "central"]
+        if not central_candidates:
             first = ranked_candidates[0]
             return {
                 "action": "skip",
-                "reason": "early central yes not cheap",
+                "reason": "bucket_not_central",
                 "mode": regime_mode,
                 "forecast_fresh": forecast_fresh,
                 "candidate": first["candidate"],
@@ -592,10 +588,38 @@ def select_strategy_v1_event_trade(
                 "edge_yes": first["edge_yes"],
                 "edge_no": first["edge_no"],
             }
-        selected = sorted(eligible, key=lambda item: (item["yes_price"], -item["gaussian_probability"]))[0]
+        selected = sorted(central_candidates, key=lambda item: (item["yes_price"], -item["gaussian_probability"]))[0]
+        if selected["yes_price"] < STRATEGY_V1_EARLY_YES_MIN_PRICE:
+            return {
+                "action": "skip",
+                "reason": "early_yes_too_cheap",
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": selected["candidate"],
+                "probability_estimate": selected["probability_estimate"],
+                "bucket_relation": selected["bucket_relation"],
+                "price_yes": selected["yes_price"],
+                "gaussian_probability": selected["gaussian_probability"],
+                "edge_yes": selected["edge_yes"],
+                "edge_no": selected["edge_no"],
+            }
+        if selected["yes_price"] > STRATEGY_V1_EARLY_YES_MAX_PRICE:
+            return {
+                "action": "skip",
+                "reason": "early_yes_too_expensive",
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": selected["candidate"],
+                "probability_estimate": selected["probability_estimate"],
+                "bucket_relation": selected["bucket_relation"],
+                "price_yes": selected["yes_price"],
+                "gaussian_probability": selected["gaussian_probability"],
+                "edge_yes": selected["edge_yes"],
+                "edge_no": selected["edge_no"],
+            }
         decision = _apply_strategy_v1_rebuy_guard(selected, "yes")
         decision.update({
-            "reason": "early central yes" if decision["action"] == "trade" else decision["reason"],
+            "reason": "early_central_yes" if decision["action"] == "trade" else decision["reason"],
             "threshold": STRATEGY_V1_EARLY_YES_MAX_PRICE,
             "selected_edge": selected["edge_yes"],
             "candidate": selected["candidate"],
@@ -608,11 +632,19 @@ def select_strategy_v1_event_trade(
 
     if regime_mode == "late":
         eligible = []
+        has_far_bucket = False
+        has_no_below_min = False
+        has_no_above_max = False
         for item in ranked_candidates:
             relation = item["bucket_relation"]
             if relation not in {"far", "almost_impossible"}:
                 continue
+            has_far_bucket = True
+            if item["no_price"] < STRATEGY_V1_NO_MIN_ENTRY_PRICE:
+                has_no_below_min = True
+                continue
             if item["no_price"] > STRATEGY_V1_NO_MAX_ENTRY_PRICE:
+                has_no_above_max = True
                 continue
             max_probability = (
                 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY
@@ -623,13 +655,17 @@ def select_strategy_v1_event_trade(
                 eligible.append(item)
         if not eligible:
             first = ranked_candidates[0]
+            if not has_far_bucket:
+                reason = "bucket_not_far_enough"
+            elif has_no_below_min:
+                reason = "late_no_not_expensive_enough"
+            elif has_no_above_max:
+                reason = "late_no_too_expensive"
+            else:
+                reason = "late_far_no_probability_too_high"
             return {
                 "action": "skip",
-                "reason": "late no price too high" if any(
-                    item["bucket_relation"] in {"far", "almost_impossible"}
-                    and item["no_price"] > STRATEGY_V1_NO_MAX_ENTRY_PRICE
-                    for item in ranked_candidates
-                ) else "late far no not extreme enough",
+                "reason": reason,
                 "mode": regime_mode,
                 "forecast_fresh": forecast_fresh,
                 "candidate": first["candidate"],
@@ -654,55 +690,20 @@ def select_strategy_v1_event_trade(
         })
         return decision
 
-    no_candidates = [
-        item for item in ranked_candidates
-        if item["bucket_relation"] in {"far", "almost_impossible"} and item["edge_no"] > STRATEGY_V1_MID_NO_EDGE_THRESHOLD
-    ]
-    yes_candidates = [
-        item for item in ranked_candidates
-        if item["bucket_relation"] == "central"
-        and item["edge_yes"] > STRATEGY_V1_MID_YES_EDGE_THRESHOLD
-        and item["yes_price"] <= STRATEGY_V1_MID_YES_MAX_PRICE
-    ]
-    selected = None
-    selected_side = None
-    if no_candidates:
-        selected = max(no_candidates, key=lambda item: item["edge_no"])
-        selected_side = "no"
-    if yes_candidates:
-        best_yes = max(yes_candidates, key=lambda item: item["edge_yes"])
-        if selected is None or best_yes["edge_yes"] > selected["edge_no"]:
-            selected = best_yes
-            selected_side = "yes"
-    if selected is None:
-        first = ranked_candidates[0]
-        return {
-            "action": "skip",
-                "reason": "mid market no strong edge",
-                "mode": regime_mode,
-                "forecast_fresh": forecast_fresh,
-                "candidate": first["candidate"],
-                "probability_estimate": first["probability_estimate"],
-            "bucket_relation": first["bucket_relation"],
-            "price_yes": first["yes_price"],
-            "gaussian_probability": first["gaussian_probability"],
-            "edge_yes": first["edge_yes"],
-            "edge_no": first["edge_no"],
-        }
-    decision = _apply_strategy_v1_rebuy_guard(selected, selected_side)
-    decision.update({
-        "reason": f"mid {selected_side} strong edge" if decision["action"] == "trade" else decision["reason"],
-        "threshold": STRATEGY_V1_MID_NO_EDGE_THRESHOLD if selected_side == "no" else STRATEGY_V1_MID_YES_EDGE_THRESHOLD,
-        "selected_edge": selected["edge_no"] if selected_side == "no" else selected["edge_yes"],
-        "candidate": selected["candidate"],
-        "probability_estimate": selected["probability_estimate"],
-        "bucket_relation": selected["bucket_relation"],
+    first = ranked_candidates[0]
+    return {
+        "action": "skip",
+        "reason": "mid_market_skip",
         "mode": regime_mode,
         "forecast_fresh": forecast_fresh,
-    })
-    if decision["action"] == "trade":
-        decision["reason"] = "mid market extreme edge"
-    return decision
+        "candidate": first["candidate"],
+        "probability_estimate": first["probability_estimate"],
+        "bucket_relation": first["bucket_relation"],
+        "price_yes": first["yes_price"],
+        "gaussian_probability": first["gaussian_probability"],
+        "edge_yes": first["edge_yes"],
+        "edge_no": first["edge_no"],
+    }
 
 
 def get_strategy_v1_rebuy_context(
@@ -1842,10 +1843,12 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             early_market_min_hours=STRATEGY_V1_EARLY_MARKET_MIN_HOURS,
             late_market_max_hours=STRATEGY_V1_LATE_MARKET_MAX_HOURS,
             forecast_fresh_max_hours=STRATEGY_V1_FORECAST_FRESH_MAX_HOURS,
+            early_yes_min_price=STRATEGY_V1_EARLY_YES_MIN_PRICE,
             early_yes_max_price=STRATEGY_V1_EARLY_YES_MAX_PRICE,
-            mid_yes_max_price=STRATEGY_V1_MID_YES_MAX_PRICE,
             late_far_max_probability=STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
             late_almost_impossible_max_probability=STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY,
+            no_min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
+            no_max_entry_price=STRATEGY_V1_NO_MAX_ENTRY_PRICE,
         )
     elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
