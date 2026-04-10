@@ -263,6 +263,16 @@ class PaperTrader:
             position["last_buy_price"] = price
             self.state["cash_balance"] -= cost
             self._log_event(
+                "paper_buy",
+                market_id=market_id,
+                side=side,
+                shares=round(filled_shares, 6),
+                amount_usd=round(cost, 6),
+                simulated_fill_price=round(price, 6),
+                buy_count=position["buy_count"],
+                position_cost_usd=round(position["position_cost_usd"], 6),
+            )
+            self._log_event(
                 "paper_position_opened",
                 market_id=market_id,
                 side=side,
