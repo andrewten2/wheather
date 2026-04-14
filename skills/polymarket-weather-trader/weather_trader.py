@@ -1678,6 +1678,7 @@ def check_exit_opportunities(
 
         take_profit, stop_loss = get_exit_targets(entry_price, position_side)
         exit_reason = None
+        ignored_edge_invalidated = False
         if current_price >= take_profit:
             exit_reason = "take_profit"
         elif current_price <= stop_loss:
@@ -1687,7 +1688,10 @@ def check_exit_opportunities(
             if exit_edge is not None:
                 current_edge = exit_edge.get("edge_no") if position_side == "no" else exit_edge.get("edge_yes")
                 if current_edge is not None and current_edge < 0:
-                    exit_reason = "edge_invalidated"
+                    if execution_mode == ExecutionMode.PAPER:
+                        ignored_edge_invalidated = True
+                    else:
+                        exit_reason = "edge_invalidated"
 
         if logger is not None:
             logger.event(
@@ -1700,6 +1704,24 @@ def check_exit_opportunities(
                 stop_loss=round(stop_loss, 6),
                 exit_reason=exit_reason,
             )
+            if ignored_edge_invalidated:
+                logger.event(
+                    "paper_hold_ignore_edge_invalidated",
+                    market_id=market_id,
+                    side=position_side,
+                    entry_price=round(entry_price, 6),
+                    current_price=round(current_price, 6),
+                    take_profit=round(take_profit, 6),
+                    stop_loss=round(stop_loss, 6),
+                )
+
+        if ignored_edge_invalidated:
+            print(f"  📊 {question}...")
+            print(
+                f"     {position_side.upper()} hold: edge invalidated ignored in paper mode "
+                f"(entry ${entry_price:.2f}, current ${current_price:.2f})"
+            )
+            continue
 
         if exit_reason is not None:
             exits_found += 1
