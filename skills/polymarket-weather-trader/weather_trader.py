@@ -261,6 +261,7 @@ STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
 STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.40
+STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
 STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
 STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
@@ -268,12 +269,16 @@ STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.98
 STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
 STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
 STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
+FORECAST_DRIFT_THRESHOLD_DEGREES = 2.0
+MAX_TOTAL_POSITIONS = 40
 STRATEGY_V1_MAX_POSITION_PER_MARKET_USD = 40.0
 STRATEGY_V1_MAX_BUYS_PER_MARKET = 5
 STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES = 20
 STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR = 0.95
 STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN = 10
 MARKET_EXIT_COOLDOWN_MINUTES = 120
+MARKET_REENTRY_COOLDOWN_MINUTES = 120
+MAX_POSITION_AGE_HOURS = 24
 PAPER_SLIPPAGE_MAX_PCT = 0.45
 
 
@@ -325,6 +330,7 @@ def log_entry_regime_decision(
     bucket_range: str = None,
     forecast_value: float = None,
     bucket_relation: str = None,
+    entry_bucket_relation: str = None,
     mode: str = None,
     yes_price: float = None,
     no_price: float = None,
@@ -337,6 +343,7 @@ def log_entry_regime_decision(
         bucket_range=bucket_range,
         forecast_value=round(forecast_value, 6) if forecast_value is not None else None,
         bucket_relation=bucket_relation,
+        entry_bucket_relation=entry_bucket_relation,
         mode=mode,
         yes_price=round(yes_price, 6) if yes_price is not None else None,
         no_price=round(no_price, 6) if no_price is not None else None,
@@ -425,6 +432,16 @@ def _classify_bucket_relation(index: int, central_index: int) -> str:
     return "almost_impossible"
 
 
+def _classify_entry_bucket_relation(index: int, central_index: int) -> Optional[str]:
+    if index == central_index:
+        return "central"
+    if index == central_index - 1:
+        return "adjacent_lower"
+    if index == central_index + 1:
+        return "adjacent_upper"
+    return None
+
+
 def build_strategy_v1_event_candidates(
     event_markets: list,
     forecast,
@@ -478,7 +495,147 @@ def build_strategy_v1_event_candidates(
     central_index = _select_central_bucket_index(ranked_candidates, float(forecast.predicted_value))
     for idx, item in enumerate(ranked_candidates):
         item["bucket_relation"] = _classify_bucket_relation(idx, central_index)
+        item["entry_bucket_relation"] = _classify_entry_bucket_relation(idx, central_index)
+        item["bucket_index"] = idx
+        item["central_index"] = central_index
     return ranked_candidates
+
+
+def _find_ranked_candidate_by_market_id(ranked_candidates: list, market_id: str) -> Optional[dict]:
+    for item in ranked_candidates:
+        if item["candidate"].market_id == market_id:
+            return item
+    return None
+
+
+def _get_event_open_position(event_markets: list) -> Optional[dict]:
+    paper_trader = get_paper_trader()
+    for raw_market in event_markets:
+        market = build_weather_market(raw_market)
+        position_state = paper_trader.get_open_position_state(market.market_id)
+        if not position_state:
+            continue
+        bucket = parse_temperature_bucket_model(market.outcome_name)
+        return {
+            "market_id": market.market_id,
+            "market": market,
+            "bucket": bucket,
+            "position_state": position_state,
+            "side": position_state.get("side", "yes"),
+            "shares": float(position_state.get("shares", 0.0) or 0.0),
+            "question": position_state.get("question") or market.question or market.event_name,
+        }
+    return None
+
+
+def maybe_rotate_position_on_forecast_drift(
+    *,
+    event_id: str,
+    event_markets: list,
+    ranked_candidates: list,
+    strategy_v1_decision: dict,
+    forecast,
+    execution_mode: ExecutionMode,
+    logger: StructuredLogger,
+) -> bool:
+    if execution_mode != ExecutionMode.PAPER:
+        return True
+
+    paper_trader = get_paper_trader()
+    current_forecast_value = float(forecast.predicted_value)
+    timestamp = getattr(forecast, "timestamp", None) or getattr(forecast, "retrieved_at", None) or datetime.now(timezone.utc).isoformat()
+    forecast_history = paper_trader.get_forecast_history(event_id)
+    previous_forecast_value = None
+    if forecast_history and forecast_history.get("forecast_value") is not None:
+        try:
+            previous_forecast_value = float(forecast_history["forecast_value"])
+        except Exception:
+            previous_forecast_value = None
+
+    try:
+        paper_trader.record_forecast_history(event_id, current_forecast_value, timestamp=timestamp)
+    except Exception:
+        previous_forecast_value = previous_forecast_value
+
+    if previous_forecast_value is None:
+        return True
+
+    drift_degrees = abs(current_forecast_value - previous_forecast_value)
+    if drift_degrees < FORECAST_DRIFT_THRESHOLD_DEGREES:
+        return True
+
+    if not ranked_candidates:
+        return True
+
+    if logger is not None:
+        logger.event(
+            "forecast_drift_detected",
+            event_id=event_id,
+            forecast_old=round(previous_forecast_value, 6),
+            forecast_new=round(current_forecast_value, 6),
+            drift_degrees=round(drift_degrees, 6),
+        )
+
+    if not strategy_v1_decision or strategy_v1_decision.get("action") != "trade":
+        return True
+    if strategy_v1_decision.get("mode") != "early" or strategy_v1_decision.get("selected_side") != "yes":
+        return True
+
+    open_position = _get_event_open_position(event_markets)
+    if not open_position or open_position.get("side") != "yes":
+        return True
+
+    held_entry = _find_ranked_candidate_by_market_id(ranked_candidates, open_position["market_id"])
+    if not held_entry or held_entry.get("bucket_relation") == "central":
+        return True
+
+    new_candidate = strategy_v1_decision.get("candidate")
+    if new_candidate is None or new_candidate.market_id == open_position["market_id"]:
+        return True
+
+    shares = open_position.get("shares", 0.0)
+    if shares < MIN_SHARES_PER_ORDER:
+        return False
+
+    price_snapshot = paper_trader.get_market_price_snapshot(
+        get_adapter(),
+        open_position["market_id"],
+        stored_question=open_position["question"],
+    )
+    current_yes_price = price_snapshot.get("yes_price") if price_snapshot else None
+    if current_yes_price is None:
+        if logger is not None:
+            logger.event(
+                "forecast_drift_detected",
+                event_id=event_id,
+                forecast_old=round(previous_forecast_value, 6),
+                forecast_new=round(current_forecast_value, 6),
+                drift_degrees=round(drift_degrees, 6),
+                reason="skip rotation: price not found",
+            )
+        return False
+
+    result = execute_sell(
+        open_position["market_id"],
+        shares,
+        side="yes",
+        market_price=current_yes_price,
+        market_question=open_position["question"],
+    )
+    if logger is not None:
+        logger.event(
+            "forecast_drift_detected",
+            event_id=event_id,
+            forecast_old=round(previous_forecast_value, 6),
+            forecast_new=round(current_forecast_value, 6),
+            drift_degrees=round(drift_degrees, 6),
+            previous_market_id=open_position["market_id"],
+            new_market_id=new_candidate.market_id,
+            previous_bucket=open_position["market"].outcome_name,
+            new_bucket=new_candidate.outcome_name,
+            result="rotated" if result.get("success") else "rotation_failed",
+        )
+    return bool(result.get("success"))
 
 
 def _apply_strategy_v1_rebuy_guard(entry: dict, selected_side: str) -> dict:
@@ -533,13 +690,14 @@ def select_strategy_v1_event_trade(
     date_str: str,
     metric: str,
     execution_mode: ExecutionMode,
+    ranked_candidates: list = None,
 ):
     if execution_mode != ExecutionMode.PAPER:
         return None
 
     regime_mode = classify_market_regime(forecast)
     forecast_fresh = is_forecast_fresh(forecast)
-    ranked_candidates = build_strategy_v1_event_candidates(
+    ranked_candidates = ranked_candidates or build_strategy_v1_event_candidates(
         event_markets=event_markets,
         forecast=forecast,
         unit_label=unit_label,
@@ -572,7 +730,12 @@ def select_strategy_v1_event_trade(
         }
 
     if regime_mode == "early":
-        central_candidates = [item for item in ranked_candidates if item["bucket_relation"] == "central"]
+        central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
+        early_candidates = [
+            item for item in ranked_candidates
+            if item["entry_bucket_relation"] in {"adjacent_lower", "central", "adjacent_upper"}
+            and item["yes_price"] <= STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE
+        ]
         if not central_candidates:
             first = ranked_candidates[0]
             return {
@@ -587,8 +750,19 @@ def select_strategy_v1_event_trade(
                 "gaussian_probability": first["gaussian_probability"],
                 "edge_yes": first["edge_yes"],
                 "edge_no": first["edge_no"],
+                "entry_bucket_relation": first.get("entry_bucket_relation"),
             }
-        selected = sorted(central_candidates, key=lambda item: (item["yes_price"], -item["gaussian_probability"]))[0]
+        if not early_candidates:
+            selected = sorted(central_candidates, key=lambda item: (item["yes_price"], -item["gaussian_probability"]))[0]
+        else:
+            positive_edge_candidates = [item for item in early_candidates if item["edge_yes"] > 0]
+            if positive_edge_candidates:
+                selected = sorted(
+                    positive_edge_candidates,
+                    key=lambda item: (-item["edge_yes"], item["yes_price"], -item["gaussian_probability"]),
+                )[0]
+            else:
+                selected = sorted(central_candidates, key=lambda item: (item["yes_price"], -item["gaussian_probability"]))[0]
         if selected["yes_price"] < STRATEGY_V1_EARLY_YES_MIN_PRICE:
             return {
                 "action": "skip",
@@ -602,6 +776,7 @@ def select_strategy_v1_event_trade(
                 "gaussian_probability": selected["gaussian_probability"],
                 "edge_yes": selected["edge_yes"],
                 "edge_no": selected["edge_no"],
+                "entry_bucket_relation": selected.get("entry_bucket_relation"),
             }
         if selected["yes_price"] > STRATEGY_V1_EARLY_YES_MAX_PRICE:
             return {
@@ -616,15 +791,22 @@ def select_strategy_v1_event_trade(
                 "gaussian_probability": selected["gaussian_probability"],
                 "edge_yes": selected["edge_yes"],
                 "edge_no": selected["edge_no"],
+                "entry_bucket_relation": selected.get("entry_bucket_relation"),
             }
         decision = _apply_strategy_v1_rebuy_guard(selected, "yes")
         decision.update({
-            "reason": "early_central_yes" if decision["action"] == "trade" else decision["reason"],
+            "reason": (
+                "early_adjacent_yes"
+                if decision["action"] == "trade" and selected.get("entry_bucket_relation") in {"adjacent_lower", "adjacent_upper"}
+                else "early_central_yes" if decision["action"] == "trade"
+                else decision["reason"]
+            ),
             "threshold": STRATEGY_V1_EARLY_YES_MAX_PRICE,
             "selected_edge": selected["edge_yes"],
             "candidate": selected["candidate"],
             "probability_estimate": selected["probability_estimate"],
             "bucket_relation": selected["bucket_relation"],
+            "entry_bucket_relation": selected.get("entry_bucket_relation"),
             "mode": regime_mode,
             "forecast_fresh": forecast_fresh,
         })
@@ -675,6 +857,7 @@ def select_strategy_v1_event_trade(
                 "gaussian_probability": first["gaussian_probability"],
                 "edge_yes": first["edge_yes"],
                 "edge_no": first["edge_no"],
+                "entry_bucket_relation": first.get("entry_bucket_relation"),
             }
         selected = sorted(eligible, key=lambda item: (item["gaussian_probability"], -item["edge_no"]))[0]
         decision = _apply_strategy_v1_rebuy_guard(selected, "no")
@@ -685,6 +868,7 @@ def select_strategy_v1_event_trade(
             "candidate": selected["candidate"],
             "probability_estimate": selected["probability_estimate"],
             "bucket_relation": selected["bucket_relation"],
+            "entry_bucket_relation": selected.get("entry_bucket_relation"),
             "mode": regime_mode,
             "forecast_fresh": forecast_fresh,
         })
@@ -703,6 +887,7 @@ def select_strategy_v1_event_trade(
         "gaussian_probability": first["gaussian_probability"],
         "edge_yes": first["edge_yes"],
         "edge_no": first["edge_no"],
+        "entry_bucket_relation": first.get("entry_bucket_relation"),
     }
 
 
@@ -713,6 +898,52 @@ def get_strategy_v1_rebuy_context(
     current_side_price: float,
 ) -> dict:
     position = paper_trader.get_open_position_state(market_id)
+    open_positions_count = paper_trader.get_open_positions_count()
+    if position:
+        buy_count = int(position.get("buy_count", 0) or 0)
+        position_cost_usd = float(position.get("position_cost_usd", position.get("cost_basis", 0.0)) or 0.0)
+        last_buy_at = position.get("last_buy_at")
+        last_buy_price = position.get("last_buy_price")
+        return {
+            "open_position_exists": True,
+            "rebuy_allowed": False,
+            "buy_count": buy_count,
+            "position_cost_usd": position_cost_usd,
+            "last_buy_at": last_buy_at,
+            "last_buy_price": last_buy_price,
+            "reason": "already_have_position",
+            "open_positions_count": open_positions_count,
+        }
+    if open_positions_count >= MAX_TOTAL_POSITIONS:
+        return {
+            "open_position_exists": False,
+            "rebuy_allowed": False,
+            "buy_count": 0,
+            "position_cost_usd": 0.0,
+            "last_buy_at": None,
+            "last_buy_price": None,
+            "reason": "max_positions_reached",
+            "open_positions_count": open_positions_count,
+        }
+    last_trade_at = paper_trader.get_last_trade_time(market_id)
+    if last_trade_at:
+        try:
+            last_trade_dt = datetime.fromisoformat(str(last_trade_at).replace("Z", "+00:00"))
+            if last_trade_dt.tzinfo is None:
+                last_trade_dt = last_trade_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < last_trade_dt + timedelta(minutes=MARKET_REENTRY_COOLDOWN_MINUTES):
+                return {
+                    "open_position_exists": False,
+                    "rebuy_allowed": False,
+                    "buy_count": 0,
+                    "position_cost_usd": 0.0,
+                    "last_buy_at": None,
+                    "last_buy_price": None,
+                    "reason": "market_cooldown",
+                    "open_positions_count": open_positions_count,
+                }
+        except Exception:
+            pass
     if not position:
         last_exit_at = paper_trader.get_last_exit_time(market_id)
         if last_exit_at:
@@ -728,7 +959,8 @@ def get_strategy_v1_rebuy_context(
                         "position_cost_usd": 0.0,
                         "last_buy_at": None,
                         "last_buy_price": None,
-                        "reason": "market_exit_cooldown",
+                        "reason": "market_cooldown",
+                        "open_positions_count": open_positions_count,
                     }
             except Exception:
                 pass
@@ -740,80 +972,8 @@ def get_strategy_v1_rebuy_context(
             "last_buy_at": None,
             "last_buy_price": None,
             "reason": None,
+            "open_positions_count": open_positions_count,
         }
-
-    position_side = position.get("side")
-    buy_count = int(position.get("buy_count", 0) or 0)
-    position_cost_usd = float(position.get("position_cost_usd", position.get("cost_basis", 0.0)) or 0.0)
-    last_buy_at = position.get("last_buy_at")
-    last_buy_price = position.get("last_buy_price")
-
-    if position_side != selected_side:
-        return {
-            "open_position_exists": True,
-            "rebuy_allowed": False,
-            "buy_count": buy_count,
-            "position_cost_usd": position_cost_usd,
-            "last_buy_at": last_buy_at,
-            "last_buy_price": last_buy_price,
-            "reason": "open position exists",
-        }
-    if position_cost_usd >= STRATEGY_V1_MAX_POSITION_PER_MARKET_USD:
-        return {
-            "open_position_exists": True,
-            "rebuy_allowed": False,
-            "buy_count": buy_count,
-            "position_cost_usd": position_cost_usd,
-            "last_buy_at": last_buy_at,
-            "last_buy_price": last_buy_price,
-            "reason": "max_position_per_market",
-        }
-    if buy_count >= STRATEGY_V1_MAX_BUYS_PER_MARKET:
-        return {
-            "open_position_exists": True,
-            "rebuy_allowed": False,
-            "buy_count": buy_count,
-            "position_cost_usd": position_cost_usd,
-            "last_buy_at": last_buy_at,
-            "last_buy_price": last_buy_price,
-            "reason": "max_buys_per_market",
-        }
-    if last_buy_at:
-        try:
-            last_buy_dt = datetime.fromisoformat(str(last_buy_at).replace("Z", "+00:00"))
-            if last_buy_dt.tzinfo is None:
-                last_buy_dt = last_buy_dt.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) < last_buy_dt + timedelta(minutes=STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES):
-                return {
-                    "open_position_exists": True,
-                    "rebuy_allowed": False,
-                    "buy_count": buy_count,
-                    "position_cost_usd": position_cost_usd,
-                    "last_buy_at": last_buy_at,
-                    "last_buy_price": last_buy_price,
-                    "reason": "cooldown_between_buys",
-                }
-        except Exception:
-            pass
-    if last_buy_price is not None and current_side_price > float(last_buy_price) * STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR:
-        return {
-            "open_position_exists": True,
-            "rebuy_allowed": False,
-            "buy_count": buy_count,
-            "position_cost_usd": position_cost_usd,
-            "last_buy_at": last_buy_at,
-            "last_buy_price": last_buy_price,
-            "reason": "rebuy_price_not_better",
-        }
-    return {
-        "open_position_exists": True,
-        "rebuy_allowed": True,
-        "buy_count": buy_count,
-        "position_cost_usd": position_cost_usd,
-        "last_buy_at": last_buy_at,
-        "last_buy_price": last_buy_price,
-        "reason": "controlled_rebuy_allowed",
-    }
 
 
 def select_strategy_v1_trade(candidate, probability_estimate, execution_mode: ExecutionMode):
@@ -1627,11 +1787,27 @@ def check_exit_opportunities(
         shares = (pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and position_side == "no") else (pos.shares_yes or 0)
         entry_price = get_position_entry_price(pos, execution_mode)
         question = pos.question[:50] if pos.question else "Unknown"
+        position_age_hours = None
         yes_price = None
         no_price = None
         chosen_exit_price = pos.current_price
         price_snapshot = None
+        opened_at = None
         if execution_mode == ExecutionMode.PAPER:
+            position_state = get_paper_trader().get_open_position_state(market_id)
+            if position_state:
+                opened_at = position_state.get("opened_at")
+                if opened_at:
+                    try:
+                        opened_dt = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+                        if opened_dt.tzinfo is None:
+                            opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                        position_age_hours = max(
+                            0.0,
+                            (datetime.now(timezone.utc) - opened_dt.astimezone(timezone.utc)).total_seconds() / 3600.0,
+                        )
+                    except Exception:
+                        position_age_hours = None
             price_snapshot = get_paper_trader().get_market_price_snapshot(
                 get_adapter(),
                 market_id,
@@ -1679,7 +1855,9 @@ def check_exit_opportunities(
         take_profit, stop_loss = get_exit_targets(entry_price, position_side)
         exit_reason = None
         ignored_edge_invalidated = False
-        if current_price >= take_profit:
+        if position_age_hours is not None and position_age_hours > MAX_POSITION_AGE_HOURS:
+            exit_reason = "max_age_exit"
+        elif current_price >= take_profit:
             exit_reason = "take_profit"
         elif current_price <= stop_loss:
             exit_reason = "stop_loss"
@@ -1702,6 +1880,7 @@ def check_exit_opportunities(
                 current_price=round(current_price, 6),
                 take_profit=round(take_profit, 6),
                 stop_loss=round(stop_loss, 6),
+                position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
                 exit_reason=exit_reason,
             )
             if ignored_edge_invalidated:
@@ -1713,6 +1892,7 @@ def check_exit_opportunities(
                     current_price=round(current_price, 6),
                     take_profit=round(take_profit, 6),
                     stop_loss=round(stop_loss, 6),
+                    position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
                 )
 
         if ignored_edge_invalidated:
@@ -1784,6 +1964,7 @@ def check_exit_opportunities(
                         market_id=market_id,
                         entry_price=round(entry_price, 6),
                         current_price=round(current_price, 6),
+                        position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
                         realized_pnl=result.get("realized_pnl"),
                         reason_for_exit=exit_reason,
                     )
@@ -1880,8 +2061,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     if paper:
         log(
-            "  Entry regimes:   early=central YES, late=far NO, "
-            "mid=only strong edge"
+            "  Entry regimes:   early=central±1 YES, late=far NO, "
+            "mid=skip"
         )
     log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
@@ -2062,7 +2243,16 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         strategy_v1_decision = None
         candidate = None
         probability_estimate = None
+        strategy_ranked_candidates = None
         if execution_mode == ExecutionMode.PAPER:
+            strategy_ranked_candidates = build_strategy_v1_event_candidates(
+                event_markets=event_markets,
+                forecast=forecast,
+                unit_label=unit_label,
+                location=location,
+                date_str=date_str,
+                metric=metric,
+            )
             strategy_v1_decision = select_strategy_v1_event_trade(
                 event_markets=event_markets,
                 forecast=forecast,
@@ -2071,6 +2261,29 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 date_str=date_str,
                 metric=metric,
                 execution_mode=execution_mode,
+                ranked_candidates=strategy_ranked_candidates,
+            )
+            drift_rotation_allowed = maybe_rotate_position_on_forecast_drift(
+                event_id=event_id,
+                event_markets=event_markets,
+                ranked_candidates=strategy_ranked_candidates,
+                strategy_v1_decision=strategy_v1_decision,
+                forecast=forecast,
+                execution_mode=execution_mode,
+                logger=logger,
+            )
+            if not drift_rotation_allowed:
+                log("  ⏸️  forecast drift detected but rotation could not complete")
+                continue
+            strategy_v1_decision = select_strategy_v1_event_trade(
+                event_markets=event_markets,
+                forecast=forecast,
+                unit_label=unit_label,
+                location=location,
+                date_str=date_str,
+                metric=metric,
+                execution_mode=execution_mode,
+                ranked_candidates=strategy_ranked_candidates,
             )
             candidate = strategy_v1_decision.get("candidate") if strategy_v1_decision else None
             probability_estimate = strategy_v1_decision.get("probability_estimate") if strategy_v1_decision else None
@@ -2080,6 +2293,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 bucket_range=getattr(candidate, "outcome_name", None),
                 forecast_value=forecast_temp,
                 bucket_relation=strategy_v1_decision.get("bucket_relation") if strategy_v1_decision else None,
+                entry_bucket_relation=strategy_v1_decision.get("entry_bucket_relation") if strategy_v1_decision else None,
                 mode=strategy_v1_decision.get("mode") if strategy_v1_decision else None,
                 yes_price=strategy_v1_decision.get("price_yes") if strategy_v1_decision else None,
                 no_price=(1.0 - strategy_v1_decision.get("price_yes")) if strategy_v1_decision and strategy_v1_decision.get("price_yes") is not None else None,
@@ -2115,7 +2329,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         log(
             f"  Selected bucket: {outcome_name} @ YES ${price:.2f}"
             + (
-                f" ({strategy_v1_decision.get('mode')}/{strategy_v1_decision.get('bucket_relation')})"
+                f" ({strategy_v1_decision.get('mode')}/{strategy_v1_decision.get('bucket_relation')}"
+                + (
+                    f"/{strategy_v1_decision.get('entry_bucket_relation')}"
+                    if strategy_v1_decision.get("entry_bucket_relation")
+                    else ""
+                )
+                + ")"
                 if execution_mode == ExecutionMode.PAPER and strategy_v1_decision
                 else ""
             )

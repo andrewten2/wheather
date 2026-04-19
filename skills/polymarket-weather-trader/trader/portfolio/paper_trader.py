@@ -30,6 +30,7 @@ class PaperTrader:
             "initial_cash": self.initial_cash,
             "cash_balance": self.initial_cash,
             "realized_pnl": 0.0,
+            "forecast_history": {},
             "market_exit_times": {},
             "positions": {},
             "orders": [],
@@ -50,6 +51,7 @@ class PaperTrader:
         state.setdefault("positions", {})
         state.setdefault("orders", [])
         state.setdefault("trades", [])
+        state.setdefault("forecast_history", {})
         state.setdefault("market_exit_times", {})
         state.setdefault("cash_balance", state.get("initial_cash", self.initial_cash))
         state.setdefault("realized_pnl", 0.0)
@@ -70,11 +72,25 @@ class PaperTrader:
     def has_trade_for_market(self, market_id: str) -> bool:
         return any(trade.get("market_id") == market_id for trade in self.state.get("trades", []))
 
+    def get_last_trade_time(self, market_id: str) -> Optional[str]:
+        market_trades = [
+            trade for trade in self.state.get("trades", [])
+            if trade.get("market_id") == market_id
+        ]
+        if not market_trades:
+            return None
+        latest_trade = max(market_trades, key=lambda trade: str(trade.get("timestamp") or ""))
+        return latest_trade.get("timestamp")
+
     def has_open_position_for_market(self, market_id: str) -> bool:
         position = (self.state.get("positions") or {}).get(market_id)
         if not position:
             return False
         return float(position.get("shares", 0.0) or 0.0) > 0.0
+
+    def get_open_positions_count(self) -> int:
+        positions = self.state.get("positions") or {}
+        return sum(1 for pos in positions.values() if float(pos.get("shares", 0.0) or 0.0) > 0.0)
 
     def get_open_position_state(self, market_id: str) -> Optional[dict]:
         position = (self.state.get("positions") or {}).get(market_id)
@@ -106,6 +122,21 @@ class PaperTrader:
 
     def get_last_exit_time(self, market_id: str) -> Optional[str]:
         return (self.state.get("market_exit_times") or {}).get(market_id)
+
+    def get_forecast_history(self, event_id: str) -> Optional[dict]:
+        return (self.state.get("forecast_history") or {}).get(event_id)
+
+    def record_forecast_history(
+        self,
+        event_id: str,
+        forecast_value: float,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        self.state.setdefault("forecast_history", {})[event_id] = {
+            "forecast_value": float(forecast_value),
+            "timestamp": timestamp or self._now(),
+        }
+        self._save_state()
 
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
         snapshot = self.get_market_price_snapshot(adapter, market_id)
