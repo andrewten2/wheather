@@ -138,6 +138,27 @@ class PaperTrader:
         }
         self._save_state()
 
+    def update_open_position_mark_to_market(
+        self,
+        market_id: str,
+        current_price: Optional[float],
+        current_value_usd: Optional[float],
+        unrealized_pnl: Optional[float],
+        unrealized_pnl_pct: Optional[float],
+        updated_at: Optional[str] = None,
+    ) -> None:
+        position = (self.state.get("positions") or {}).get(market_id)
+        if not position:
+            return
+        if float(position.get("shares", 0.0) or 0.0) <= 0.0:
+            return
+        position["current_price"] = current_price
+        position["current_value_usd"] = current_value_usd
+        position["unrealized_pnl"] = unrealized_pnl
+        position["unrealized_pnl_pct"] = unrealized_pnl_pct
+        position["updated_at"] = updated_at or self._now()
+        self._save_state()
+
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
         snapshot = self.get_market_price_snapshot(adapter, market_id)
         if not snapshot:
@@ -269,6 +290,10 @@ class PaperTrader:
             "avg_cost": 0.0,
             "cost_basis": 0.0,
             "entry_price": price,
+            "current_price": None,
+            "current_value_usd": None,
+            "unrealized_pnl": None,
+            "unrealized_pnl_pct": None,
             "position_cost_usd": 0.0,
             "buy_count": 0,
             "last_buy_at": None,
@@ -289,6 +314,12 @@ class PaperTrader:
             position["cost_basis"] = new_cost_basis
             position["position_cost_usd"] = new_cost_basis
             position["avg_cost"] = (new_cost_basis / new_total_shares) if new_total_shares > 0 else 0.0
+            position["current_price"] = price
+            position["current_value_usd"] = new_total_shares * price
+            position["unrealized_pnl"] = position["current_value_usd"] - new_cost_basis
+            position["unrealized_pnl_pct"] = (
+                position["unrealized_pnl"] / new_cost_basis if new_cost_basis > 0 else None
+            )
             position["buy_count"] = int(position.get("buy_count", 0) or 0) + 1
             position["last_buy_at"] = timestamp
             position["last_buy_price"] = price
@@ -335,6 +366,16 @@ class PaperTrader:
             position["cost_basis"] = remaining_cost_basis
             position["position_cost_usd"] = remaining_cost_basis
             position["avg_cost"] = (remaining_cost_basis / remaining_shares) if remaining_shares > 0 else 0.0
+            position["current_price"] = price if remaining_shares > 0 else None
+            position["current_value_usd"] = (remaining_shares * price) if remaining_shares > 0 else None
+            position["unrealized_pnl"] = (
+                (position["current_value_usd"] - remaining_cost_basis)
+                if remaining_shares > 0 else None
+            )
+            position["unrealized_pnl_pct"] = (
+                (position["unrealized_pnl"] / remaining_cost_basis)
+                if remaining_shares > 0 and remaining_cost_basis > 0 else None
+            )
             self.state["cash_balance"] += proceeds
             self.state["realized_pnl"] += realized_pnl
             if remaining_shares == 0:

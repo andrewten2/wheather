@@ -1788,6 +1788,8 @@ def check_exit_opportunities(
         entry_price = get_position_entry_price(pos, execution_mode)
         question = pos.question[:50] if pos.question else "Unknown"
         position_age_hours = None
+        position_state = None
+        cost_basis = None
         yes_price = None
         no_price = None
         chosen_exit_price = pos.current_price
@@ -1796,6 +1798,7 @@ def check_exit_opportunities(
         if execution_mode == ExecutionMode.PAPER:
             position_state = get_paper_trader().get_open_position_state(market_id)
             if position_state:
+                cost_basis = float(position_state.get("cost_basis", 0.0) or 0.0)
                 opened_at = position_state.get("opened_at")
                 if opened_at:
                     try:
@@ -1832,6 +1835,34 @@ def check_exit_opportunities(
             if context and context.get("market"):
                 price_snapshot = build_market_price_snapshot(context["market"])
         current_price = chosen_exit_price
+
+        if execution_mode == ExecutionMode.PAPER:
+            current_value_usd = (shares * current_price) if current_price is not None else None
+            unrealized_pnl = (current_value_usd - cost_basis) if (current_value_usd is not None and cost_basis is not None) else None
+            unrealized_pnl_pct = (
+                unrealized_pnl / cost_basis
+                if unrealized_pnl is not None and cost_basis is not None and cost_basis > 0
+                else None
+            )
+            get_paper_trader().update_open_position_mark_to_market(
+                market_id=market_id,
+                current_price=current_price,
+                current_value_usd=current_value_usd,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl_pct=unrealized_pnl_pct,
+            )
+            if logger is not None:
+                logger.event(
+                    "paper_mark_to_market",
+                    market_id=market_id,
+                    side=position_side,
+                    entry_price=round(entry_price, 6),
+                    current_price=round(current_price, 6) if current_price is not None else None,
+                    cost_basis=round(cost_basis, 6) if cost_basis is not None else None,
+                    current_value_usd=round(current_value_usd, 6) if current_value_usd is not None else None,
+                    unrealized_pnl=round(unrealized_pnl, 6) if unrealized_pnl is not None else None,
+                    unrealized_pnl_pct=round(unrealized_pnl_pct, 6) if unrealized_pnl_pct is not None else None,
+                )
 
         if shares < MIN_SHARES_PER_ORDER:
             continue
