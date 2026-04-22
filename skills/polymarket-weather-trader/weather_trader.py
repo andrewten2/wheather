@@ -1771,7 +1771,7 @@ def check_exit_opportunities(
     if not positions:
         return 0, 0
 
-    weather_positions = filter_weather_positions(positions, TRADE_SOURCE)
+    weather_positions = positions if execution_mode == ExecutionMode.PAPER else filter_weather_positions(positions, TRADE_SOURCE)
 
     if not weather_positions:
         return 0, 0
@@ -1864,13 +1864,19 @@ def check_exit_opportunities(
                     unrealized_pnl_pct=round(unrealized_pnl_pct, 6) if unrealized_pnl_pct is not None else None,
                 )
 
-        if shares < MIN_SHARES_PER_ORDER:
+        if execution_mode != ExecutionMode.PAPER and shares < MIN_SHARES_PER_ORDER:
             continue
 
         if current_price is None:
             print(f"  📊 {question}...")
             print(f"     ⏭️  Skip exit: price not found")
             if logger is not None:
+                logger.event(
+                    "exit_snapshot_missing",
+                    market_id=market_id,
+                    side=position_side,
+                    reason="market_not_in_active_scan",
+                )
                 logger.event(
                     "exit_price_check",
                     market_id=market_id,
@@ -1962,7 +1968,7 @@ def check_exit_opportunities(
             if fresh_pos:
                 fresh_side = get_position_side(fresh_pos) if execution_mode == ExecutionMode.PAPER else "yes"
                 fresh_shares = (fresh_pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and fresh_side == "no") else (fresh_pos.shares_yes or 0)
-                if fresh_shares < MIN_SHARES_PER_ORDER:
+                if execution_mode != ExecutionMode.PAPER and fresh_shares < MIN_SHARES_PER_ORDER:
                     print(f"     ⏭️  Skipped: fresh share count {fresh_shares:.1f} below minimum")
                     continue
                 if fresh_shares != shares:
