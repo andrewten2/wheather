@@ -259,6 +259,7 @@ STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
+STRATEGY_V1_YES_STOP_LOSS_PCT = 0.20
 STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.40
 STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
@@ -449,11 +450,22 @@ def build_strategy_v1_event_candidates(
     location: str,
     date_str: str,
     metric: str,
+    logger: StructuredLogger = None,
 ) -> list:
     probability_model = get_strategy_v1_probability_model()
     ranked_candidates = []
     for raw_market in event_markets:
         weather_market = build_weather_market(raw_market)
+        question_text = f"{weather_market.question or ''} {weather_market.event_name or ''}".lower()
+        if "lowest temperature" in question_text:
+            if logger is not None:
+                logger.event(
+                    "market_skipped",
+                    reason="lowest_temperature_disabled",
+                    market_id=weather_market.market_id,
+                    question=weather_market.question or weather_market.event_name,
+                )
+            continue
         bucket = parse_temperature_bucket_model(weather_market.outcome_name)
         if bucket is None or bucket.bucket_type not in STRATEGY_V1_ALLOWED_BUCKET_TYPES:
             continue
@@ -1675,14 +1687,34 @@ def get_position_entry_price(pos, execution_mode: ExecutionMode) -> float:
     return float(pos.avg_cost or 0.0)
 
 
-def get_exit_targets(entry_price: float, side: str) -> tuple[float, float]:
+def get_exit_targets(entry_price: float, side: str, execution_mode: ExecutionMode = None) -> tuple[float, float]:
     if side == "no":
         take_profit = min(1.0, entry_price + 0.12)
         stop_loss = max(0.0, entry_price - 0.10)
     else:
         take_profit = min(1.0, entry_price + 0.15)
-        stop_loss = max(0.0, entry_price - 0.08)
+        if execution_mode == ExecutionMode.PAPER:
+            stop_loss = max(0.01, entry_price * (1.0 - STRATEGY_V1_YES_STOP_LOSS_PCT))
+        else:
+            stop_loss = max(0.0, entry_price - 0.08)
     return take_profit, stop_loss
+
+
+def is_placeholder_paper_exit_price(
+    yes_price: Optional[float],
+    no_price: Optional[float],
+    chosen_exit_price: Optional[float],
+) -> bool:
+    def is_half(value: Optional[float]) -> bool:
+        return value is not None and abs(float(value) - 0.5) < 1e-9
+
+    if is_half(yes_price) and is_half(no_price):
+        return True
+    if yes_price is None and no_price is None and is_half(chosen_exit_price):
+        return True
+    if is_half(chosen_exit_price):
+        return True
+    return False
 
 
 def build_market_price_snapshot(raw_market: dict) -> Optional[dict]:
@@ -1836,6 +1868,21 @@ def check_exit_opportunities(
                 price_snapshot = build_market_price_snapshot(context["market"])
         current_price = chosen_exit_price
 
+        if execution_mode == ExecutionMode.PAPER and is_placeholder_paper_exit_price(yes_price, no_price, current_price):
+            print(f"  📊 {question}...")
+            print("     ⏭️  Skip exit: placeholder or missing price snapshot")
+            if logger is not None:
+                logger.event(
+                    "skip_exit_placeholder_price",
+                    market_id=market_id,
+                    side=position_side,
+                    yes_price=round(yes_price, 6) if yes_price is not None else None,
+                    no_price=round(no_price, 6) if no_price is not None else None,
+                    chosen_exit_price=round(current_price, 6) if current_price is not None else None,
+                    reason="placeholder_or_missing_snapshot",
+                )
+            continue
+
         if execution_mode == ExecutionMode.PAPER:
             current_value_usd = (shares * current_price) if current_price is not None else None
             unrealized_pnl = (current_value_usd - cost_basis) if (current_value_usd is not None and cost_basis is not None) else None
@@ -1889,7 +1936,7 @@ def check_exit_opportunities(
                 )
             continue
 
-        take_profit, stop_loss = get_exit_targets(entry_price, position_side)
+        take_profit, stop_loss = get_exit_targets(entry_price, position_side, execution_mode=execution_mode)
         exit_reason = None
         ignored_edge_invalidated = False
         if position_age_hours is not None and position_age_hours > MAX_POSITION_AGE_HOURS:
@@ -2077,7 +2124,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             paper_max_trades_per_run=STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
             yes_take_profit_delta=0.15,
-            yes_stop_loss_delta=0.08,
+            yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
             no_take_profit_delta=0.12,
             no_stop_loss_delta=0.10,
             early_market_min_hours=STRATEGY_V1_EARLY_MARKET_MIN_HOURS,
@@ -2095,7 +2142,10 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
-    log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
+    if paper:
+        log("  Exit rules:      YES +0.15 / -20%, NO +0.12 / -0.10, edge<0 exit")
+    else:
+        log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     if paper:
         log(
             "  Entry regimes:   early=central±1 YES, late=far NO, "
@@ -2289,6 +2339,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 location=location,
                 date_str=date_str,
                 metric=metric,
+                logger=logger,
             )
             strategy_v1_decision = select_strategy_v1_event_trade(
                 event_markets=event_markets,
