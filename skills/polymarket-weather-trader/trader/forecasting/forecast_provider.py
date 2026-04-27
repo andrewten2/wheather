@@ -17,17 +17,23 @@ class ForecastProvider:
         international_locations: Dict[str, dict],
         noaa_api_base: str,
         open_meteo_base: str,
+        cache_ttl_seconds: int = 300,
+        logger=None,
     ):
         self.locations = locations
         self.international_locations = international_locations
         self.noaa_api_base = noaa_api_base
         self.open_meteo_base = open_meteo_base
+        self.cache_ttl_seconds = self._coerce_positive_int(cache_ttl_seconds, 300)
+        self.logger = logger
         self._cache = {}
+        self._cache_fetched_at: Dict[str, datetime] = {}
         self._last_errors: Dict[str, str] = {}
 
     def get_forecast(self, location: str, date_str: str, metric: str) -> Optional[Forecast]:
-        if location not in self._cache:
-            self._cache[location] = self._fetch_location_forecasts(location)
+        refresh_reason = self._cache_refresh_reason(location)
+        if refresh_reason:
+            self._refresh_location_cache(location, refresh_reason)
 
         daily = self._cache.get(location, {})
         row, fallback_date, fallback_reason = self._resolve_forecast_row(daily, date_str, metric)
@@ -52,11 +58,12 @@ class ForecastProvider:
         )
 
     def has_cached_location(self, location: str) -> bool:
-        return location in self._cache
+        return self._cache_refresh_reason(location) is None
 
     def get_available_forecast_dates(self, location: str) -> list:
-        if location not in self._cache:
-            self._cache[location] = self._fetch_location_forecasts(location)
+        refresh_reason = self._cache_refresh_reason(location)
+        if refresh_reason:
+            self._refresh_location_cache(location, refresh_reason)
         return sorted(self._cache.get(location, {}).keys())
 
     def get_last_error(self, location: str) -> Optional[str]:
@@ -73,6 +80,38 @@ class ForecastProvider:
             raw = self.get_openmeteo_forecast(location)
             return {d: {"high": v.get("high_c"), "low": v.get("low_c")} for d, v in raw.items()}
         return self.get_noaa_forecast(location)
+
+    def _cache_refresh_reason(self, location: str) -> Optional[str]:
+        if location not in self._cache:
+            return "missing"
+        fetched_at = self._cache_fetched_at.get(location)
+        if fetched_at is None:
+            return "missing"
+        age_seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        if age_seconds > self.cache_ttl_seconds:
+            return "expired"
+        return None
+
+    def _refresh_location_cache(self, location: str, reason: str) -> None:
+        self._cache[location] = self._fetch_location_forecasts(location)
+        self._cache_fetched_at[location] = datetime.now(timezone.utc)
+        if self.logger:
+            self.logger.event(
+                "forecast_cache_refresh",
+                location=location,
+                reason=reason,
+                ttl_seconds=self.cache_ttl_seconds,
+            )
+
+    @staticmethod
+    def _coerce_positive_int(value, default: int) -> int:
+        try:
+            parsed = int(value)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+        return default
 
     def _resolve_forecast_row(
         self,

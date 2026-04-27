@@ -20,6 +20,7 @@ import sys
 import re
 import json
 import argparse
+import time
 from pathlib import Path
 from dataclasses import asdict
 from typing import Optional
@@ -153,6 +154,20 @@ _config = load_config(CONFIG_SCHEMA, __file__, slug="polymarket-weather-trader")
 NOAA_API_BASE = "https://api.weather.gov"
 ORDER_TYPE = (_config.get("order_type") or "GTC").upper()
 
+
+def _get_positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
+FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
+
 # SDK adapter / execution singletons
 _adapter = None
 _execution_engine = None
@@ -194,6 +209,7 @@ def get_forecast_provider():
             international_locations=INTERNATIONAL_LOCATIONS,
             noaa_api_base=NOAA_API_BASE,
             open_meteo_base=OPEN_METEO_BASE,
+            cache_ttl_seconds=FORECAST_CACHE_TTL_SECONDS,
         )
     return _forecast_provider
 
@@ -266,7 +282,7 @@ STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
 STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
 STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
-STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.98
+STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.92
 STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
 STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
 STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
@@ -2093,6 +2109,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     if paper:
         get_paper_trader().logger = logger
     forecast_provider = get_forecast_provider()
+    forecast_provider.logger = logger
     probability_model = get_probability_model()
     strategy_v1_probability_model = get_strategy_v1_probability_model() if paper else None
     dataset_recorder = get_dataset_recorder(output_path=dataset_output, logger=logger) if record_dataset else None
@@ -2112,6 +2129,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             mode="paper_only",
             strategy_style="forecast_first",
             allowed_cities="all_active_locations",
+            loop_interval_seconds=WEATHER_BOT_LOOP_SECONDS,
+            forecast_cache_ttl_seconds=FORECAST_CACHE_TTL_SECONDS,
             allowed_bucket_types=sorted(STRATEGY_V1_ALLOWED_BUCKET_TYPES),
             no_edge_threshold=STRATEGY_V1_NO_EDGE_THRESHOLD,
             yes_edge_threshold=STRATEGY_V1_YES_EDGE_THRESHOLD,
@@ -2154,6 +2173,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")
+    log(f"  Loop interval:   {WEATHER_BOT_LOOP_SECONDS}s")
+    log(f"  Forecast TTL:    {FORECAST_CACHE_TTL_SECONDS}s")
     log(f"  Locations:       {', '.join(ACTIVE_LOCATIONS)}")
     log(f"  Smart sizing:    {'✓ Enabled' if smart_sizing else '✗ Disabled'}")
     log(f"  Safeguards:      {'✓ Enabled' if use_safeguards else '✗ Disabled'}")
@@ -2853,19 +2874,26 @@ if __name__ == "__main__":
     # Default to dry-run unless --live is explicitly passed
     dry_run = not args.live and not args.paper
 
-    run_weather_strategy(
-        dry_run=dry_run,
-        positions_only=args.positions,
-        show_config=args.config,
-        smart_sizing=args.smart_sizing,
-        use_safeguards=not args.no_safeguards,
-        use_trends=not args.no_trends,
-        quiet=args.quiet,
-        vol_targeting=args.vol_targeting or VOL_TARGETING,
-        paper=args.paper,
-        record_dataset=args.record_dataset,
-        dataset_output=args.dataset_output,
-    )
+    run_kwargs = {
+        "dry_run": dry_run,
+        "positions_only": args.positions,
+        "show_config": args.config,
+        "smart_sizing": args.smart_sizing,
+        "use_safeguards": not args.no_safeguards,
+        "use_trends": not args.no_trends,
+        "quiet": args.quiet,
+        "vol_targeting": args.vol_targeting or VOL_TARGETING,
+        "paper": args.paper,
+        "record_dataset": args.record_dataset,
+        "dataset_output": args.dataset_output,
+    }
+
+    if args.paper and not args.positions and not args.config:
+        while True:
+            run_weather_strategy(**run_kwargs)
+            time.sleep(WEATHER_BOT_LOOP_SECONDS)
+    else:
+        run_weather_strategy(**run_kwargs)
 
     # Fallback report for automaton if the strategy returned early (no signal)
     if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
