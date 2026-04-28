@@ -1843,10 +1843,12 @@ def check_exit_opportunities(
         chosen_exit_price = pos.current_price
         price_snapshot = None
         opened_at = None
+        stored_question = pos.question
         if execution_mode == ExecutionMode.PAPER:
             position_state = get_paper_trader().get_open_position_state(market_id)
             if position_state:
                 cost_basis = float(position_state.get("cost_basis", 0.0) or 0.0)
+                stored_question = position_state.get("question") or stored_question
                 opened_at = position_state.get("opened_at")
                 if opened_at:
                     try:
@@ -1859,20 +1861,23 @@ def check_exit_opportunities(
                         )
                     except Exception:
                         position_age_hours = None
-            price_snapshot = get_paper_trader().get_market_price_snapshot(
-                get_adapter(),
-                market_id,
-                stored_question=pos.question,
-            )
-            if price_snapshot:
-                yes_price = price_snapshot.get("yes_price")
-                no_price = price_snapshot.get("no_price")
-                chosen_exit_price = no_price if position_side == "no" else yes_price
+            if chosen_exit_price is None:
+                price_snapshot = get_paper_trader().get_market_price_snapshot(
+                    get_adapter(),
+                    market_id,
+                    stored_question=stored_question,
+                )
+                if price_snapshot:
+                    yes_price = price_snapshot.get("yes_price")
+                    no_price = price_snapshot.get("no_price")
+                    direct_exit_price = no_price if position_side == "no" else yes_price
+                    if direct_exit_price is not None:
+                        chosen_exit_price = direct_exit_price
             if logger is not None:
                 logger.event(
                     "exit_price_check",
                     market_id=market_id,
-                    outcome_name=pos.question,
+                    outcome_name=stored_question,
                     side=position_side,
                     yes_price=round(yes_price, 6) if yes_price is not None else None,
                     no_price=round(no_price, 6) if no_price is not None else None,
@@ -1938,12 +1943,13 @@ def check_exit_opportunities(
                     "exit_snapshot_missing",
                     market_id=market_id,
                     side=position_side,
-                    reason="market_not_in_active_scan",
+                    reason="direct_snapshot_failed",
+                    stored_question=stored_question,
                 )
                 logger.event(
                     "exit_price_check",
                     market_id=market_id,
-                    outcome_name=pos.question,
+                    outcome_name=stored_question,
                     side=position_side,
                     yes_price=round(yes_price, 6) if yes_price is not None else None,
                     no_price=round(no_price, 6) if no_price is not None else None,
@@ -2047,7 +2053,7 @@ def check_exit_opportunities(
                 shares,
                 side=position_side,
                 market_price=current_price,
-                market_question=pos.question,
+                market_question=stored_question,
             )
 
             if result.get("success"):
