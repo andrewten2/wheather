@@ -302,6 +302,13 @@ class PaperTrader:
             "updated_at": timestamp,
             "sources": ["sdk:weather"] if signal_source else [],
         })
+        position_question = (
+            position.get("question")
+            or market_question
+            or self._get_market_question(adapter, market_id)
+        )
+        if position_question:
+            position["question"] = position_question
 
         realized_pnl = 0.0
         if action == "buy":
@@ -407,6 +414,7 @@ class PaperTrader:
             "trade_id": order_id,
             "timestamp": timestamp,
             "market_id": market_id,
+            "question": position_question,
             "action": action,
             "side": side,
             "requested_shares": shares,
