@@ -8,12 +8,23 @@ from trader.models.market import TemperatureBucket, WeatherMarket
 
 
 def build_weather_market(raw_market: dict) -> WeatherMarket:
+    event_name = raw_market.get("event_name") or raw_market.get("question", "")
+    question = raw_market.get("question", "")
+    outcome_name = raw_market.get("outcome_name") or ""
+    if not parse_temperature_bucket(outcome_name):
+        for fallback_text in (question, event_name):
+            if fallback_text and parse_temperature_bucket(fallback_text):
+                outcome_name = fallback_text
+                break
+    if not outcome_name:
+        outcome_name = question
+
     return WeatherMarket(
         market_id=raw_market.get("id", ""),
         event_id=raw_market.get("event_id"),
-        event_name=raw_market.get("event_name") or raw_market.get("question", ""),
-        question=raw_market.get("question", ""),
-        outcome_name=raw_market.get("outcome_name") or raw_market.get("question", ""),
+        event_name=event_name,
+        question=question,
+        outcome_name=outcome_name,
         price_yes=raw_market.get("external_price_yes") or 0.5,
         raw_market=raw_market,
     )
@@ -50,19 +61,38 @@ def parse_weather_event(
         if not location:
             return None
 
-    temp_unit = "C" if "°c" in event_lower or re.search(r"\d+°?c\b", event_lower, re.IGNORECASE) else "F"
-    month_day_match = re.search(r"(?:on|for)\s+([a-zA-Z]+)\s+(\d{1,2})", event_name, re.IGNORECASE)
-    if not month_day_match:
-        return None
-
-    month_name = month_day_match.group(1).lower()
-    day = int(month_day_match.group(2))
     month_map = {
         "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
         "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
         "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
         "november": 11, "nov": 11, "december": 12, "dec": 12,
     }
+
+    temp_unit = "C" if "°c" in event_lower or re.search(r"\d+°?c\b", event_lower, re.IGNORECASE) else "F"
+    month_day_match = re.search(
+        r"(?:on|for)\s+([a-zA-Z]+)\s+(\d{1,2})(?:st|nd|rd|th)?",
+        event_name,
+        re.IGNORECASE,
+    )
+    month_name = None
+    day = None
+    if month_day_match:
+        month_name = month_day_match.group(1).lower()
+        day = int(month_day_match.group(2))
+    else:
+        for candidate_match in re.finditer(
+            r"\b([a-zA-Z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+            event_name,
+            re.IGNORECASE,
+        ):
+            candidate_month = candidate_match.group(1).lower()
+            if candidate_month in month_map:
+                month_name = candidate_month
+                day = int(candidate_match.group(2))
+                break
+
+    if month_name is None or day is None:
+        return None
 
     month = month_map.get(month_name)
     if not month:
@@ -113,17 +143,37 @@ def parse_temperature_bucket(outcome_name: str) -> Optional[TemperatureBucket]:
     if not outcome_name:
         return None
 
-    below_match = re.search(r"(\d+)\s*°?[fFcC]?\s*(or below|or less)", outcome_name, re.IGNORECASE)
+    below_match = re.search(
+        r"(\d+)\s*°?[fFcC]?\s*(or below|or less|or lower|or under)",
+        outcome_name,
+        re.IGNORECASE,
+    )
+    if not below_match:
+        below_match = re.search(
+            r"(?:at or below|below|under|less than|lower than|no more than)\s*(\d+)\s*°?[fFcC]?",
+            outcome_name,
+            re.IGNORECASE,
+        )
     if below_match:
         value = int(below_match.group(1))
         return TemperatureBucket(label=outcome_name, low=-999, high=value, bucket_type="below")
 
-    above_match = re.search(r"(\d+)\s*°?[fFcC]?\s*(or higher|or above|or more)", outcome_name, re.IGNORECASE)
+    above_match = re.search(
+        r"(\d+)\s*°?[fFcC]?\s*(or higher|or above|or more|or greater)",
+        outcome_name,
+        re.IGNORECASE,
+    )
+    if not above_match:
+        above_match = re.search(
+            r"(?:at or above|above|over|greater than|higher than|at least)\s*(\d+)\s*°?[fFcC]?",
+            outcome_name,
+            re.IGNORECASE,
+        )
     if above_match:
         value = int(above_match.group(1))
         return TemperatureBucket(label=outcome_name, low=value, high=999, bucket_type="above")
 
-    range_match = re.search(r"(\d+)\s*(?:°?\s*[fFcC])?\s*(?:-|–|to)\s*(\d+)", outcome_name)
+    range_match = re.search(r"(\d+)\s*(?:°?\s*[fFcC])?\s*(?:-|–|—|to|and)\s*(\d+)", outcome_name, re.IGNORECASE)
     if range_match:
         low, high = int(range_match.group(1)), int(range_match.group(2))
         return TemperatureBucket(label=outcome_name, low=min(low, high), high=max(low, high), bucket_type="range")

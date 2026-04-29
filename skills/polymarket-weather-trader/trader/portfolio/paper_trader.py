@@ -165,16 +165,81 @@ class PaperTrader:
             return None
         return snapshot.get("no_price") if side == "no" else snapshot.get("yes_price")
 
+    @staticmethod
+    def _coerce_price(value) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        if price < 0.0 or price > 1.0:
+            return None
+        return price
+
+    @classmethod
+    def _first_price(cls, market: dict, keys: List[str]) -> Optional[float]:
+        for key in keys:
+            price = cls._coerce_price(market.get(key))
+            if price is not None:
+                return price
+        return None
+
+    @classmethod
+    def _price_from_outcome_prices(cls, market: dict, index: int) -> Optional[float]:
+        raw_prices = market.get("outcome_prices") or market.get("outcomePrices")
+        if raw_prices is None:
+            return None
+        if isinstance(raw_prices, str):
+            try:
+                raw_prices = json.loads(raw_prices)
+            except Exception:
+                return None
+        if not isinstance(raw_prices, list) or len(raw_prices) <= index:
+            return None
+        return cls._coerce_price(raw_prices[index])
+
     def _build_price_snapshot_from_market(self, market: dict) -> Optional[dict]:
         if not market:
             return None
-        raw_price_yes = market.get("external_price_yes")
-        if raw_price_yes is None:
-            raw_price_yes = market.get("current_probability")
-        if raw_price_yes is None:
+        price_yes = self._first_price(
+            market,
+            [
+                "external_price_yes",
+                "price_yes",
+                "yes_price",
+                "current_probability",
+                "current_price",
+                "external_price",
+                "market_price",
+                "probability",
+                "last_price",
+            ],
+        )
+        if price_yes is None:
+            price_yes = self._price_from_outcome_prices(market, 0)
+
+        price_no = self._first_price(
+            market,
+            [
+                "external_price_no",
+                "price_no",
+                "no_price",
+            ],
+        )
+        if price_no is None:
+            price_no = self._price_from_outcome_prices(market, 1)
+
+        if price_yes is None and price_no is None:
             return None
-        price_yes = float(raw_price_yes)
-        price_no = 1.0 - price_yes
+        if price_yes is None:
+            price_yes = 1.0 - price_no
+        if price_no is None:
+            price_no = 1.0 - price_yes
         return {
             "yes_price": price_yes,
             "no_price": price_no,
@@ -208,6 +273,10 @@ class PaperTrader:
             context = adapter.get_market_context(market_id)
         except Exception:
             context = None
+        if context:
+            snapshot = self._build_price_snapshot_from_market(context)
+            if snapshot is not None:
+                return snapshot
         if context and "market" in context:
             snapshot = self._build_price_snapshot_from_market(context["market"])
             if snapshot is not None:
