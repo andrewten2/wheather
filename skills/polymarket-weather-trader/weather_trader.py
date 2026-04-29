@@ -1576,6 +1576,14 @@ LOCATION_SEARCH_TERMS = {
     "Atlanta": ["temperature atlanta"],
     "Dallas": ["temperature dallas"],
     "Miami": ["temperature miami"],
+    "Tel Aviv": ["temperature tel aviv"],
+    "Munich": ["temperature munich"],
+    "London": ["temperature london"],
+    "Tokyo": ["temperature tokyo"],
+    "Seoul": ["temperature seoul"],
+    "Ankara": ["temperature ankara"],
+    "Lucknow": ["temperature lucknow"],
+    "Wellington": ["temperature wellington"],
 }
 
 # =============================================================================
