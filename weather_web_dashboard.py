@@ -13,8 +13,9 @@ from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent
+ENV_STATE_PATH = os.environ.get("WEATHER_DASHBOARD_STATE")
 STATE_CANDIDATES = [
-    Path(os.environ.get("WEATHER_DASHBOARD_STATE", "")),
+    Path(ENV_STATE_PATH) if ENV_STATE_PATH else None,
     Path("/root/wheather/skills/polymarket-weather-trader/data/paper_trading/state.json"),
     ROOT / "skills" / "polymarket-weather-trader" / "data" / "paper_trading" / "state.json",
 ]
@@ -22,9 +23,9 @@ STATE_CANDIDATES = [
 
 def resolve_state_path() -> Path:
     for path in STATE_CANDIDATES:
-        if str(path) and path.exists():
+        if path and path.is_file():
             return path
-    return STATE_CANDIDATES[1]
+    return Path("/root/wheather/skills/polymarket-weather-trader/data/paper_trading/state.json")
 
 
 STATE_PATH = resolve_state_path()
@@ -108,6 +109,27 @@ def normalize_state() -> dict:
     wins = [trade for trade in sells if (to_float(trade.get("realized_pnl")) or 0.0) > 0]
     losses = [trade for trade in sells if (to_float(trade.get("realized_pnl")) or 0.0) < 0]
 
+    def trade_price(trade: dict, fields: tuple[str, ...]) -> float | None:
+        for field in fields:
+            price = to_float(trade.get(field))
+            if price is not None:
+                return price
+        return None
+
+    buy_history = {}
+    for trade in buys:
+        market_key = trade.get("market_id") or clean_text(trade.get("question"))
+        side = (trade.get("side") or "?").upper()
+        price = trade_price(
+            trade,
+            ("simulated_fill_price", "entry_price", "price", "market_price", "avg_price", "avg_cost"),
+        )
+        if market_key and price is not None:
+            buy_history.setdefault((market_key, side), []).append((parse_dt(trade.get("timestamp")), price))
+
+    for history in buy_history.values():
+        history.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc))
+
     normalized_positions = []
     for position in positions:
         pnl, pnl_pct = position_pnl(position)
@@ -142,11 +164,28 @@ def normalize_state() -> dict:
 
     normalized_sells = []
     for trade in sells[-30:]:
+        sell_time = parse_dt(trade.get("timestamp"))
+        market_key = trade.get("market_id") or clean_text(trade.get("question"))
+        side = (trade.get("side") or "?").upper()
+        entry_price = trade_price(
+            trade,
+            ("entry_price", "avg_price", "avg_cost", "buy_price", "entry_fill_price"),
+        )
+        if entry_price is None:
+            history = buy_history.get((market_key, side), [])
+            if sell_time:
+                prior_buys = [item for item in history if item[0] is None or item[0] <= sell_time]
+                if prior_buys:
+                    entry_price = prior_buys[-1][1]
+            elif history:
+                entry_price = history[-1][1]
+
         normalized_sells.append(
             {
                 "timestamp": trade.get("timestamp"),
-                "time": (parse_dt(trade.get("timestamp")).strftime("%m-%d %H:%M") if parse_dt(trade.get("timestamp")) else ""),
-                "side": (trade.get("side") or "?").upper(),
+                "time": (sell_time.strftime("%m-%d %H:%M") if sell_time else ""),
+                "side": side,
+                "entry_price": entry_price,
                 "exit_price": to_float(trade.get("simulated_fill_price")),
                 "pnl": to_float(trade.get("realized_pnl")),
                 "question": clean_text(trade.get("question") or trade.get("market_id")),
@@ -211,6 +250,7 @@ INDEX_HTML = r"""<!doctype html>
       margin: 0;
       min-height: 100vh;
       font-family: var(--mono);
+      font-size: 16px;
       color: var(--text);
       background:
         radial-gradient(circle at 20% 0%, rgba(0, 255, 154, 0.16), transparent 28%),
@@ -245,7 +285,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 100vh;
       padding: 18px;
       display: grid;
-      grid-template-rows: 74px 1fr 220px;
+      grid-template-rows: 84px 1fr 250px;
       gap: 18px;
     }
     .shell {
@@ -269,11 +309,11 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--green);
       font-weight: 800;
       letter-spacing: 0.02em;
-      font-size: 22px;
+      font-size: 26px;
       text-shadow: 0 0 15px rgba(105, 255, 125, 0.45);
     }
     .storm {
-      font-size: 36px;
+      font-size: 42px;
       color: var(--cyan);
       filter: drop-shadow(0 0 10px rgba(73, 220, 255, 0.65));
     }
@@ -283,7 +323,7 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
       margin-left: 14px;
       color: white;
-      font-size: 14px;
+      font-size: 16px;
     }
     .pulse {
       width: 9px;
@@ -302,11 +342,11 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      font-size: 11px;
+      font-size: 12px;
     }
     .metric .value {
       margin-top: 4px;
-      font-size: 17px;
+      font-size: 20px;
       font-weight: 800;
     }
     .positive { color: var(--green); }
@@ -362,6 +402,7 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 900;
       letter-spacing: 0.06em;
       text-transform: uppercase;
+      font-size: 17px;
     }
     .green .panel-title { color: var(--green); }
     .stats-list {
@@ -373,8 +414,9 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: 1fr auto;
       align-items: center;
-      padding: 10px 10px;
+      padding: 12px 10px;
       border-bottom: 1px solid rgba(155, 210, 230, 0.08);
+      font-size: 16px;
     }
     .stat-row span:first-child { color: #dbe7ff; }
     .stat-row .icon { color: var(--cyan); margin-right: 10px; }
@@ -400,20 +442,21 @@ INDEX_HTML = r"""<!doctype html>
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 14px;
+      font-size: 16px;
     }
     th {
       color: #f7fbff;
-      font-size: 13px;
+      font-size: 15px;
       letter-spacing: 0.03em;
       padding: 12px 10px;
       border-bottom: 1px solid rgba(191, 226, 244, 0.28);
       text-align: left;
     }
     td {
-      padding: 10px;
+      padding: 12px 10px;
       border-bottom: 1px solid rgba(160, 210, 240, 0.08);
       vertical-align: middle;
+      line-height: 1.35;
     }
     tbody tr {
       transition: background 0.2s ease, transform 0.2s ease;
@@ -423,7 +466,7 @@ INDEX_HTML = r"""<!doctype html>
       transform: translateX(2px);
     }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
-    .market { color: #eef7ff; }
+    .market { color: #eef7ff; line-height: 1.35; }
     .dot {
       display: inline-block;
       width: 10px;
@@ -497,7 +540,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="panel-title">CLOSED TRADES</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th></th><th>Time</th><th>Side</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+          <thead><tr><th></th><th>Time</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
           <tbody id="closed"></tbody>
         </table>
       </div>
@@ -598,6 +641,7 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="dot ${dot}"></span></td>
           <td>${t.time}</td>
           <td class="side-${t.side}">${t.side}</td>
+          <td class="num">${fmtPrice(t.entry_price)}</td>
           <td class="num">${fmtPrice(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${fmtMoney(t.pnl)}</td>
           <td class="market">${t.question}</td>
