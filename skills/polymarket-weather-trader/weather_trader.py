@@ -178,6 +178,7 @@ _paper_trader = None
 _probability_model = None
 _strategy_v1_probability_model = None
 _dataset_recorder = None
+_actual_temperature_cache = {}
 
 def get_adapter(live=True):
     """Lazy-init SDK adapter singleton."""
@@ -285,6 +286,7 @@ STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
 STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
 STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.92
+STRATEGY_V1_NO_TAKE_PROFIT_PRICE = 0.98
 STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
 STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
 STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
@@ -297,7 +299,7 @@ STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR = 0.95
 STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN = 10
 MARKET_EXIT_COOLDOWN_MINUTES = 120
 MARKET_REENTRY_COOLDOWN_MINUTES = 120
-MAX_POSITION_AGE_HOURS = 24
+MAX_POSITION_AGE_HOURS = 48
 PAPER_SLIPPAGE_MAX_PCT = 0.45
 
 
@@ -1308,6 +1310,7 @@ INTERNATIONAL_LOCATIONS = {
 }
 
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE_BASE = "https://archive-api.open-meteo.com/v1/archive"
 
 def get_openmeteo_forecast(city: str) -> dict:
     """Compatibility wrapper for forecast provider."""
@@ -1715,7 +1718,7 @@ def get_position_entry_price(pos, execution_mode: ExecutionMode) -> float:
 
 def get_exit_targets(entry_price: float, side: str, execution_mode: ExecutionMode = None) -> tuple[float, float]:
     if side == "no":
-        take_profit = min(1.0, entry_price + 0.12)
+        take_profit = STRATEGY_V1_NO_TAKE_PROFIT_PRICE
         stop_loss = max(0.0, entry_price - 0.10)
     else:
         take_profit = min(1.0, entry_price + 0.15)
@@ -1805,6 +1808,155 @@ def load_paper_positions_from_state(price_snapshot_cache: dict = None) -> list[P
             )
         )
     return positions
+
+
+def _get_location_coordinates(location: str) -> Optional[dict]:
+    if location in LOCATIONS:
+        return LOCATIONS[location]
+    if location in INTERNATIONAL_LOCATIONS:
+        return INTERNATIONAL_LOCATIONS[location]
+    return None
+
+
+def fetch_actual_temperature(location: str, target_date: str, metric: str, unit: str) -> Optional[dict]:
+    """Fetch realized daily high/low from Open-Meteo archive for paper settlement."""
+    cache_key = (location, target_date, metric, unit)
+    if cache_key in _actual_temperature_cache:
+        return _actual_temperature_cache[cache_key]
+
+    loc = _get_location_coordinates(location)
+    if not loc:
+        return None
+
+    temperature_unit = "celsius" if str(unit).upper() == "C" else "fahrenheit"
+    daily_field = "temperature_2m_max" if metric == "high" else "temperature_2m_min"
+    params = urlencode(
+        {
+            "latitude": loc["lat"],
+            "longitude": loc["lon"],
+            "start_date": target_date,
+            "end_date": target_date,
+            "daily": "temperature_2m_max,temperature_2m_min",
+            "temperature_unit": temperature_unit,
+            "timezone": loc.get("tz", "auto"),
+        }
+    )
+    data = get_forecast_provider().fetch_json(
+        f"{OPEN_METEO_ARCHIVE_BASE}?{params}",
+        error_key=f"actual:{location}:{target_date}",
+    )
+    if not data:
+        return None
+
+    daily = data.get("daily") or {}
+    values = daily.get(daily_field) or []
+    if not values or values[0] is None:
+        return None
+
+    actual_raw = float(values[0])
+    actual_rounded = round(actual_raw)
+    result = {
+        "source": "openmeteo_archive",
+        "location": location,
+        "target_date": target_date,
+        "metric": metric,
+        "unit": unit,
+        "actual_raw": actual_raw,
+        "actual_value": actual_rounded,
+    }
+    _actual_temperature_cache[cache_key] = result
+    return result
+
+
+def bucket_contains_actual(bucket, actual_value: float) -> bool:
+    if bucket.bucket_type == "below":
+        return actual_value <= float(bucket.high)
+    if bucket.bucket_type == "above":
+        return actual_value >= float(bucket.low)
+    if bucket.bucket_type == "exact":
+        return actual_value == float(bucket.low)
+    return float(bucket.low) <= actual_value <= float(bucket.high)
+
+
+def resolve_paper_settlement_price(
+    market_id: str,
+    stored_question: str,
+    position_side: str,
+    logger: StructuredLogger = None,
+) -> Optional[dict]:
+    """Resolve stale paper weather positions after event date has passed."""
+    event_info = parse_weather_event_model(stored_question, LOCATION_ALIASES, min_date=None)
+    bucket = parse_temperature_bucket_model(stored_question)
+    if not event_info or bucket is None:
+        if logger is not None:
+            logger.event(
+                "paper_settlement_unavailable",
+                market_id=market_id,
+                side=position_side,
+                reason="unparseable_market",
+                stored_question=stored_question,
+            )
+        return None
+
+    try:
+        target_date = datetime.strptime(event_info["date"], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    if target_date >= datetime.now(timezone.utc).date():
+        return None
+
+    actual = fetch_actual_temperature(
+        event_info["location"],
+        event_info["date"],
+        event_info["metric"],
+        event_info.get("unit", "F"),
+    )
+    if not actual:
+        if logger is not None:
+            logger.event(
+                "paper_settlement_unavailable",
+                market_id=market_id,
+                side=position_side,
+                reason="actual_temperature_not_found",
+                stored_question=stored_question,
+                location=event_info.get("location"),
+                target_date=event_info.get("date"),
+                metric=event_info.get("metric"),
+            )
+        return None
+
+    bucket_won = bucket_contains_actual(bucket, actual["actual_value"])
+    yes_settlement_price = 1.0 if bucket_won else 0.0
+    chosen_settlement_price = 1.0 - yes_settlement_price if position_side == "no" else yes_settlement_price
+    result = {
+        "settlement_price": chosen_settlement_price,
+        "yes_settlement_price": yes_settlement_price,
+        "bucket_won": bucket_won,
+        "actual": actual,
+        "bucket_low": bucket.low,
+        "bucket_high": bucket.high,
+        "bucket_type": bucket.bucket_type,
+    }
+    if logger is not None:
+        logger.event(
+            "paper_settlement_check",
+            market_id=market_id,
+            side=position_side,
+            stored_question=stored_question,
+            settlement_price=chosen_settlement_price,
+            yes_settlement_price=yes_settlement_price,
+            bucket_won=bucket_won,
+            actual_temperature=actual["actual_value"],
+            actual_temperature_raw=round(actual["actual_raw"], 4),
+            unit=actual["unit"],
+            source=actual["source"],
+            bucket_low=bucket.low,
+            bucket_high=bucket.high,
+            bucket_type=bucket.bucket_type,
+            target_date=actual["target_date"],
+        )
+    return result
 
 
 def compute_position_exit_edge(market_snapshot: dict) -> Optional[dict]:
@@ -1905,6 +2057,7 @@ def check_exit_opportunities(
         no_price = None
         chosen_exit_price = pos.current_price
         price_snapshot = None
+        settlement_info = None
         opened_at = None
         stored_question = pos.question
         if execution_mode == ExecutionMode.PAPER:
@@ -1959,6 +2112,19 @@ def check_exit_opportunities(
             if context and context.get("market"):
                 price_snapshot = build_market_price_snapshot(context["market"])
         current_price = chosen_exit_price
+
+        if execution_mode == ExecutionMode.PAPER and (
+            current_price is None or is_placeholder_paper_exit_price(yes_price, no_price, current_price)
+        ):
+            settlement_info = resolve_paper_settlement_price(
+                market_id=market_id,
+                stored_question=stored_question,
+                position_side=position_side,
+                logger=logger,
+            )
+            if settlement_info is not None:
+                current_price = settlement_info["settlement_price"]
+                chosen_exit_price = current_price
 
         if execution_mode == ExecutionMode.PAPER and is_placeholder_paper_exit_price(yes_price, no_price, current_price):
             print(f"  📊 {question}...")
@@ -2032,7 +2198,9 @@ def check_exit_opportunities(
         take_profit, stop_loss = get_exit_targets(entry_price, position_side, execution_mode=execution_mode)
         exit_reason = None
         ignored_edge_invalidated = False
-        if position_age_hours is not None and position_age_hours > MAX_POSITION_AGE_HOURS:
+        if settlement_info is not None:
+            exit_reason = "market_settlement"
+        elif position_age_hours is not None and position_age_hours > MAX_POSITION_AGE_HOURS:
             exit_reason = "max_age_exit"
         elif current_price >= take_profit:
             exit_reason = "take_profit"
@@ -2058,6 +2226,10 @@ def check_exit_opportunities(
                 take_profit=round(take_profit, 6),
                 stop_loss=round(stop_loss, 6),
                 position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
+                settlement_actual_temperature=(
+                    settlement_info["actual"]["actual_value"] if settlement_info is not None else None
+                ),
+                settlement_bucket_won=settlement_info["bucket_won"] if settlement_info is not None else None,
                 exit_reason=exit_reason,
             )
             if ignored_edge_invalidated:
@@ -2089,7 +2261,7 @@ def check_exit_opportunities(
             )
 
             # Check safeguards before selling
-            if use_safeguards:
+            if use_safeguards and exit_reason != "market_settlement":
                 context = get_market_context(market_id)
                 should_trade, reasons = check_context_safeguards(context)
                 if not should_trade:
@@ -2222,7 +2394,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
             yes_take_profit_delta=0.15,
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
-            no_take_profit_delta=0.12,
+            no_take_profit_price=STRATEGY_V1_NO_TAKE_PROFIT_PRICE,
             no_stop_loss_delta=0.10,
             early_market_min_hours=STRATEGY_V1_EARLY_MARKET_MIN_HOURS,
             late_market_max_hours=STRATEGY_V1_LATE_MARKET_MAX_HOURS,
