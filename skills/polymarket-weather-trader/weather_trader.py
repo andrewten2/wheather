@@ -59,6 +59,7 @@ from simmer_sdk.skill import load_config, update_config, get_config_path
 from trader.adapters.simmer_client import SimmerAdapter, discover_and_import_weather_markets
 from trader.execution.execution_engine import ExecutionEngine
 from trader.models.execution import ExecutionMode
+from trader.models.position import Position
 from trader.forecasting.forecast_provider import ForecastProvider
 from trader.markets.market_parser import (
     build_weather_market,
@@ -166,6 +167,7 @@ def _get_positive_int_env(name: str, default: int) -> int:
 
 
 WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
+WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_SECONDS", 30)
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
 
 # SDK adapter / execution singletons
@@ -1590,10 +1592,10 @@ LOCATION_SEARCH_TERMS = {
 # Simmer API - Trading
 # =============================================================================
 
-def fetch_weather_markets():
+def fetch_weather_markets(search_queries=None):
     """Fetch weather-tagged markets from Simmer API."""
     try:
-        return get_adapter().fetch_weather_markets()
+        return get_adapter().fetch_weather_markets(search_queries=search_queries)
     except Exception:
         print("  Failed to fetch markets from Simmer API")
         return []
@@ -1757,6 +1759,54 @@ def build_market_price_snapshot(raw_market: dict) -> Optional[dict]:
     }
 
 
+def build_market_snapshot_cache(markets: list) -> dict:
+    """Build market_id -> side-aware price snapshot from one active market scan."""
+    snapshots = {}
+    for raw_market in markets or []:
+        market_id = raw_market.get("id") or raw_market.get("market_id")
+        if not market_id:
+            continue
+        snapshot = build_market_price_snapshot(raw_market)
+        if snapshot is not None:
+            snapshots[market_id] = snapshot
+    return snapshots
+
+
+def load_paper_positions_from_state(price_snapshot_cache: dict = None) -> list[Position]:
+    """Load paper positions without per-position API lookups."""
+    positions = []
+    for market_id, stored in get_paper_trader().state.get("positions", {}).items():
+        side = stored.get("side", "yes")
+        shares = float(stored.get("shares", 0.0) or 0.0)
+        snapshot = (price_snapshot_cache or {}).get(market_id)
+        current_price = None
+        if snapshot is not None:
+            current_price = snapshot.get("no_price") if side == "no" else snapshot.get("yes_price")
+        current_value = (shares * current_price) if current_price is not None else None
+        pnl = (
+            current_value - float(stored.get("cost_basis", 0.0) or 0.0)
+            if current_value is not None
+            else None
+        )
+        positions.append(
+            Position(
+                market_id=market_id,
+                question=stored.get("question", market_id),
+                venue="paper",
+                shares_yes=shares if side == "yes" else 0.0,
+                shares_no=shares if side == "no" else 0.0,
+                avg_cost=stored.get("avg_cost"),
+                current_price=current_price,
+                current_value=current_value,
+                pnl=pnl,
+                sources=stored.get("sources", []),
+                status="active",
+                opened_by_weather_strategy=("sdk:weather" in stored.get("sources", [])),
+            )
+        )
+    return positions
+
+
 def compute_position_exit_edge(market_snapshot: dict) -> Optional[dict]:
     if not market_snapshot:
         return None
@@ -1816,13 +1866,18 @@ def check_exit_opportunities(
     use_safeguards: bool = True,
     execution_mode: ExecutionMode = None,
     logger: StructuredLogger = None,
+    positions_override: list[Position] = None,
+    price_snapshot_cache: dict = None,
+    allow_direct_snapshot_fallback: bool = True,
 ) -> tuple:
     """Check open positions for exit opportunities. Returns: (exits_found, exits_executed)"""
-    positions = load_positions(
-        get_adapter(),
-        execution_mode=execution_mode,
-        paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
-    )
+    positions = positions_override
+    if positions is None:
+        positions = load_positions(
+            get_adapter(),
+            execution_mode=execution_mode,
+            paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
+        )
 
     if not positions:
         return 0, 0
@@ -1869,18 +1924,26 @@ def check_exit_opportunities(
                         )
                     except Exception:
                         position_age_hours = None
-            if chosen_exit_price is None:
-                price_snapshot = get_paper_trader().get_market_price_snapshot(
-                    get_adapter(),
-                    market_id,
-                    stored_question=stored_question,
-                )
-                if price_snapshot:
-                    yes_price = price_snapshot.get("yes_price")
-                    no_price = price_snapshot.get("no_price")
-                    direct_exit_price = no_price if position_side == "no" else yes_price
-                    if direct_exit_price is not None:
-                        chosen_exit_price = direct_exit_price
+            price_snapshot = (price_snapshot_cache or {}).get(market_id)
+            if price_snapshot:
+                yes_price = price_snapshot.get("yes_price")
+                no_price = price_snapshot.get("no_price")
+                direct_exit_price = no_price if position_side == "no" else yes_price
+                if direct_exit_price is not None:
+                    chosen_exit_price = direct_exit_price
+            elif chosen_exit_price is None:
+                if allow_direct_snapshot_fallback:
+                    price_snapshot = get_paper_trader().get_market_price_snapshot(
+                        get_adapter(),
+                        market_id,
+                        stored_question=stored_question,
+                    )
+                    if price_snapshot:
+                        yes_price = price_snapshot.get("yes_price")
+                        no_price = price_snapshot.get("no_price")
+                        direct_exit_price = no_price if position_side == "no" else yes_price
+                        if direct_exit_price is not None:
+                            chosen_exit_price = direct_exit_price
             if logger is not None:
                 logger.event(
                     "exit_price_check",
@@ -2144,6 +2207,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             strategy_style="forecast_first",
             allowed_cities="all_active_locations",
             loop_interval_seconds=WEATHER_BOT_LOOP_SECONDS,
+            exit_check_interval_seconds=WEATHER_BOT_EXIT_CHECK_SECONDS,
             forecast_cache_ttl_seconds=FORECAST_CACHE_TTL_SECONDS,
             allowed_bucket_types=sorted(STRATEGY_V1_ALLOWED_BUCKET_TYPES),
             no_edge_threshold=STRATEGY_V1_NO_EDGE_THRESHOLD,
@@ -2188,6 +2252,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")
     log(f"  Loop interval:   {WEATHER_BOT_LOOP_SECONDS}s")
+    if paper:
+        log(f"  Exit check:      {WEATHER_BOT_EXIT_CHECK_SECONDS}s (open positions only)")
     log(f"  Forecast TTL:    {FORECAST_CACHE_TTL_SECONDS}s")
     log(f"  Locations:       {', '.join(ACTIVE_LOCATIONS)}")
     log(f"  Smart sizing:    {'✓ Enabled' if smart_sizing else '✗ Disabled'}")
@@ -2802,6 +2868,25 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         print("\n  [PAPER MODE - trades simulated with real prices]")
 
 
+def run_paper_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True, quiet: bool = False):
+    """Run a lightweight PAPER-only exit pass without scanning for new entries."""
+    logger = StructuredLogger(quiet=quiet)
+    get_paper_trader().logger = logger
+    get_execution_engine(live=True, forced_mode=ExecutionMode.PAPER, logger=logger)
+    active_markets = fetch_weather_markets(search_queries=[])
+    price_snapshot_cache = build_market_snapshot_cache(active_markets)
+    paper_positions = load_paper_positions_from_state(price_snapshot_cache=price_snapshot_cache)
+    check_exit_opportunities(
+        dry_run=dry_run,
+        use_safeguards=use_safeguards,
+        execution_mode=ExecutionMode.PAPER,
+        logger=logger,
+        positions_override=paper_positions,
+        price_snapshot_cache=price_snapshot_cache,
+        allow_direct_snapshot_fallback=False,
+    )
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -2905,7 +2990,17 @@ if __name__ == "__main__":
     if args.paper and not args.positions and not args.config:
         while True:
             run_weather_strategy(**run_kwargs)
-            time.sleep(WEATHER_BOT_LOOP_SECONDS)
+            remaining_sleep = WEATHER_BOT_LOOP_SECONDS
+            while remaining_sleep > 0:
+                sleep_for = min(WEATHER_BOT_EXIT_CHECK_SECONDS, remaining_sleep)
+                time.sleep(sleep_for)
+                remaining_sleep -= sleep_for
+                if remaining_sleep > 0:
+                    run_paper_exit_check_cycle(
+                        dry_run=run_kwargs["dry_run"],
+                        use_safeguards=run_kwargs["use_safeguards"],
+                        quiet=run_kwargs["quiet"],
+                    )
     else:
         run_weather_strategy(**run_kwargs)
 

@@ -79,7 +79,8 @@ class SimmerAdapter:
         )
         add_markets(tagged.get("markets", []))
 
-        for query in search_queries or ["temperature", "highest", "weather"]:
+        queries = ["temperature", "highest", "weather"] if search_queries is None else search_queries
+        for query in queries:
             try:
                 searched = client._request(  # noqa: SLF001 - intentionally isolated here
                     "GET",
