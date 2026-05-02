@@ -405,6 +405,11 @@ def build_open_panel(positions, frame):
 
 def build_closed_panel(trades):
     sells = [trade for trade in trades if trade.get("action") == "sell"]
+    sorted_sells = sorted(
+        sells,
+        key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
+        reverse=True,
+    )
     buy_history = build_buy_history(trades)
     table = Table(title="CLOSED TRADES", expand=True, box=box.SIMPLE)
     table.add_column("", width=2)
@@ -414,7 +419,7 @@ def build_closed_panel(trades):
     table.add_column("Exit", justify="right", width=8)
     table.add_column("PnL", justify="right", width=9)
     table.add_column("Market", overflow="fold")
-    for trade in sells[-18:]:
+    for trade in sorted_sells[:18]:
         pnl = to_float(trade.get("realized_pnl"))
         style = pnl_style(pnl)
         dot_style = "#66ff7a" if (pnl or 0.0) >= 0 else "#ff5c57"

@@ -278,6 +278,7 @@ STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
+STRATEGY_V1_YES_TAKE_PROFIT_PCT = 0.40
 STRATEGY_V1_YES_STOP_LOSS_PCT = 0.10
 STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.40
@@ -1815,7 +1816,7 @@ def get_exit_targets(entry_price: float, side: str, execution_mode: ExecutionMod
         take_profit = STRATEGY_V1_NO_TAKE_PROFIT_PRICE
         stop_loss = max(0.0, entry_price - 0.10)
     else:
-        take_profit = min(1.0, entry_price + 0.15)
+        take_profit = min(1.0, entry_price * (1.0 + STRATEGY_V1_YES_TAKE_PROFIT_PCT))
         stop_loss = max(0.01, entry_price * (1.0 - STRATEGY_V1_YES_STOP_LOSS_PCT))
     return take_profit, stop_loss
 
@@ -2505,7 +2506,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             paper_max_trades_per_run=STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN,
             max_trades_per_run=MAX_TRADES_PER_RUN,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
-            yes_take_profit_delta=0.15,
+            yes_take_profit_pct=STRATEGY_V1_YES_TAKE_PROFIT_PCT,
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
             no_take_profit_price=STRATEGY_V1_NO_TAKE_PROFIT_PRICE,
             no_stop_loss_delta=0.10,
@@ -2525,7 +2526,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
     if strategy_v1_requested:
-        log("  Exit rules:      YES +0.15 / -10%, NO @0.98 / -0.10, edge<0 exit")
+        log("  Exit rules:      YES +40% / -10%, NO @0.98 / -0.10, edge<0 exit")
     else:
         log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     if strategy_v1_requested:
