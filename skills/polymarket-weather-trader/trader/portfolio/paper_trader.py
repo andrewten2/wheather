@@ -311,7 +311,13 @@ class PaperTrader:
         signal_source: Optional[str] = None,
         market_price: Optional[float] = None,
         market_question: Optional[str] = None,
+        signal_data: Optional[dict] = None,
     ) -> ExecutionResult:
+        signal_data = signal_data or {}
+        entry_regime = signal_data.get("entry_regime")
+        entry_reason = signal_data.get("entry_reason")
+        entry_bucket_relation = signal_data.get("entry_bucket_relation")
+
         price = market_price if market_price is not None else self._get_market_price(adapter, market_id, side)
         if price is None:
             return ExecutionResult(
@@ -338,6 +344,9 @@ class PaperTrader:
             "requested_shares": shares,
             "simulated_fill_price": round(price, 6),
             "signal_source": signal_source,
+            "entry_regime": entry_regime,
+            "entry_reason": entry_reason,
+            "entry_bucket_relation": entry_bucket_relation,
             "status": "filled",
         }
         self.state["orders"].append(order_entry)
@@ -369,6 +378,9 @@ class PaperTrader:
             "last_buy_price": None,
             "opened_at": timestamp,
             "updated_at": timestamp,
+            "entry_regime": entry_regime,
+            "entry_reason": entry_reason,
+            "entry_bucket_relation": entry_bucket_relation,
             "sources": ["sdk:weather"] if signal_source else [],
         })
         position_question = (
@@ -399,6 +411,12 @@ class PaperTrader:
             position["buy_count"] = int(position.get("buy_count", 0) or 0) + 1
             position["last_buy_at"] = timestamp
             position["last_buy_price"] = price
+            if entry_regime:
+                position["entry_regime"] = entry_regime
+            if entry_reason:
+                position["entry_reason"] = entry_reason
+            if entry_bucket_relation:
+                position["entry_bucket_relation"] = entry_bucket_relation
             self.state["cash_balance"] -= cost
             self._log_event(
                 "paper_buy",
@@ -490,6 +508,9 @@ class PaperTrader:
             "filled_shares": round(filled_shares, 6),
             "simulated_fill_price": round(price, 6),
             "signal_source": signal_source,
+            "entry_regime": entry_regime or position.get("entry_regime"),
+            "entry_reason": entry_reason or position.get("entry_reason"),
+            "entry_bucket_relation": entry_bucket_relation or position.get("entry_bucket_relation"),
             "realized_pnl": round(realized_pnl, 6),
         }
         self.state["trades"].append(trade_entry)

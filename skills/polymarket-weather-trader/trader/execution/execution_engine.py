@@ -107,6 +107,7 @@ class ExecutionEngine:
                 signal_source=signal_source,
                 market_price=resolved_market_price,
                 market_question=resolved_market_question,
+                signal_data=signal_data,
             )
 
         try:

@@ -283,6 +283,9 @@ STRATEGY_V1_YES_STOP_LOSS_PCT = 0.10
 STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.40
 STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
+STRATEGY_V1_MID_YES_MIN_PRICE = 0.12
+STRATEGY_V1_MID_YES_MAX_PRICE = 0.30
+STRATEGY_V1_MID_YES_MIN_EDGE = 0.20
 STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
 STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
@@ -985,6 +988,60 @@ def select_strategy_v1_event_trade(
             "reason": "late far no" if decision["action"] == "trade" else decision["reason"],
             "threshold": STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
             "selected_edge": selected["edge_no"],
+            "candidate": selected["candidate"],
+            "probability_estimate": selected["probability_estimate"],
+            "bucket_relation": selected["bucket_relation"],
+            "entry_bucket_relation": selected.get("entry_bucket_relation"),
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        })
+        return decision
+
+    if regime_mode == "mid":
+        near_forecast_candidates = [
+            item for item in ranked_candidates
+            if item.get("entry_bucket_relation") in {"adjacent_lower", "central", "adjacent_upper"}
+        ]
+        eligible = [
+            item for item in near_forecast_candidates
+            if STRATEGY_V1_MID_YES_MIN_PRICE <= item["yes_price"] <= STRATEGY_V1_MID_YES_MAX_PRICE
+            and item["edge_yes"] >= STRATEGY_V1_MID_YES_MIN_EDGE
+        ]
+        if not eligible:
+            first = ranked_candidates[0]
+            if not near_forecast_candidates:
+                reason = "mid_bucket_not_near_forecast"
+            elif all(item["yes_price"] < STRATEGY_V1_MID_YES_MIN_PRICE for item in near_forecast_candidates):
+                reason = "mid_yes_too_cheap"
+            elif all(item["yes_price"] > STRATEGY_V1_MID_YES_MAX_PRICE for item in near_forecast_candidates):
+                reason = "mid_yes_too_expensive"
+            else:
+                reason = "mid_yes_edge_too_low"
+            return {
+                "action": "skip",
+                "reason": reason,
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": first["candidate"],
+                "probability_estimate": first["probability_estimate"],
+                "bucket_relation": first["bucket_relation"],
+                "price_yes": first["yes_price"],
+                "gaussian_probability": first["gaussian_probability"],
+                "edge_yes": first["edge_yes"],
+                "edge_no": first["edge_no"],
+                "entry_bucket_relation": first.get("entry_bucket_relation"),
+            }
+        selected = sorted(eligible, key=lambda item: (-item["edge_yes"], item["yes_price"], -item["gaussian_probability"]))[0]
+        decision = _apply_strategy_v1_rebuy_guard(
+            selected,
+            "yes",
+            execution_mode=execution_mode,
+            live_positions_by_market=live_positions_by_market,
+        )
+        decision.update({
+            "reason": "mid_strong_edge_yes" if decision["action"] == "trade" else decision["reason"],
+            "threshold": STRATEGY_V1_MID_YES_MAX_PRICE,
+            "selected_edge": selected["edge_yes"],
             "candidate": selected["candidate"],
             "probability_estimate": selected["probability_estimate"],
             "bucket_relation": selected["bucket_relation"],
@@ -2515,6 +2572,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             forecast_fresh_max_hours=STRATEGY_V1_FORECAST_FRESH_MAX_HOURS,
             early_yes_min_price=STRATEGY_V1_EARLY_YES_MIN_PRICE,
             early_yes_max_price=STRATEGY_V1_EARLY_YES_MAX_PRICE,
+            mid_yes_min_price=STRATEGY_V1_MID_YES_MIN_PRICE,
+            mid_yes_max_price=STRATEGY_V1_MID_YES_MAX_PRICE,
+            mid_yes_min_edge=STRATEGY_V1_MID_YES_MIN_EDGE,
             late_far_max_probability=STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
             late_almost_impossible_max_probability=STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY,
             no_min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
@@ -2531,8 +2591,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     if strategy_v1_requested:
         log(
-            "  Entry regimes:   early=central±1 YES, late=far NO, "
-            "mid=skip"
+            "  Entry regimes:   early=central±1 YES, mid=strong-edge YES, "
+            "late=far NO"
         )
     requested_execution_mode = (
         ExecutionMode.PAPER if paper
@@ -3049,6 +3109,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 signal.metadata["market_price_no"] = round(1.0 - price, 6)
                 signal.metadata["selected_edge"] = round(selected_edge, 6)
                 signal.metadata["gaussian_probability"] = round(model_probability, 6)
+                signal.metadata["entry_regime"] = strategy_v1_decision.get("mode") if strategy_v1_decision else None
+                signal.metadata["entry_reason"] = strategy_v1_decision.get("reason") if strategy_v1_decision else None
+                signal.metadata["entry_bucket_relation"] = (
+                    strategy_v1_decision.get("entry_bucket_relation") if strategy_v1_decision else None
+                )
                 if strategy_v1_enabled(execution_mode):
                     signal.reasoning = (
                         f"strategy_v1 {selected_side.upper()} "

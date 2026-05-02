@@ -95,6 +95,28 @@ def side_style(side):
     return "bold #66ff7a" if str(side).lower() == "yes" else "bold #ff6b4a"
 
 
+def regime_label(value):
+    value = str(value or "?").strip().lower()
+    if value == "early":
+        return "EARLY"
+    if value == "mid":
+        return "MID"
+    if value == "late":
+        return "LATE"
+    return "?"
+
+
+def regime_style(value):
+    value = str(value or "").strip().lower()
+    if value == "early":
+        return "bold #66e3ff"
+    if value == "mid":
+        return "bold #ffd166"
+    if value == "late":
+        return "bold #ff9f43"
+    return "dim white"
+
+
 def parse_dt(value):
     if not value:
         return None
@@ -246,7 +268,9 @@ def build_buy_history(trades):
             ("simulated_fill_price", "entry_price", "price", "market_price", "avg_price", "avg_cost"),
         )
         if market_key and entry is not None:
-            history.setdefault((market_key, side), []).append((parse_dt(trade.get("timestamp")), entry))
+            history.setdefault((market_key, side), []).append(
+                (parse_dt(trade.get("timestamp")), entry, trade.get("entry_regime"))
+            )
 
     for items in history.values():
         items.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=DISPLAY_TZ))
@@ -268,6 +292,26 @@ def closed_entry_price(trade, buy_history):
             return prior_buys[-1][1]
     if history:
         return history[-1][1]
+    return None
+
+
+def closed_entry_regime(trade, buy_history):
+    regime = trade.get("entry_regime")
+    if regime:
+        return regime
+
+    market_key = trade.get("market_id") or market_name(trade.get("question"))
+    side = (trade.get("side") or "?").upper()
+    sell_time = parse_dt(trade.get("timestamp"))
+    history = buy_history.get((market_key, side), [])
+    if sell_time:
+        prior_buys = [item for item in history if item[0] is None or item[0] <= sell_time]
+        for item in reversed(prior_buys):
+            if len(item) > 2 and item[2]:
+                return item[2]
+    for item in reversed(history):
+        if len(item) > 2 and item[2]:
+            return item[2]
     return None
 
 
@@ -362,6 +406,7 @@ def build_open_panel(positions, frame):
     table = Table(title="OPEN POSITIONS", expand=True, box=box.SIMPLE)
     table.add_column("", width=2)
     table.add_column("Side", width=5)
+    table.add_column("Regime", justify="center", width=6)
     table.add_column("Entry", justify="right", width=8)
     table.add_column("Current", justify="right", width=8)
     table.add_column("PnL", justify="right", width=9)
@@ -391,6 +436,7 @@ def build_open_panel(positions, frame):
         table.add_row(
             Text(dot, style=dot_style),
             Text(side, style=side_style(side)),
+            Text(regime_label(position.get("entry_regime")), style=regime_style(position.get("entry_regime"))),
             price(position.get("entry_price") or position.get("avg_cost")),
             Text(current_text, style="yellow" if is_stale else pnl_style(pnl)),
             Text(pnl_text, style="yellow" if is_stale else pnl_style(pnl)),
@@ -403,6 +449,35 @@ def build_open_panel(positions, frame):
     return Panel(table, border_style="#725cff", box=box.ROUNDED, style="on #07111a")
 
 
+def build_closed_table(rows, buy_history, title):
+    table = Table(title=title, expand=True, box=box.SIMPLE)
+    table.add_column("", width=2)
+    table.add_column("Time", width=12)
+    table.add_column("Side", width=5)
+    table.add_column("Regime", justify="center", width=6)
+    table.add_column("Entry", justify="right", width=8)
+    table.add_column("Exit", justify="right", width=8)
+    table.add_column("PnL", justify="right", width=9)
+    table.add_column("Market", overflow="fold")
+    for trade in rows:
+        pnl = to_float(trade.get("realized_pnl"))
+        entry_regime = closed_entry_regime(trade, buy_history)
+        style = pnl_style(pnl)
+        dot_style = "#66ff7a" if (pnl or 0.0) >= 0 else "#ff5c57"
+        table.add_row(
+            Text("●", style=dot_style),
+            trade_time(trade.get("timestamp")),
+            Text((trade.get("side") or "?").upper(), style=side_style(trade.get("side"))),
+            Text(regime_label(entry_regime), style=regime_style(entry_regime)),
+            price(closed_entry_price(trade, buy_history)),
+            price(trade.get("simulated_fill_price")),
+            Text(money(pnl), style=style),
+            market_name(trade.get("question") or trade.get("market_id"))[:130],
+            style=style,
+        )
+    return table
+
+
 def build_closed_panel(trades):
     sells = [trade for trade in trades if trade.get("action") == "sell"]
     sorted_sells = sorted(
@@ -411,29 +486,15 @@ def build_closed_panel(trades):
         reverse=True,
     )
     buy_history = build_buy_history(trades)
-    table = Table(title="CLOSED TRADES", expand=True, box=box.SIMPLE)
-    table.add_column("", width=2)
-    table.add_column("Time", width=12)
-    table.add_column("Side", width=5)
-    table.add_column("Entry", justify="right", width=8)
-    table.add_column("Exit", justify="right", width=8)
-    table.add_column("PnL", justify="right", width=9)
-    table.add_column("Market", overflow="fold")
-    for trade in sorted_sells[:18]:
-        pnl = to_float(trade.get("realized_pnl"))
-        style = pnl_style(pnl)
-        dot_style = "#66ff7a" if (pnl or 0.0) >= 0 else "#ff5c57"
-        table.add_row(
-            Text("●", style=dot_style),
-            trade_time(trade.get("timestamp")),
-            Text((trade.get("side") or "?").upper(), style=side_style(trade.get("side"))),
-            price(closed_entry_price(trade, buy_history)),
-            price(trade.get("simulated_fill_price")),
-            Text(money(pnl), style=style),
-            market_name(trade.get("question") or trade.get("market_id"))[:130],
-            style=style,
-        )
-    return Panel(table, title="CLOSED TRADES", border_style="#aa55ff", box=box.ROUNDED, style="on #080d18")
+    recent_sells = sorted_sells[:36]
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(
+        build_closed_table(recent_sells[:18], buy_history, "LATEST 18"),
+        build_closed_table(recent_sells[18:36], buy_history, "NEXT 18"),
+    )
+    return Panel(grid, title="CLOSED TRADES", border_style="#aa55ff", box=box.ROUNDED, style="on #080d18")
 
 
 def build(frame=0):
