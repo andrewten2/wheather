@@ -88,7 +88,7 @@ def pnl_style(value):
         return "bold #66ff7a"
     if value < 0:
         return "bold #ff5c57"
-    return "dim white"
+    return "white"
 
 
 def side_style(side):
@@ -377,7 +377,7 @@ def build_open_panel(positions, frame):
             -(abs(position_pnl(position)[0] or 0.0)),
         ),
     )
-    for position in sorted_positions[:16]:
+    for position in sorted_positions[:24]:
         pnl, pnl_pct = position_pnl(position)
         side = (position.get("side") or "?").upper()
         current = to_float(position.get("current_price"))
@@ -414,7 +414,7 @@ def build_closed_panel(trades):
     table.add_column("Exit", justify="right", width=8)
     table.add_column("PnL", justify="right", width=9)
     table.add_column("Market", overflow="fold")
-    for trade in sells[-8:]:
+    for trade in sells[-18:]:
         pnl = to_float(trade.get("realized_pnl"))
         style = pnl_style(pnl)
         dot_style = "#66ff7a" if (pnl or 0.0) >= 0 else "#ff5c57"
@@ -440,15 +440,13 @@ def build(frame=0):
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=4),
-        Layout(name="main", ratio=5),
-        Layout(name="closed", ratio=2),
+        Layout(name="main", ratio=4),
+        Layout(name="closed", ratio=3),
     )
     layout["main"].split_row(Layout(name="left", ratio=1), Layout(name="open", ratio=4))
-    layout["left"].split_column(Layout(name="stats", ratio=3), Layout(name="curve", ratio=2))
 
     layout["header"].update(build_header(summary, frame))
-    layout["stats"].update(build_stats_panel(positions, trades, summary))
-    layout["curve"].update(build_curve_panel(trades))
+    layout["left"].update(build_stats_panel(positions, trades, summary))
     layout["open"].update(build_open_panel(positions, frame))
     layout["closed"].update(build_closed_panel(trades))
     return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")

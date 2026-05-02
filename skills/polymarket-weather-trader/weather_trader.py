@@ -278,7 +278,7 @@ STRATEGY_V1_MIN_PRICE = 0.02
 STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
-STRATEGY_V1_YES_STOP_LOSS_PCT = 0.20
+STRATEGY_V1_YES_STOP_LOSS_PCT = 0.10
 STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.40
 STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
@@ -670,7 +670,83 @@ def maybe_rotate_position_on_forecast_drift(
     return bool(result.get("success"))
 
 
-def _apply_strategy_v1_rebuy_guard(entry: dict, selected_side: str) -> dict:
+def strategy_v1_enabled(execution_mode: ExecutionMode) -> bool:
+    return execution_mode in {ExecutionMode.PAPER, ExecutionMode.LIVE_ENABLED}
+
+
+def _position_total_shares(pos: Position) -> float:
+    return float(pos.shares_yes or 0.0) + float(pos.shares_no or 0.0)
+
+
+def build_live_strategy_position_map(positions: list[Position]) -> dict:
+    return {
+        pos.market_id: pos
+        for pos in positions or []
+        if pos.market_id and _position_total_shares(pos) > 0
+    }
+
+
+def _apply_strategy_v1_rebuy_guard(
+    entry: dict,
+    selected_side: str,
+    execution_mode: ExecutionMode,
+    live_positions_by_market: dict = None,
+) -> dict:
+    if execution_mode != ExecutionMode.PAPER:
+        market_id = entry["candidate"].market_id
+        live_positions_by_market = live_positions_by_market or {}
+        live_position = live_positions_by_market.get(market_id)
+        current_side_price = entry["no_price"] if selected_side == "no" else entry["yes_price"]
+        if live_position is not None and _position_total_shares(live_position) > 0:
+            return {
+                "action": "skip",
+                "reason": "already_have_position",
+                "selected_side": selected_side,
+                "price_yes": entry["yes_price"],
+                "gaussian_probability": entry["gaussian_probability"],
+                "edge_yes": entry["edge_yes"],
+                "edge_no": entry["edge_no"],
+                "open_position_exists": True,
+                "historical_trade_exists": None,
+                "buy_count": None,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "position_cost_usd": live_position.current_value,
+                "current_side_price": current_side_price,
+            }
+        if len(live_positions_by_market) >= MAX_TOTAL_POSITIONS:
+            return {
+                "action": "skip",
+                "reason": "max_positions_reached",
+                "selected_side": selected_side,
+                "price_yes": entry["yes_price"],
+                "gaussian_probability": entry["gaussian_probability"],
+                "edge_yes": entry["edge_yes"],
+                "edge_no": entry["edge_no"],
+                "open_position_exists": False,
+                "historical_trade_exists": None,
+                "buy_count": None,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "position_cost_usd": None,
+                "current_side_price": current_side_price,
+            }
+        return {
+            "action": "trade",
+            "selected_side": selected_side,
+            "price_yes": entry["yes_price"],
+            "gaussian_probability": entry["gaussian_probability"],
+            "edge_yes": entry["edge_yes"],
+            "edge_no": entry["edge_no"],
+            "open_position_exists": False,
+            "historical_trade_exists": None,
+            "buy_count": None,
+            "last_buy_at": None,
+            "last_buy_price": None,
+            "position_cost_usd": None,
+            "current_side_price": current_side_price,
+        }
+
     paper_trader = get_paper_trader()
     current_side_price = entry["no_price"] if selected_side == "no" else entry["yes_price"]
     rebuy_context = get_strategy_v1_rebuy_context(
@@ -723,8 +799,9 @@ def select_strategy_v1_event_trade(
     metric: str,
     execution_mode: ExecutionMode,
     ranked_candidates: list = None,
+    live_positions_by_market: dict = None,
 ):
-    if execution_mode != ExecutionMode.PAPER:
+    if not strategy_v1_enabled(execution_mode):
         return None
 
     regime_mode = classify_market_regime(forecast)
@@ -825,7 +902,12 @@ def select_strategy_v1_event_trade(
                 "edge_no": selected["edge_no"],
                 "entry_bucket_relation": selected.get("entry_bucket_relation"),
             }
-        decision = _apply_strategy_v1_rebuy_guard(selected, "yes")
+        decision = _apply_strategy_v1_rebuy_guard(
+            selected,
+            "yes",
+            execution_mode=execution_mode,
+            live_positions_by_market=live_positions_by_market,
+        )
         decision.update({
             "reason": (
                 "early_adjacent_yes"
@@ -892,7 +974,12 @@ def select_strategy_v1_event_trade(
                 "entry_bucket_relation": first.get("entry_bucket_relation"),
             }
         selected = sorted(eligible, key=lambda item: (item["gaussian_probability"], -item["edge_no"]))[0]
-        decision = _apply_strategy_v1_rebuy_guard(selected, "no")
+        decision = _apply_strategy_v1_rebuy_guard(
+            selected,
+            "no",
+            execution_mode=execution_mode,
+            live_positions_by_market=live_positions_by_market,
+        )
         decision.update({
             "reason": "late far no" if decision["action"] == "trade" else decision["reason"],
             "threshold": STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
@@ -1233,6 +1320,7 @@ MIN_TICK_SIZE = 0.01        # Minimum tradeable price
 ENTRY_THRESHOLD = _config["entry_threshold"]
 EXIT_THRESHOLD = _config["exit_threshold"]
 MAX_POSITION_USD = _config["max_position_usd"]
+LIVE_MAX_POSITION_USD = float(os.environ.get("WEATHER_BOT_LIVE_MAX_POSITION_USD", "2.00"))
 _automaton_max = os.environ.get("AUTOMATON_MAX_BET")
 if _automaton_max:
     MAX_POSITION_USD = min(MAX_POSITION_USD, float(_automaton_max))
@@ -1700,6 +1788,12 @@ def calculate_position_size(default_size: float, smart_sizing: bool) -> float:
     return smart_size
 
 
+def get_max_position_usd_for_mode(execution_mode: ExecutionMode) -> float:
+    if execution_mode == ExecutionMode.LIVE_ENABLED:
+        return LIVE_MAX_POSITION_USD
+    return MAX_POSITION_USD
+
+
 def get_position_side(pos) -> str:
     if (pos.shares_no or 0) > 0:
         return "no"
@@ -1722,10 +1816,7 @@ def get_exit_targets(entry_price: float, side: str, execution_mode: ExecutionMod
         stop_loss = max(0.0, entry_price - 0.10)
     else:
         take_profit = min(1.0, entry_price + 0.15)
-        if execution_mode == ExecutionMode.PAPER:
-            stop_loss = max(0.01, entry_price * (1.0 - STRATEGY_V1_YES_STOP_LOSS_PCT))
-        else:
-            stop_loss = max(0.0, entry_price - 0.08)
+        stop_loss = max(0.01, entry_price * (1.0 - STRATEGY_V1_YES_STOP_LOSS_PCT))
     return take_profit, stop_loss
 
 
@@ -2046,8 +2137,8 @@ def check_exit_opportunities(
 
     for pos in weather_positions:
         market_id = pos.market_id
-        position_side = get_position_side(pos) if execution_mode == ExecutionMode.PAPER else "yes"
-        shares = (pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and position_side == "no") else (pos.shares_yes or 0)
+        position_side = get_position_side(pos)
+        shares = (pos.shares_no or 0) if position_side == "no" else (pos.shares_yes or 0)
         entry_price = get_position_entry_price(pos, execution_mode)
         question = pos.question[:50] if pos.question else "Unknown"
         position_age_hours = None
@@ -2111,6 +2202,22 @@ def check_exit_opportunities(
             context = get_market_context(market_id)
             if context and context.get("market"):
                 price_snapshot = build_market_price_snapshot(context["market"])
+                if price_snapshot:
+                    yes_price = price_snapshot.get("yes_price")
+                    no_price = price_snapshot.get("no_price")
+                    direct_exit_price = no_price if position_side == "no" else yes_price
+                    if direct_exit_price is not None:
+                        chosen_exit_price = direct_exit_price
+            if logger is not None:
+                logger.event(
+                    "exit_price_check",
+                    market_id=market_id,
+                    outcome_name=stored_question,
+                    side=position_side,
+                    yes_price=round(yes_price, 6) if yes_price is not None else None,
+                    no_price=round(no_price, 6) if no_price is not None else None,
+                    chosen_exit_price=round(chosen_exit_price, 6) if chosen_exit_price is not None else None,
+                )
         current_price = chosen_exit_price
 
         if execution_mode == ExecutionMode.PAPER and (
@@ -2261,7 +2368,7 @@ def check_exit_opportunities(
             )
 
             # Check safeguards before selling
-            if use_safeguards and exit_reason != "market_settlement":
+            if use_safeguards and execution_mode != ExecutionMode.PAPER and exit_reason != "market_settlement":
                 context = get_market_context(market_id)
                 should_trade, reasons = check_context_safeguards(context)
                 if not should_trade:
@@ -2278,8 +2385,8 @@ def check_exit_opportunities(
             )
             fresh_pos = find_position(fresh_positions, market_id)
             if fresh_pos:
-                fresh_side = get_position_side(fresh_pos) if execution_mode == ExecutionMode.PAPER else "yes"
-                fresh_shares = (fresh_pos.shares_no or 0) if (execution_mode == ExecutionMode.PAPER and fresh_side == "no") else (fresh_pos.shares_yes or 0)
+                fresh_side = get_position_side(fresh_pos)
+                fresh_shares = (fresh_pos.shares_no or 0) if fresh_side == "no" else (fresh_pos.shares_yes or 0)
                 if execution_mode != ExecutionMode.PAPER and fresh_shares < MIN_SHARES_PER_ORDER:
                     print(f"     ⏭️  Skipped: fresh share count {fresh_shares:.1f} below minimum")
                     continue
@@ -2360,7 +2467,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     forecast_provider = get_forecast_provider()
     forecast_provider.logger = logger
     probability_model = get_probability_model()
-    strategy_v1_probability_model = get_strategy_v1_probability_model() if paper else None
+    strategy_v1_requested = paper or not dry_run
+    strategy_v1_probability_model = get_strategy_v1_probability_model() if strategy_v1_requested else None
     dataset_recorder = get_dataset_recorder(output_path=dataset_output, logger=logger) if record_dataset else None
 
     def log(msg, force=False):
@@ -2370,12 +2478,16 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log("🌤️  Simmer Weather Trading Skill")
     log("=" * 50)
 
-    if paper:
-        log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
+    if strategy_v1_requested:
+        mode_label = "paper_only" if paper else "live_enabled"
+        if paper:
+            log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
+        else:
+            log("\n  [LIVE MODE] strategy_v1 enabled. Real orders can be sent.")
         logger.event(
             "strategy_v1_mode_enabled",
             strategy="strategy_v1",
-            mode="paper_only",
+            mode=mode_label,
             strategy_style="forecast_first",
             allowed_cities="all_active_locations",
             loop_interval_seconds=WEATHER_BOT_LOOP_SECONDS,
@@ -2391,6 +2503,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             cooldown_between_buys_minutes=STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES,
             rebuy_price_improvement_factor=STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR,
             paper_max_trades_per_run=STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN,
+            max_trades_per_run=MAX_TRADES_PER_RUN,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
             yes_take_profit_delta=0.15,
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
@@ -2411,16 +2524,22 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
-    if paper:
-        log("  Exit rules:      YES +0.15 / -20%, NO +0.12 / -0.10, edge<0 exit")
+    if strategy_v1_requested:
+        log("  Exit rules:      YES +0.15 / -10%, NO @0.98 / -0.10, edge<0 exit")
     else:
         log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
-    if paper:
+    if strategy_v1_requested:
         log(
             "  Entry regimes:   early=central±1 YES, late=far NO, "
             "mid=skip"
         )
-    log(f"  Max position:    ${MAX_POSITION_USD:.2f}")
+    requested_execution_mode = (
+        ExecutionMode.PAPER if paper
+        else ExecutionMode.LIVE_ENABLED if not dry_run
+        else ExecutionMode.DRY_RUN
+    )
+    effective_max_position_usd = get_max_position_usd_for_mode(requested_execution_mode)
+    log(f"  Max position:    ${effective_max_position_usd:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")
     log(f"  Loop interval:   {WEATHER_BOT_LOOP_SECONDS}s")
@@ -2508,6 +2627,15 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     events = group_markets_by_event(markets, LOCATION_ALIASES, min_date=date.today())
 
     log(f"  Grouped into {len(events)} events")
+
+    live_strategy_positions_by_market = {}
+    if execution_mode == ExecutionMode.LIVE_ENABLED:
+        live_strategy_positions_by_market = build_live_strategy_position_map(
+            filter_weather_positions(
+                load_positions(adapter, execution_mode=execution_mode),
+                TRADE_SOURCE,
+            )
+        )
 
     trades_executed = 0
     total_usd_spent = 0.0
@@ -2604,7 +2732,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         candidate = None
         probability_estimate = None
         strategy_ranked_candidates = None
-        if execution_mode == ExecutionMode.PAPER:
+        if strategy_v1_enabled(execution_mode):
             strategy_ranked_candidates = build_strategy_v1_event_candidates(
                 event_markets=event_markets,
                 forecast=forecast,
@@ -2623,6 +2751,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 metric=metric,
                 execution_mode=execution_mode,
                 ranked_candidates=strategy_ranked_candidates,
+                live_positions_by_market=live_strategy_positions_by_market,
             )
             drift_rotation_allowed = maybe_rotate_position_on_forecast_drift(
                 event_id=event_id,
@@ -2645,6 +2774,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 metric=metric,
                 execution_mode=execution_mode,
                 ranked_candidates=strategy_ranked_candidates,
+                live_positions_by_market=live_strategy_positions_by_market,
             )
             candidate = strategy_v1_decision.get("candidate") if strategy_v1_decision else None
             probability_estimate = strategy_v1_decision.get("probability_estimate") if strategy_v1_decision else None
@@ -2697,7 +2827,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     else ""
                 )
                 + ")"
-                if execution_mode == ExecutionMode.PAPER and strategy_v1_decision
+                if strategy_v1_enabled(execution_mode) and strategy_v1_decision
                 else ""
             )
         )
@@ -2718,7 +2848,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             f"sigma={probability_estimate.metadata.get('sigma_used')}, "
             f"p={model_probability:.0%}, market={price:.0%}, edge={probability_estimate.edge:.1%}"
         )
-        preliminary_strategy_v1_decision = strategy_v1_decision if execution_mode == ExecutionMode.PAPER else None
+        preliminary_strategy_v1_decision = strategy_v1_decision if strategy_v1_enabled(execution_mode) else None
         if use_safeguards:
             context = get_market_context(market_id, my_probability=model_probability)
             if not context and execution_mode == ExecutionMode.LIVE_ENABLED:
@@ -2781,7 +2911,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 trend_bonus = f" 📈 (up {trend['change_24h']:.0%} in 24h)"
 
         strategy_v1_decision = None
-        if execution_mode == ExecutionMode.PAPER:
+        if strategy_v1_enabled(execution_mode):
             strategy_v1_decision = preliminary_strategy_v1_decision or select_strategy_v1_event_trade(
                 event_markets=event_markets,
                 forecast=forecast,
@@ -2790,6 +2920,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 date_str=date_str,
                 metric=metric,
                 execution_mode=execution_mode,
+                live_positions_by_market=live_strategy_positions_by_market,
             )
             log_strategy_v1_decision(
                 logger=logger,
@@ -2816,7 +2947,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         selected_edge = probability_estimate.edge
         signal_source = "noaa_forecast"
         source_label_for_signal = "NOAA"
-        if execution_mode == ExecutionMode.PAPER:
+        if strategy_v1_enabled(execution_mode):
             should_trade = strategy_v1_decision is not None and strategy_v1_decision.get("action") == "trade"
             if should_trade:
                 selected_side = strategy_v1_decision["selected_side"]
@@ -2828,7 +2959,10 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             should_trade = price < ENTRY_THRESHOLD
 
         if should_trade:
-            position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
+            max_position_usd = get_max_position_usd_for_mode(execution_mode)
+            position_size = calculate_position_size(max_position_usd, smart_sizing)
+            if execution_mode == ExecutionMode.LIVE_ENABLED:
+                position_size = min(position_size, LIVE_MAX_POSITION_USD)
 
             # Apply volatility targeting
             vol_meta = None
@@ -2852,7 +2986,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 continue
 
             opportunities_found += 1
-            if execution_mode == ExecutionMode.PAPER:
+            if strategy_v1_enabled(execution_mode):
                 log(
                     f"  ✅ strategy_v1 {selected_side.upper()} opportunity "
                     f"(edge_yes={strategy_v1_decision['edge_yes']:.1%}, edge_no={strategy_v1_decision['edge_no']:.1%})!{trend_bonus}"
@@ -2904,7 +3038,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 signal.metadata["trade_side"] = selected_side
                 signal.metadata["edge_yes"] = round(strategy_v1_decision["edge_yes"], 6) if strategy_v1_decision else None
                 signal.metadata["edge_no"] = round(strategy_v1_decision["edge_no"], 6) if strategy_v1_decision else None
-                signal.metadata["strategy"] = "strategy_v1" if execution_mode == ExecutionMode.PAPER else "legacy_threshold"
+                signal.metadata["strategy"] = "strategy_v1" if strategy_v1_enabled(execution_mode) else "legacy_threshold"
                 signal.metadata["bucket_type"] = getattr(candidate.bucket, "bucket_type", None)
                 signal.metadata["city"] = candidate.location
                 signal.metadata["question"] = candidate.market.question
@@ -2914,7 +3048,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 signal.metadata["market_price_no"] = round(1.0 - price, 6)
                 signal.metadata["selected_edge"] = round(selected_edge, 6)
                 signal.metadata["gaussian_probability"] = round(model_probability, 6)
-                if execution_mode == ExecutionMode.PAPER:
+                if strategy_v1_enabled(execution_mode):
                     signal.reasoning = (
                         f"strategy_v1 {selected_side.upper()} "
                         f"{candidate.location} {outcome_name} at YES ${price:.2f} "
@@ -2948,6 +3082,19 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     f"{shares:.1f} shares @ ${price:.2f}",
                     force=True,
                 )
+                if execution_mode == ExecutionMode.LIVE_ENABLED:
+                    live_strategy_positions_by_market[market_id] = Position(
+                        market_id=market_id,
+                        question=candidate.market.question,
+                        venue="polymarket",
+                        shares_yes=result.get("shares_bought") if selected_side == "yes" else 0,
+                        shares_no=result.get("shares_bought") if selected_side == "no" else 0,
+                        avg_cost=price if selected_side == "yes" else 1.0 - price,
+                        current_price=price if selected_side == "yes" else 1.0 - price,
+                        current_value=position_size,
+                        sources=[TRADE_SOURCE],
+                        opened_by_weather_strategy=True,
+                    )
 
                 # Log trade context for journal (skip for paper trades)
                 if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
@@ -2973,7 +3120,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 log(f"  ❌ Trade failed: {error}", force=True)
                 execution_errors.append(error[:120])
         else:
-            if execution_mode == ExecutionMode.PAPER and strategy_v1_decision:
+            if strategy_v1_enabled(execution_mode) and strategy_v1_decision:
                 log(f"  ⏸️  strategy_v1 skip: {strategy_v1_decision['reason']}")
             else:
                 log(f"  ⏸️  Price ${price:.2f} above threshold ${ENTRY_THRESHOLD:.2f} - skip")
@@ -3059,6 +3206,24 @@ def run_paper_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = Tru
     )
 
 
+def run_live_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True, quiet: bool = False):
+    """Run a lightweight LIVE exit pass without scanning for new entries."""
+    logger = StructuredLogger(quiet=quiet)
+    execution_engine = get_execution_engine(live=True, logger=logger)
+    execution_mode = execution_engine.get_mode()
+    if execution_mode != ExecutionMode.LIVE_ENABLED:
+        logger.log(f"  ⏭️  Live exit check skipped: execution mode is {execution_mode.value}")
+        return
+    live_positions = load_positions(get_adapter(), execution_mode=execution_mode)
+    check_exit_opportunities(
+        dry_run=dry_run,
+        use_safeguards=use_safeguards,
+        execution_mode=execution_mode,
+        logger=logger,
+        positions_override=live_positions,
+    )
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -3066,6 +3231,7 @@ def run_paper_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = Tru
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simmer Weather Trading Skill")
     parser.add_argument("--live", action="store_true", help="Execute real trades (default is dry-run)")
+    parser.add_argument("--live-loop", action="store_true", help="Run --live continuously with fast exit checks")
     parser.add_argument("--dry-run", action="store_true", help="(Default) Show opportunities without trading")
     parser.add_argument("--paper", action="store_true", help="Simulate trades and persist paper positions/PnL locally")
     parser.add_argument("--backtest-file", help="Run a deterministic backtest from a local JSON dataset")
@@ -3144,6 +3310,9 @@ if __name__ == "__main__":
 
     # Default to dry-run unless --live is explicitly passed
     dry_run = not args.live and not args.paper
+    if args.live_loop and not args.live:
+        print("Error: --live-loop requires --live")
+        sys.exit(1)
 
     run_kwargs = {
         "dry_run": dry_run,
@@ -3169,6 +3338,20 @@ if __name__ == "__main__":
                 remaining_sleep -= sleep_for
                 if remaining_sleep > 0:
                     run_paper_exit_check_cycle(
+                        dry_run=run_kwargs["dry_run"],
+                        use_safeguards=run_kwargs["use_safeguards"],
+                        quiet=run_kwargs["quiet"],
+                    )
+    elif args.live and args.live_loop and not args.positions and not args.config:
+        while True:
+            run_weather_strategy(**run_kwargs)
+            remaining_sleep = WEATHER_BOT_LOOP_SECONDS
+            while remaining_sleep > 0:
+                sleep_for = min(WEATHER_BOT_EXIT_CHECK_SECONDS, remaining_sleep)
+                time.sleep(sleep_for)
+                remaining_sleep -= sleep_for
+                if remaining_sleep > 0:
+                    run_live_exit_check_cycle(
                         dry_run=run_kwargs["dry_run"],
                         use_safeguards=run_kwargs["use_safeguards"],
                         quiet=run_kwargs["quiet"],
