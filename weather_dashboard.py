@@ -1,7 +1,11 @@
 import json
 import os
 import re
+import select
+import sys
+import termios
 import time
+import tty
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,6 +26,7 @@ STATE = Path(
     )
 )
 REFRESH_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_REFRESH_SECONDS", "30"))
+CLOSED_ROWS_PER_COLUMN = int(os.environ.get("WEATHER_DASHBOARD_CLOSED_ROWS_PER_COLUMN", "20"))
 
 console = Console()
 DISPLAY_TZ = timezone(timedelta(hours=3))
@@ -41,6 +46,70 @@ STAT_ICONS = {
     "Exposure": "◈",
     "Realized": "▤",
     "Unrealized": "◉",
+}
+
+VIEW_ORDER = ("old", "new", "all")
+VIEW_LABELS = {
+    "old": "OLD CITIES",
+    "new": "NEW CITIES",
+    "all": "ALL CITIES",
+}
+
+OLD_CITY_ALIASES = {
+    "NYC": ("new york city", "new york", "nyc"),
+    "Chicago": ("chicago",),
+    "Seattle": ("seattle",),
+    "Atlanta": ("atlanta",),
+    "Dallas": ("dallas",),
+    "Miami": ("miami",),
+    "Tel Aviv": ("tel aviv",),
+    "Munich": ("munich",),
+    "London": ("london",),
+    "Tokyo": ("tokyo",),
+    "Seoul": ("seoul",),
+    "Ankara": ("ankara",),
+    "Lucknow": ("lucknow",),
+    "Wellington": ("wellington",),
+}
+
+NEW_CITY_ALIASES = {
+    "Amsterdam": ("amsterdam",),
+    "Austin": ("austin",),
+    "Beijing": ("beijing",),
+    "Buenos Aires": ("buenos aires",),
+    "Busan": ("busan",),
+    "Cape Town": ("cape town",),
+    "Chengdu": ("chengdu",),
+    "Chongqing": ("chongqing",),
+    "Denver": ("denver",),
+    "Guangzhou": ("guangzhou",),
+    "Helsinki": ("helsinki",),
+    "Hong Kong": ("hong kong",),
+    "Houston": ("houston",),
+    "Istanbul": ("istanbul",),
+    "Jakarta": ("jakarta",),
+    "Jeddah": ("jeddah",),
+    "Karachi": ("karachi",),
+    "Kuala Lumpur": ("kuala lumpur",),
+    "Lagos": ("lagos",),
+    "Los Angeles": ("los angeles",),
+    "Madrid": ("madrid",),
+    "Manila": ("manila",),
+    "Mexico City": ("mexico city",),
+    "Milan": ("milan",),
+    "Moscow": ("moscow",),
+    "Panama City": ("panama city",),
+    "Paris": ("paris",),
+    "Qingdao": ("qingdao",),
+    "San Francisco": ("san francisco",),
+    "Sao Paulo": ("sao paulo", "são paulo"),
+    "Shanghai": ("shanghai",),
+    "Shenzhen": ("shenzhen",),
+    "Singapore": ("singapore",),
+    "Taipei": ("taipei",),
+    "Toronto": ("toronto",),
+    "Warsaw": ("warsaw",),
+    "Wuhan": ("wuhan",),
 }
 
 
@@ -248,6 +317,43 @@ def market_name(question):
     return re.sub(r"\s+", " ", question).strip()
 
 
+def _contains_city_alias(text, alias):
+    return re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", text) is not None
+
+
+def city_group_for_question(question):
+    text = market_name(question).lower()
+    for aliases in OLD_CITY_ALIASES.values():
+        if any(_contains_city_alias(text, alias) for alias in aliases):
+            return "old"
+    for aliases in NEW_CITY_ALIASES.values():
+        if any(_contains_city_alias(text, alias) for alias in aliases):
+            return "new"
+    return "unknown"
+
+
+def item_city_group(item):
+    return city_group_for_question(item.get("question") or item.get("market_id") or "")
+
+
+def filter_by_view(items, view):
+    items = vals(items)
+    if view == "all":
+        return items
+    return [item for item in items if item_city_group(item) == view]
+
+
+def build_view_tabs(active_view):
+    text = Text()
+    for key, view in zip(("1", "2", "3"), VIEW_ORDER):
+        selected = view == active_view
+        label = f" {key} {VIEW_LABELS[view]} "
+        text.append(label, style=("black on #66ff7a" if selected else "bold #66e3ff"))
+        text.append(" ")
+    text.append(" q EXIT ", style="dim white")
+    return text
+
+
 def trade_price(trade, fields):
     for field in fields:
         value = to_float(trade.get(field))
@@ -340,7 +446,7 @@ def summarize(positions, trades):
     }
 
 
-def build_header(summary, frame):
+def build_header(summary, frame, active_view):
     now = datetime.now(DISPLAY_TZ).strftime(f"%H:%M:%S {DISPLAY_TZ_LABEL}")
     pulse = "●" if frame % 2 == 0 else "•"
     heartbeat = sparkline(closed_pnl_values(load_state().get("trades") or []), width=22)
@@ -353,7 +459,13 @@ def build_header(summary, frame):
     grid.add_column(ratio=2)
     grid.add_column(ratio=1)
     grid.add_row(
-        Text.assemble(("☈ ", "bold #33ccff"), ("WEATHER BOT TERMINAL ", "bold #66ff7a"), (pulse, "bold #66ff7a"), (" LIVE", "bold white")),
+        Text.assemble(
+            ("☈ ", "bold #33ccff"),
+            ("WEATHER BOT TERMINAL ", "bold #66ff7a"),
+            (pulse, "bold #66ff7a"),
+            (" LIVE  ", "bold white"),
+            (VIEW_LABELS.get(active_view, "ALL CITIES"), "bold #ffd166"),
+        ),
         metric_block("TotalPnL", money(summary["total"]), pnl_style(summary["total"])),
         metric_block("Realized", money(summary["realized"]), pnl_style(summary["realized"])),
         metric_block("Unrealized", money(summary["unrealized"]), pnl_style(summary["unrealized"])),
@@ -361,7 +473,7 @@ def build_header(summary, frame):
         Text(heartbeat, style="#66ff7a"),
         Text(now, style="bold white"),
     )
-    return Panel(grid, border_style="#2277aa", box=box.ROUNDED, style="on #061019")
+    return Panel(Group(grid, build_view_tabs(active_view)), border_style="#2277aa", box=box.ROUNDED, style="on #061019")
 
 
 def stats_row(label, value, style="bold white"):
@@ -486,41 +598,89 @@ def build_closed_panel(trades):
         reverse=True,
     )
     buy_history = build_buy_history(trades)
-    recent_sells = sorted_sells[:36]
+    recent_sells = sorted_sells[: CLOSED_ROWS_PER_COLUMN * 2]
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
     grid.add_row(
-        build_closed_table(recent_sells[:18], buy_history, "LATEST 18"),
-        build_closed_table(recent_sells[18:36], buy_history, "NEXT 18"),
+        build_closed_table(recent_sells[:CLOSED_ROWS_PER_COLUMN], buy_history, f"LATEST {CLOSED_ROWS_PER_COLUMN}"),
+        build_closed_table(recent_sells[CLOSED_ROWS_PER_COLUMN:CLOSED_ROWS_PER_COLUMN * 2], buy_history, f"NEXT {CLOSED_ROWS_PER_COLUMN}"),
     )
     return Panel(grid, title="CLOSED TRADES", border_style="#aa55ff", box=box.ROUNDED, style="on #080d18")
 
 
-def build(frame=0):
+def build(frame=0, active_view="old"):
     state = load_state()
-    positions = vals(state.get("positions"))
-    trades = state.get("trades") or []
+    positions = filter_by_view(state.get("positions"), active_view)
+    trades = filter_by_view(state.get("trades") or [], active_view)
     summary = summarize(positions, trades)
 
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=4),
-        Layout(name="main", ratio=4),
-        Layout(name="closed", ratio=3),
+        Layout(name="header", size=5),
+        Layout(name="main", ratio=2),
+        Layout(name="closed", ratio=6),
     )
     layout["main"].split_row(Layout(name="left", ratio=1), Layout(name="open", ratio=4))
 
-    layout["header"].update(build_header(summary, frame))
+    layout["header"].update(build_header(summary, frame, active_view))
     layout["left"].update(build_stats_panel(positions, trades, summary))
     layout["open"].update(build_open_panel(positions, frame))
     layout["closed"].update(build_closed_panel(trades))
     return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
 
 
-with Live(build(), refresh_per_second=2, screen=True) as live:
+def apply_key(key, active_view):
+    if key == "1":
+        return "old", False
+    if key == "2":
+        return "new", False
+    if key == "3":
+        return "all", False
+    if key and key.lower() == "q":
+        return active_view, True
+    return active_view, False
+
+
+def read_key(timeout):
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return ""
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        return ""
+    return sys.stdin.read(1)
+
+
+def run():
     frame = 0
-    while True:
-        live.update(build(frame))
-        frame += 1
-        time.sleep(max(1, REFRESH_SECONDS))
+    active_view = os.environ.get("WEATHER_DASHBOARD_VIEW", "old").lower()
+    if active_view not in VIEW_ORDER:
+        active_view = "old"
+
+    old_tty = None
+    if sys.stdin.isatty():
+        old_tty = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+    try:
+        with Live(build(active_view=active_view), refresh_per_second=2, screen=True) as live:
+            while True:
+                live.update(build(frame, active_view=active_view))
+                frame += 1
+
+                deadline = time.time() + max(1, REFRESH_SECONDS)
+                while time.time() < deadline:
+                    key = read_key(min(0.25, max(0.0, deadline - time.time())))
+                    active_view, should_quit = apply_key(key, active_view)
+                    if should_quit:
+                        return
+                    if key:
+                        live.update(build(frame, active_view=active_view))
+    finally:
+        if old_tty is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+
+
+if __name__ == "__main__":
+    run()
