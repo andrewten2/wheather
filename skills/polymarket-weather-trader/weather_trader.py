@@ -420,6 +420,8 @@ def log_strategy_v1_decision(
     bucket_type = getattr(candidate.bucket, "bucket_type", None) if candidate and candidate.bucket else None
     logger.event(
         "strategy_v1_trade_decision",
+        strategy_id=ACTIVE_STRATEGY_ID,
+        strategy_label=get_active_strategy_config().get("label"),
         action=action,
         reason=reason,
         selected_side=selected_side,
@@ -2798,7 +2800,7 @@ def check_exit_opportunities(
                     shares = fresh_shares
                 position_side = fresh_side
 
-            tag = "SIMULATED" if dry_run else "LIVE"
+            tag = "PAPER" if execution_mode == ExecutionMode.PAPER else ("SIMULATED" if dry_run else "LIVE")
             side_label = position_side.upper()
             print(f"     Selling {side_label} {shares:.1f} shares ({tag})...")
             result = execute_sell(
@@ -3631,6 +3633,17 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     if (dry_run or paper) and show_summary:
         print("\n  [PAPER MODE - trades simulated with real prices]")
 
+    if strategy_v1_requested:
+        logger.event(
+            "strategy_v1_cycle_completed",
+            strategy_id=ACTIVE_STRATEGY_ID,
+            strategy_label=get_active_strategy_config().get("label"),
+            events_scanned=len(events),
+            entry_opportunities=opportunities_found,
+            exit_opportunities=exits_found,
+            trades_executed=total_trades,
+        )
+
 
 def run_paper_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True, quiet: bool = False):
     """Run a lightweight PAPER-only exit pass without scanning for new entries."""
@@ -3691,6 +3704,7 @@ def run_strategy_suite(args):
             dataset_output=args.dataset_output,
             skip_discovery=index > 0,
         )
+        print(f"✅ Strategy suite completed: {strategy_id}")
 
 
 def run_strategy_suite_exit_check_cycle(args):
