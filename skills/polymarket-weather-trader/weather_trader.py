@@ -1992,9 +1992,20 @@ def fetch_weather_markets(search_queries=None):
         return []
 
 
-def execute_trade(market_id: str, side: str, amount: float, reasoning: str = None, signal_data: dict = None) -> dict:
+def execute_trade(
+    market_id: str,
+    side: str,
+    amount: float,
+    reasoning: str = None,
+    signal_data: dict = None,
+    execution_mode: ExecutionMode = None,
+) -> dict:
     """Execute a buy trade via execution layer with source tagging."""
-    result = get_execution_engine().buy(
+    forced_mode = ExecutionMode.PAPER if execution_mode == ExecutionMode.PAPER else None
+    result = get_execution_engine(
+        live=(execution_mode in {ExecutionMode.PAPER, ExecutionMode.LIVE_ENABLED}) if execution_mode else True,
+        forced_mode=forced_mode,
+    ).buy(
         market_id=market_id,
         side=side,
         amount=amount,
@@ -2024,9 +2035,14 @@ def execute_sell(
     market_price: float = None,
     market_question: str = None,
     signal_data: dict = None,
+    execution_mode: ExecutionMode = None,
 ) -> dict:
     """Execute a sell trade via execution layer with source tagging."""
-    result = get_execution_engine().sell(
+    forced_mode = ExecutionMode.PAPER if execution_mode == ExecutionMode.PAPER else None
+    result = get_execution_engine(
+        live=(execution_mode in {ExecutionMode.PAPER, ExecutionMode.LIVE_ENABLED}) if execution_mode else True,
+        forced_mode=forced_mode,
+    ).sell(
         market_id=market_id,
         side=side,
         shares=shares,
@@ -2810,6 +2826,7 @@ def check_exit_opportunities(
                 market_price=current_price,
                 market_question=stored_question,
                 signal_data={"exit_reason": exit_reason, "strategy_id": ACTIVE_STRATEGY_ID},
+                execution_mode=execution_mode,
             )
 
             if result.get("success"):
@@ -3517,6 +3534,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 market_id, selected_side, position_size,
                 reasoning=signal.reasoning,
                 signal_data=signal.metadata,
+                execution_mode=execution_mode,
             )
 
             if result.get("success"):
