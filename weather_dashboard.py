@@ -25,6 +25,7 @@ STATE = Path(
         "/root/wheather/skills/polymarket-weather-trader/data/paper_trading/state.json",
     )
 )
+STATE_ROOT = STATE.parent
 REFRESH_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_REFRESH_SECONDS", "30"))
 CLOSED_ROWS_PER_COLUMN = int(os.environ.get("WEATHER_DASHBOARD_CLOSED_ROWS_PER_COLUMN", "20"))
 
@@ -53,6 +54,29 @@ VIEW_LABELS = {
     "old": "OLD CITIES",
     "new": "NEW CITIES",
     "all": "ALL CITIES",
+}
+
+STRATEGY_ORDER = (
+    "baseline",
+    "stop20_early",
+    "no_reentry_after_stop",
+    "wunderground_only",
+    "ensemble_agreement",
+    "ensemble_bias_corrected",
+    "early_only",
+    "low_risk_cities_only",
+)
+STRATEGY_KEYS = dict(zip("abcdefgh", STRATEGY_ORDER))
+STRATEGY_LABELS = {
+    "baseline": "BASELINE",
+    "stop20_early": "STOP20 EARLY",
+    "no_reentry_after_stop": "NO REENTRY",
+    "wunderground_only": "WUNDERGROUND",
+    "ensemble_agreement": "ENSEMBLE",
+    "ensemble_bias_corrected": "BIAS ENSEMBLE",
+    "early_only": "EARLY ONLY",
+    "low_risk_cities_only": "LOW RISK",
+    "compare": "COMPARE ALL",
 }
 
 OLD_CITY_ALIASES = {
@@ -113,11 +137,18 @@ NEW_CITY_ALIASES = {
 }
 
 
-def load_state():
+def state_path_for_strategy(strategy):
+    if strategy == "baseline":
+        return STATE
+    return STATE_ROOT / "strategies" / strategy / "state.json"
+
+
+def load_state(strategy="baseline"):
+    state_path = state_path_for_strategy(strategy)
     try:
-        return json.loads(STATE.read_text())
+        return json.loads(state_path.read_text())
     except Exception:
-        return {"positions": {}, "trades": []}
+        return {"strategy_id": strategy, "positions": {}, "trades": []}
 
 
 def vals(value):
@@ -343,13 +374,21 @@ def filter_by_view(items, view):
     return [item for item in items if item_city_group(item) == view]
 
 
-def build_view_tabs(active_view):
+def build_view_tabs(active_view, active_strategy):
     text = Text()
     for key, view in zip(("1", "2", "3"), VIEW_ORDER):
         selected = view == active_view
         label = f" {key} {VIEW_LABELS[view]} "
         text.append(label, style=("black on #66ff7a" if selected else "bold #66e3ff"))
         text.append(" ")
+    text.append("  ")
+    for key, strategy in STRATEGY_KEYS.items():
+        selected = strategy == active_strategy
+        label = f" {key} {STRATEGY_LABELS[strategy]} "
+        text.append(label, style=("black on #ffd166" if selected else "bold #ffd166"))
+        text.append(" ")
+    text.append(" c COMPARE ", style=("black on #ff9f43" if active_strategy == "compare" else "bold #ff9f43"))
+    text.append(" ")
     text.append(" q EXIT ", style="dim white")
     return text
 
@@ -446,10 +485,11 @@ def summarize(positions, trades):
     }
 
 
-def build_header(summary, frame, active_view):
+def build_header(summary, frame, active_view, active_strategy):
     now = datetime.now(DISPLAY_TZ).strftime(f"%H:%M:%S {DISPLAY_TZ_LABEL}")
     pulse = "●" if frame % 2 == 0 else "•"
-    heartbeat = sparkline(closed_pnl_values(load_state().get("trades") or []), width=22)
+    state = load_state(active_strategy if active_strategy != "compare" else "baseline")
+    heartbeat = sparkline(closed_pnl_values(state.get("trades") or []), width=22)
     grid = Table.grid(expand=True)
     grid.add_column(ratio=3)
     grid.add_column(ratio=1)
@@ -465,6 +505,8 @@ def build_header(summary, frame, active_view):
             (pulse, "bold #66ff7a"),
             (" LIVE  ", "bold white"),
             (VIEW_LABELS.get(active_view, "ALL CITIES"), "bold #ffd166"),
+            (" / ", "dim"),
+            (STRATEGY_LABELS.get(active_strategy, active_strategy).upper(), "bold #ff9f43"),
         ),
         metric_block("TotalPnL", money(summary["total"]), pnl_style(summary["total"])),
         metric_block("Realized", money(summary["realized"]), pnl_style(summary["realized"])),
@@ -473,7 +515,7 @@ def build_header(summary, frame, active_view):
         Text(heartbeat, style="#66ff7a"),
         Text(now, style="bold white"),
     )
-    return Panel(Group(grid, build_view_tabs(active_view)), border_style="#2277aa", box=box.ROUNDED, style="on #061019")
+    return Panel(Group(grid, build_view_tabs(active_view, active_strategy)), border_style="#2277aa", box=box.ROUNDED, style="on #061019")
 
 
 def stats_row(label, value, style="bold white"):
@@ -609,8 +651,52 @@ def build_closed_panel(trades):
     return Panel(grid, title="CLOSED TRADES", border_style="#aa55ff", box=box.ROUNDED, style="on #080d18")
 
 
-def build(frame=0, active_view="old"):
-    state = load_state()
+def build_compare_panel(active_view):
+    table = Table(title=f"STRATEGY COMPARISON / {VIEW_LABELS.get(active_view, active_view)}", expand=True, box=box.SIMPLE)
+    table.add_column("Key", width=4)
+    table.add_column("Strategy", overflow="fold")
+    table.add_column("Open", justify="right", width=7)
+    table.add_column("Buys", justify="right", width=7)
+    table.add_column("Sells", justify="right", width=7)
+    table.add_column("PnL", justify="right", width=10)
+    table.add_column("Realized", justify="right", width=10)
+    table.add_column("Unrealized", justify="right", width=10)
+    table.add_column("Winrate", justify="right", width=9)
+    for key, strategy in STRATEGY_KEYS.items():
+        state = load_state(strategy)
+        positions = filter_by_view(state.get("positions"), active_view)
+        trades = filter_by_view(state.get("trades") or [], active_view)
+        summary = summarize(positions, trades)
+        table.add_row(
+            key,
+            STRATEGY_LABELS.get(strategy, strategy),
+            str(len(positions)),
+            str(len(summary["buys"])),
+            str(len(summary["sells"])),
+            Text(money(summary["total"]), style=pnl_style(summary["total"])),
+            Text(money(summary["realized"]), style=pnl_style(summary["realized"])),
+            Text(money(summary["unrealized"]), style=pnl_style(summary["unrealized"])),
+            f"{summary['winrate']:.1f}%",
+        )
+    return Panel(table, border_style="#ff9f43", box=box.ROUNDED, style="on #080d18")
+
+
+def build(frame=0, active_view="old", active_strategy="baseline"):
+    if active_strategy == "compare":
+        state = {"positions": {}, "trades": []}
+        positions = []
+        trades = []
+        summary = summarize(positions, trades)
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=5),
+            Layout(name="compare", ratio=1),
+        )
+        layout["header"].update(build_header(summary, frame, active_view, active_strategy))
+        layout["compare"].update(build_compare_panel(active_view))
+        return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
+
+    state = load_state(active_strategy)
     positions = filter_by_view(state.get("positions"), active_view)
     trades = filter_by_view(state.get("trades") or [], active_view)
     summary = summarize(positions, trades)
@@ -623,23 +709,27 @@ def build(frame=0, active_view="old"):
     )
     layout["main"].split_row(Layout(name="left", ratio=1), Layout(name="open", ratio=4))
 
-    layout["header"].update(build_header(summary, frame, active_view))
+    layout["header"].update(build_header(summary, frame, active_view, active_strategy))
     layout["left"].update(build_stats_panel(positions, trades, summary))
     layout["open"].update(build_open_panel(positions, frame))
     layout["closed"].update(build_closed_panel(trades))
     return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
 
 
-def apply_key(key, active_view):
+def apply_key(key, active_view, active_strategy):
     if key == "1":
-        return "old", False
+        return "old", active_strategy, False
     if key == "2":
-        return "new", False
+        return "new", active_strategy, False
     if key == "3":
-        return "all", False
+        return "all", active_strategy, False
+    if key in STRATEGY_KEYS:
+        return active_view, STRATEGY_KEYS[key], False
+    if key and key.lower() == "c":
+        return active_view, "compare", False
     if key and key.lower() == "q":
-        return active_view, True
-    return active_view, False
+        return active_view, active_strategy, True
+    return active_view, active_strategy, False
 
 
 def read_key(timeout):
@@ -657,6 +747,9 @@ def run():
     active_view = os.environ.get("WEATHER_DASHBOARD_VIEW", "old").lower()
     if active_view not in VIEW_ORDER:
         active_view = "old"
+    active_strategy = os.environ.get("WEATHER_DASHBOARD_STRATEGY", "baseline").lower()
+    if active_strategy not in STRATEGY_ORDER and active_strategy != "compare":
+        active_strategy = "baseline"
 
     old_tty = None
     if sys.stdin.isatty():
@@ -664,19 +757,19 @@ def run():
         tty.setcbreak(sys.stdin.fileno())
 
     try:
-        with Live(build(active_view=active_view), refresh_per_second=2, screen=True) as live:
+        with Live(build(active_view=active_view, active_strategy=active_strategy), refresh_per_second=2, screen=True) as live:
             while True:
-                live.update(build(frame, active_view=active_view))
+                live.update(build(frame, active_view=active_view, active_strategy=active_strategy))
                 frame += 1
 
                 deadline = time.time() + max(1, REFRESH_SECONDS)
                 while time.time() < deadline:
                     key = read_key(min(0.25, max(0.0, deadline - time.time())))
-                    active_view, should_quit = apply_key(key, active_view)
+                    active_view, active_strategy, should_quit = apply_key(key, active_view, active_strategy)
                     if should_quit:
                         return
                     if key:
-                        live.update(build(frame, active_view=active_view))
+                        live.update(build(frame, active_view=active_view, active_strategy=active_strategy))
     finally:
         if old_tty is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)

@@ -59,6 +59,7 @@ from simmer_sdk.skill import load_config, update_config, get_config_path
 from trader.adapters.simmer_client import SimmerAdapter, discover_and_import_weather_markets
 from trader.execution.execution_engine import ExecutionEngine
 from trader.models.execution import ExecutionMode
+from trader.models.forecast import Forecast
 from trader.models.position import Position
 from trader.forecasting.forecast_provider import ForecastProvider
 from trader.markets.market_parser import (
@@ -172,13 +173,99 @@ FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS",
 
 # SDK adapter / execution singletons
 _adapter = None
-_execution_engine = None
+_execution_engines = {}
 _forecast_provider = None
-_paper_trader = None
+_paper_traders = {}
 _probability_model = None
 _strategy_v1_probability_model = None
 _dataset_recorder = None
 _actual_temperature_cache = {}
+_weather_markets_cache = {}
+
+BASELINE_STRATEGY_ID = "baseline"
+ACTIVE_STRATEGY_ID = BASELINE_STRATEGY_ID
+LOW_RISK_STRATEGY_CITIES = {
+    "Atlanta", "Houston", "Miami", "Moscow", "Munich", "Los Angeles", "Taipei"
+}
+STRATEGY_VARIANTS = {
+    "baseline": {
+        "label": "Baseline",
+        "forecast_mode": "primary",
+        "early_yes_stop_loss_pct": STRATEGY_V1_YES_STOP_LOSS_PCT if "STRATEGY_V1_YES_STOP_LOSS_PCT" in globals() else 0.10,
+    },
+    "stop20_early": {
+        "label": "Early Stop 20%",
+        "forecast_mode": "primary",
+        "early_yes_stop_loss_pct": 0.20,
+    },
+    "no_reentry_after_stop": {
+        "label": "No Reentry After Stop",
+        "forecast_mode": "primary",
+        "block_reentry_after_stop_loss": True,
+    },
+    "wunderground_only": {
+        "label": "Wunderground Only",
+        "forecast_mode": "wunderground",
+    },
+    "ensemble_agreement": {
+        "label": "Ensemble Agreement",
+        "forecast_mode": "ensemble_agreement",
+        "agreement_threshold": 2.0,
+    },
+    "ensemble_bias_corrected": {
+        "label": "Ensemble Bias Corrected",
+        "forecast_mode": "ensemble_bias_corrected",
+        "agreement_threshold": 3.0,
+    },
+    "early_only": {
+        "label": "Early Only",
+        "forecast_mode": "primary",
+        "allowed_regimes": {"early"},
+    },
+    "low_risk_cities_only": {
+        "label": "Low Risk Cities Only",
+        "forecast_mode": "primary",
+        "allowed_cities": LOW_RISK_STRATEGY_CITIES,
+    },
+}
+
+
+def get_active_strategy_config() -> dict:
+    return STRATEGY_VARIANTS.get(ACTIVE_STRATEGY_ID, STRATEGY_VARIANTS[BASELINE_STRATEGY_ID])
+
+
+def set_active_strategy(strategy_id: str) -> None:
+    global ACTIVE_STRATEGY_ID
+    if strategy_id not in STRATEGY_VARIANTS:
+        raise ValueError(f"Unknown strategy variant: {strategy_id}")
+    ACTIVE_STRATEGY_ID = strategy_id
+
+
+def get_strategy_state_dir(strategy_id: str = None) -> Path:
+    strategy_id = strategy_id or ACTIVE_STRATEGY_ID
+    base_dir = Path(__file__).resolve().parent / "data" / "paper_trading"
+    if strategy_id == BASELINE_STRATEGY_ID:
+        return base_dir
+    return base_dir / "strategies" / strategy_id
+
+
+# Positive value means primary forecast has historically run hot versus actual;
+# the corrected forecast subtracts this value. Keep this conservative until the
+# Wunderground calibration sample grows.
+FORECAST_BIAS_BY_LOCATION = {
+    "Austin": -5.67,
+    "NYC": 6.49,
+    "Dallas": -4.47,
+    "Denver": -5.00,
+    "Amsterdam": -4.22,
+    "Seoul": 0.00,
+    "Seattle": -4.00,
+    "Atlanta": 1.84,
+    "Miami": -1.59,
+    "Houston": -0.94,
+    "Moscow": -1.19,
+    "Munich": 0.39,
+}
 
 def get_adapter(live=True):
     """Lazy-init SDK adapter singleton."""
@@ -189,9 +276,9 @@ def get_adapter(live=True):
 
 def get_execution_engine(live=True, forced_mode=None, logger=None):
     """Lazy-init execution engine singleton."""
-    global _execution_engine
-    if _execution_engine is None:
-        _execution_engine = ExecutionEngine(
+    key = (ACTIVE_STRATEGY_ID, bool(live), forced_mode.value if forced_mode else None)
+    if key not in _execution_engines:
+        _execution_engines[key] = ExecutionEngine(
             adapter=get_adapter(live=live),
             trade_source=TRADE_SOURCE,
             skill_slug=SKILL_SLUG,
@@ -200,7 +287,11 @@ def get_execution_engine(live=True, forced_mode=None, logger=None):
             paper_trader=get_paper_trader() if forced_mode == ExecutionMode.PAPER else None,
             logger=logger,
         )
-    return _execution_engine
+    engine = _execution_engines[key]
+    engine.logger = logger
+    if forced_mode == ExecutionMode.PAPER:
+        engine.paper_trader = get_paper_trader()
+    return engine
 
 
 def get_forecast_provider():
@@ -219,11 +310,12 @@ def get_forecast_provider():
 
 def get_paper_trader():
     """Lazy-init paper trader singleton."""
-    global _paper_trader
-    if _paper_trader is None:
-        state_dir = Path(__file__).resolve().parent / "data" / "paper_trading"
-        _paper_trader = PaperTrader(state_dir=state_dir)
-    return _paper_trader
+    if ACTIVE_STRATEGY_ID not in _paper_traders:
+        _paper_traders[ACTIVE_STRATEGY_ID] = PaperTrader(
+            state_dir=get_strategy_state_dir(ACTIVE_STRATEGY_ID),
+            strategy_id=ACTIVE_STRATEGY_ID,
+        )
+    return _paper_traders[ACTIVE_STRATEGY_ID]
 
 
 def get_probability_model():
@@ -816,6 +908,14 @@ def select_strategy_v1_event_trade(
 
     regime_mode = classify_market_regime(forecast)
     forecast_fresh = is_forecast_fresh(forecast)
+    event_allowed, event_skip_reason = strategy_allows_event(location, regime_mode=regime_mode)
+    if not event_allowed:
+        return {
+            "action": "skip",
+            "reason": event_skip_reason,
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        }
     ranked_candidates = ranked_candidates or build_strategy_v1_event_candidates(
         event_markets=event_markets,
         forecast=forecast,
@@ -1108,6 +1208,20 @@ def get_strategy_v1_rebuy_context(
             "reason": "max_positions_reached",
             "open_positions_count": open_positions_count,
         }
+    strategy_config = get_active_strategy_config()
+    if strategy_config.get("block_reentry_after_stop_loss"):
+        last_exit_reason = paper_trader.get_last_exit_reason(market_id)
+        if last_exit_reason == "stop_loss":
+            return {
+                "open_position_exists": False,
+                "rebuy_allowed": False,
+                "buy_count": 0,
+                "position_cost_usd": 0.0,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "reason": "blocked_after_stop_loss",
+                "open_positions_count": open_positions_count,
+            }
     last_trade_at = paper_trader.get_last_trade_time(market_id)
     if last_trade_at:
         try:
@@ -1861,8 +1975,16 @@ LOCATION_SEARCH_TERMS = {
 
 def fetch_weather_markets(search_queries=None):
     """Fetch weather-tagged markets from Simmer API."""
+    cache_key = tuple(search_queries) if search_queries is not None else ("default",)
+    cached = _weather_markets_cache.get(cache_key)
+    if cached:
+        fetched_at, markets = cached
+        if (datetime.now(timezone.utc) - fetched_at).total_seconds() <= 20:
+            return markets
     try:
-        return get_adapter().fetch_weather_markets(search_queries=search_queries)
+        markets = get_adapter().fetch_weather_markets(search_queries=search_queries)
+        _weather_markets_cache[cache_key] = (datetime.now(timezone.utc), markets)
+        return markets
     except Exception:
         print("  Failed to fetch markets from Simmer API")
         return []
@@ -1899,6 +2021,7 @@ def execute_sell(
     side: str = "yes",
     market_price: float = None,
     market_question: str = None,
+    signal_data: dict = None,
 ) -> dict:
     """Execute a sell trade via execution layer with source tagging."""
     result = get_execution_engine().sell(
@@ -1907,6 +2030,7 @@ def execute_sell(
         shares=shares,
         market_price=market_price,
         market_question=market_question,
+        signal_data=signal_data,
     )
     out = {
         "success": result.success,
@@ -1986,13 +2110,22 @@ def get_position_entry_price(pos, execution_mode: ExecutionMode) -> float:
     return float(pos.avg_cost or 0.0)
 
 
-def get_exit_targets(entry_price: float, side: str, execution_mode: ExecutionMode = None) -> tuple[float, float]:
+def get_exit_targets(
+    entry_price: float,
+    side: str,
+    execution_mode: ExecutionMode = None,
+    entry_regime: str = None,
+) -> tuple[float, float]:
     if side == "no":
         take_profit = STRATEGY_V1_NO_TAKE_PROFIT_PRICE
         stop_loss = max(0.0, entry_price - 0.10)
     else:
         take_profit = min(1.0, entry_price * (1.0 + STRATEGY_V1_YES_TAKE_PROFIT_PCT))
-        stop_loss = max(0.01, entry_price * (1.0 - STRATEGY_V1_YES_STOP_LOSS_PCT))
+        stop_pct = STRATEGY_V1_YES_STOP_LOSS_PCT
+        strategy_config = get_active_strategy_config()
+        if str(entry_regime or "").lower() == "early":
+            stop_pct = float(strategy_config.get("early_yes_stop_loss_pct", stop_pct))
+        stop_loss = max(0.01, entry_price * (1.0 - stop_pct))
     return take_profit, stop_loss
 
 
@@ -2133,6 +2266,94 @@ def fetch_actual_temperature(location: str, target_date: str, metric: str, unit:
     }
     _actual_temperature_cache[cache_key] = result
     return result
+
+
+def clone_forecast(
+    forecast: Forecast,
+    predicted_value: float,
+    source: str,
+    metadata_note: str = None,
+) -> Forecast:
+    return Forecast(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        source=source,
+        location_key=forecast.location_key,
+        location_name=forecast.location_name,
+        target_date=forecast.target_date,
+        metric=forecast.metric,
+        predicted_value=round(predicted_value),
+        unit=forecast.unit,
+        retrieved_at=datetime.now(timezone.utc).isoformat(),
+        is_observation_fallback=forecast.is_observation_fallback,
+        horizon_days=forecast.horizon_days,
+        fallback_date=forecast.fallback_date,
+        fallback_reason=metadata_note or forecast.fallback_reason,
+    )
+
+
+def resolve_strategy_forecast(
+    primary_forecast: Forecast,
+    location: str,
+    date_str: str,
+    metric: str,
+    logger: StructuredLogger = None,
+) -> tuple[Optional[Forecast], Optional[str]]:
+    strategy_config = get_active_strategy_config()
+    mode = strategy_config.get("forecast_mode", "primary")
+    if mode == "primary":
+        return primary_forecast, None
+
+    wunderground = get_forecast_provider().get_wunderground_forecast(location, date_str, metric)
+    if wunderground is None:
+        return None, "wunderground_forecast_unavailable"
+
+    if mode == "wunderground":
+        return wunderground, None
+
+    primary_value = float(primary_forecast.predicted_value)
+    bias = float(FORECAST_BIAS_BY_LOCATION.get(location, 0.0))
+    if mode == "ensemble_bias_corrected":
+        primary_value = primary_value - bias
+
+    diff = abs(primary_value - float(wunderground.predicted_value))
+    threshold = float(strategy_config.get("agreement_threshold", 2.0))
+    if diff > threshold:
+        if logger is not None:
+            logger.event(
+                "strategy_forecast_disagreement",
+                strategy_id=ACTIVE_STRATEGY_ID,
+                location=location,
+                target_date=date_str,
+                metric=metric,
+                primary_forecast=round(primary_value, 4),
+                wunderground_forecast=wunderground.predicted_value,
+                diff=round(diff, 4),
+                threshold=threshold,
+            )
+        return None, "forecast_sources_disagree"
+
+    ensemble_value = (primary_value + float(wunderground.predicted_value)) / 2.0
+    return clone_forecast(
+        primary_forecast,
+        predicted_value=ensemble_value,
+        source=mode,
+        metadata_note=(
+            f"ensemble_with_wunderground_diff_{diff:.2f}"
+            if mode == "ensemble_agreement"
+            else f"bias_corrected_ensemble_diff_{diff:.2f}"
+        ),
+    ), None
+
+
+def strategy_allows_event(location: str, regime_mode: str = None) -> tuple[bool, Optional[str]]:
+    strategy_config = get_active_strategy_config()
+    allowed_cities = strategy_config.get("allowed_cities")
+    if allowed_cities and location not in allowed_cities:
+        return False, "city_not_in_strategy_universe"
+    allowed_regimes = strategy_config.get("allowed_regimes")
+    if allowed_regimes and regime_mode not in allowed_regimes:
+        return False, "regime_not_allowed_for_strategy"
+    return True, None
 
 
 def bucket_contains_actual(bucket, actual_value: float) -> bool:
@@ -2478,7 +2699,13 @@ def check_exit_opportunities(
                 )
             continue
 
-        take_profit, stop_loss = get_exit_targets(entry_price, position_side, execution_mode=execution_mode)
+        entry_regime = position_state.get("entry_regime") if position_state else None
+        take_profit, stop_loss = get_exit_targets(
+            entry_price,
+            position_side,
+            execution_mode=execution_mode,
+            entry_regime=entry_regime,
+        )
         exit_reason = None
         ignored_edge_invalidated = False
         if settlement_info is not None:
@@ -2580,6 +2807,7 @@ def check_exit_opportunities(
                 side=position_side,
                 market_price=current_price,
                 market_question=stored_question,
+                signal_data={"exit_reason": exit_reason, "strategy_id": ACTIVE_STRATEGY_ID},
             )
 
             if result.get("success"):
@@ -2635,7 +2863,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                          use_safeguards: bool = True, use_trends: bool = True,
                          quiet: bool = False, vol_targeting: bool = VOL_TARGETING,
                          paper: bool = False, record_dataset: bool = False,
-                         dataset_output: str = None):
+                         dataset_output: str = None, skip_discovery: bool = False):
     """Run the weather trading strategy."""
     logger = StructuredLogger(quiet=quiet)
     if paper:
@@ -2663,6 +2891,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         logger.event(
             "strategy_v1_mode_enabled",
             strategy="strategy_v1",
+            strategy_id=ACTIVE_STRATEGY_ID,
+            strategy_label=get_active_strategy_config().get("label"),
             mode=mode_label,
             strategy_style="forecast_first",
             allowed_cities="all_active_locations",
@@ -2683,6 +2913,10 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
             yes_take_profit_pct=STRATEGY_V1_YES_TAKE_PROFIT_PCT,
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
+            early_yes_stop_loss_pct=get_active_strategy_config().get(
+                "early_yes_stop_loss_pct",
+                STRATEGY_V1_YES_STOP_LOSS_PCT,
+            ),
             no_take_profit_price=STRATEGY_V1_NO_TAKE_PROFIT_PRICE,
             no_stop_loss_delta=0.10,
             early_market_min_hours=STRATEGY_V1_EARLY_MARKET_MIN_HOURS,
@@ -2704,7 +2938,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
     if strategy_v1_requested:
-        log("  Exit rules:      YES +40% / -10%, NO @0.98 / -0.10, edge<0 exit")
+        early_stop_pct = float(get_active_strategy_config().get("early_yes_stop_loss_pct", STRATEGY_V1_YES_STOP_LOSS_PCT))
+        log(f"  Exit rules:      YES +40% / -{STRATEGY_V1_YES_STOP_LOSS_PCT:.0%}, EARLY YES -{early_stop_pct:.0%}, NO @0.98 / -0.10")
     else:
         log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     if strategy_v1_requested:
@@ -2783,17 +3018,21 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 log(f"    YES: {pos.shares_yes:.1f} | NO: {pos.shares_no:.1f} | P&L: ${pos.pnl or 0:.2f} | Sources: {pos.sources}")
         return
 
-    log("\n🔍 Discovering new weather markets on Polymarket...")
-    newly_imported = discover_and_import_weather_markets(
-        adapter=adapter,
-        active_locations=ACTIVE_LOCATIONS,
-        location_search_terms=LOCATION_SEARCH_TERMS,
-        log=log,
-    )
-    if newly_imported:
-        log(f"  Auto-imported {newly_imported} new market(s)")
+    if skip_discovery:
+        log("\n🔍 Discovering new weather markets on Polymarket...")
+        log("  Skipped discovery for strategy-suite shadow variant")
     else:
-        log("  No new markets to import")
+        log("\n🔍 Discovering new weather markets on Polymarket...")
+        newly_imported = discover_and_import_weather_markets(
+            adapter=adapter,
+            active_locations=ACTIVE_LOCATIONS,
+            location_search_terms=LOCATION_SEARCH_TERMS,
+            log=log,
+        )
+        if newly_imported:
+            log(f"  Auto-imported {newly_imported} new market(s)")
+        else:
+            log("  No new markets to import")
 
     log("\n📡 Fetching weather markets...")
     markets = fetch_weather_markets()
@@ -2855,8 +3094,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             else:
                 log(f"  Fetching NOAA forecast...")
 
-        forecast = forecast_provider.get_forecast(location, date_str, metric)
-        if not forecast:
+        primary_forecast = forecast_provider.get_forecast(location, date_str, metric)
+        if not primary_forecast:
             log(f"  ⚠️  No forecast available for {date_str}")
             provider_error = forecast_provider.get_last_error(location)
             if provider_error:
@@ -2884,9 +3123,26 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     )
             continue
 
+        forecast, strategy_forecast_skip_reason = resolve_strategy_forecast(
+            primary_forecast=primary_forecast,
+            location=location,
+            date_str=date_str,
+            metric=metric,
+            logger=logger,
+        )
+        if forecast is None:
+            log(f"  ⏸️  {ACTIVE_STRATEGY_ID}: {strategy_forecast_skip_reason}")
+            skip_reasons.append(strategy_forecast_skip_reason or "forecast strategy skip")
+            continue
+
         forecast_temp = forecast.predicted_value
         unit_label = "°C" if forecast.unit == "C" else "°F"
-        source_label = "Open-Meteo" if is_international else "NOAA"
+        if forecast.source == "wunderground":
+            source_label = "Wunderground"
+        elif forecast.source.startswith("ensemble"):
+            source_label = forecast.source
+        else:
+            source_label = "Open-Meteo" if is_international else "NOAA"
         log(f"  {source_label} forecast: {forecast_temp}{unit_label}")
         if forecast.fallback_date:
             log(
@@ -3136,7 +3392,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 selected_threshold = strategy_v1_decision["threshold"]
                 selected_edge = strategy_v1_decision["selected_edge"]
                 signal_source = "strategy_v1_gaussian"
-                source_label_for_signal = "Gaussian"
+                source_label_for_signal = forecast.source
         else:
             should_trade = price < ENTRY_THRESHOLD
 
@@ -3221,6 +3477,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 signal.metadata["edge_yes"] = round(strategy_v1_decision["edge_yes"], 6) if strategy_v1_decision else None
                 signal.metadata["edge_no"] = round(strategy_v1_decision["edge_no"], 6) if strategy_v1_decision else None
                 signal.metadata["strategy"] = "strategy_v1" if strategy_v1_enabled(execution_mode) else "legacy_threshold"
+                signal.metadata["strategy_id"] = ACTIVE_STRATEGY_ID
+                signal.metadata["forecast_source"] = forecast.source
                 signal.metadata["bucket_type"] = getattr(candidate.bucket, "bucket_type", None)
                 signal.metadata["city"] = candidate.location
                 signal.metadata["question"] = candidate.market.question
@@ -3411,6 +3669,41 @@ def run_live_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True
     )
 
 
+def run_strategy_suite(args):
+    """Run all configured paper strategy variants with separate ledgers."""
+    for index, strategy_id in enumerate(STRATEGY_VARIANTS):
+        set_active_strategy(strategy_id)
+        variant = get_active_strategy_config()
+        print("\n" + "=" * 72)
+        print(f"🧪 Strategy suite: {strategy_id} ({variant.get('label', strategy_id)})")
+        print(f"   state: {get_strategy_state_dir(strategy_id) / 'state.json'}")
+        run_weather_strategy(
+            dry_run=False,
+            positions_only=args.positions,
+            show_config=args.config,
+            smart_sizing=args.smart_sizing,
+            use_safeguards=not args.no_safeguards,
+            use_trends=not args.no_trends,
+            quiet=args.quiet,
+            vol_targeting=args.vol_targeting or VOL_TARGETING,
+            paper=True,
+            record_dataset=args.record_dataset and index == 0,
+            dataset_output=args.dataset_output,
+            skip_discovery=index > 0,
+        )
+
+
+def run_strategy_suite_exit_check_cycle(args):
+    """Run lightweight exit checks for every paper strategy variant."""
+    for strategy_id in STRATEGY_VARIANTS:
+        set_active_strategy(strategy_id)
+        run_paper_exit_check_cycle(
+            dry_run=False,
+            use_safeguards=not args.no_safeguards,
+            quiet=args.quiet,
+        )
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -3421,6 +3714,10 @@ if __name__ == "__main__":
     parser.add_argument("--live-loop", action="store_true", help="Run --live continuously with fast exit checks")
     parser.add_argument("--dry-run", action="store_true", help="(Default) Show opportunities without trading")
     parser.add_argument("--paper", action="store_true", help="Simulate trades and persist paper positions/PnL locally")
+    parser.add_argument("--strategy", choices=sorted(STRATEGY_VARIANTS), default=BASELINE_STRATEGY_ID,
+                        help="Paper strategy variant/state to run")
+    parser.add_argument("--strategy-suite", action="store_true",
+                        help="Run all paper strategy variants with separate state files")
     parser.add_argument("--backtest-file", help="Run a deterministic backtest from a local JSON dataset")
     parser.add_argument("--compare-models", action="store_true", help="Run a side-by-side model comparison on a backtest dataset")
     parser.add_argument("--experiment-config", help="JSON experiment config file for model comparison runs")
@@ -3476,6 +3773,26 @@ if __name__ == "__main__":
             globals()["_probability_model"] = None
             globals()["_strategy_v1_probability_model"] = None
 
+    set_active_strategy(args.strategy)
+
+    if args.strategy_suite:
+        if not args.paper:
+            print("Error: --strategy-suite requires --paper")
+            sys.exit(1)
+        if args.positions or args.config:
+            run_strategy_suite(args)
+        else:
+            while True:
+                run_strategy_suite(args)
+                remaining_sleep = WEATHER_BOT_LOOP_SECONDS
+                while remaining_sleep > 0:
+                    sleep_for = min(WEATHER_BOT_EXIT_CHECK_SECONDS, remaining_sleep)
+                    time.sleep(sleep_for)
+                    remaining_sleep -= sleep_for
+                    if remaining_sleep > 0:
+                        run_strategy_suite_exit_check_cycle(args)
+        sys.exit(0)
+
     if args.compare_models:
         if not args.backtest_file:
             print("Error: --compare-models requires --backtest-file")
@@ -3513,6 +3830,7 @@ if __name__ == "__main__":
         "paper": args.paper,
         "record_dataset": args.record_dataset,
         "dataset_output": args.dataset_output,
+        "skip_discovery": False,
     }
 
     if args.paper and not args.positions and not args.config:

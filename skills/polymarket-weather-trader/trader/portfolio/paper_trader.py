@@ -12,12 +12,13 @@ from trader.models.position import Position
 class PaperTrader:
     """Persistent paper-trading ledger with simulated fills and paper positions."""
 
-    def __init__(self, state_dir: Path, logger=None, initial_cash: float = 1000.0):
+    def __init__(self, state_dir: Path, logger=None, initial_cash: float = 1000.0, strategy_id: str = "baseline"):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / "state.json"
         self.logger = logger
         self.initial_cash = initial_cash
+        self.strategy_id = strategy_id
         self.state = self._load_state()
 
     def _now(self) -> str:
@@ -27,11 +28,13 @@ class PaperTrader:
         now = self._now()
         return {
             "version": 1,
+            "strategy_id": self.strategy_id,
             "initial_cash": self.initial_cash,
             "cash_balance": self.initial_cash,
             "realized_pnl": 0.0,
             "forecast_history": {},
             "market_exit_times": {},
+            "market_exit_reasons": {},
             "positions": {},
             "orders": [],
             "trades": [],
@@ -53,6 +56,8 @@ class PaperTrader:
         state.setdefault("trades", [])
         state.setdefault("forecast_history", {})
         state.setdefault("market_exit_times", {})
+        state.setdefault("market_exit_reasons", {})
+        state.setdefault("strategy_id", self.strategy_id)
         state.setdefault("cash_balance", state.get("initial_cash", self.initial_cash))
         state.setdefault("realized_pnl", 0.0)
         state.setdefault("updated_at", self._now())
@@ -122,6 +127,12 @@ class PaperTrader:
 
     def get_last_exit_time(self, market_id: str) -> Optional[str]:
         return (self.state.get("market_exit_times") or {}).get(market_id)
+
+    def get_last_exit_reason(self, market_id: str) -> Optional[str]:
+        reason_entry = (self.state.get("market_exit_reasons") or {}).get(market_id)
+        if isinstance(reason_entry, dict):
+            return reason_entry.get("reason")
+        return reason_entry
 
     def get_forecast_history(self, event_id: str) -> Optional[dict]:
         return (self.state.get("forecast_history") or {}).get(event_id)
@@ -317,6 +328,7 @@ class PaperTrader:
         entry_regime = signal_data.get("entry_regime")
         entry_reason = signal_data.get("entry_reason")
         entry_bucket_relation = signal_data.get("entry_bucket_relation")
+        exit_reason = signal_data.get("exit_reason")
 
         price = market_price if market_price is not None else self._get_market_price(adapter, market_id, side)
         if price is None:
@@ -348,6 +360,7 @@ class PaperTrader:
             "entry_reason": entry_reason,
             "entry_bucket_relation": entry_bucket_relation,
             "status": "filled",
+            "strategy_id": self.strategy_id,
         }
         self.state["orders"].append(order_entry)
         self._log_event(
@@ -474,11 +487,18 @@ class PaperTrader:
             self.state["realized_pnl"] += realized_pnl
             if remaining_shares == 0:
                 self.state.setdefault("market_exit_times", {})[market_id] = timestamp
+                if exit_reason:
+                    self.state.setdefault("market_exit_reasons", {})[market_id] = {
+                        "reason": exit_reason,
+                        "timestamp": timestamp,
+                        "side": side,
+                    }
                 self._log_event(
                     "paper_position_closed",
                     market_id=market_id,
                     side=side,
                     realized_pnl=round(realized_pnl, 6),
+                    exit_reason=exit_reason,
                 )
             else:
                 self._log_event(
@@ -511,6 +531,8 @@ class PaperTrader:
             "entry_regime": entry_regime or position.get("entry_regime"),
             "entry_reason": entry_reason or position.get("entry_reason"),
             "entry_bucket_relation": entry_bucket_relation or position.get("entry_bucket_relation"),
+            "exit_reason": exit_reason if action == "sell" else None,
+            "strategy_id": self.strategy_id,
             "realized_pnl": round(realized_pnl, 6),
         }
         self.state["trades"].append(trade_entry)

@@ -62,6 +62,7 @@ class ExecutionEngine:
         shares: float,
         market_price: Optional[float] = None,
         market_question: Optional[str] = None,
+        signal_data: dict = None,
     ) -> ExecutionResult:
         return self._submit_trade(
             market_id=market_id,
@@ -70,6 +71,7 @@ class ExecutionEngine:
             shares=shares,
             market_price=market_price,
             market_question=market_question,
+            signal_data=signal_data,
         )
 
     def _submit_trade(

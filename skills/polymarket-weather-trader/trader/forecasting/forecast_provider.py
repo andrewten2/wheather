@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 import certifi
@@ -57,6 +58,41 @@ class ForecastProvider:
             fallback_reason=fallback_reason,
         )
 
+    def get_wunderground_forecast(self, location: str, date_str: str, metric: str) -> Optional[Forecast]:
+        """Fetch a station-code forecast from Weather Underground.
+
+        Polymarket resolves weather markets from Wunderground station pages, so this
+        is useful as an alternate research forecast source. Wunderground pages are
+        not a formal API; this parser intentionally stays conservative.
+        """
+        loc = self._resolve_location_config(location)
+        station = (loc or {}).get("station")
+        if not station:
+            self._last_errors[f"wunderground:{location}"] = "Missing station code"
+            return None
+
+        daily = self.get_wunderground_station_forecast(station, location)
+        row, fallback_date, fallback_reason = self._resolve_forecast_row(daily, date_str, metric)
+        predicted_value = row.get(metric) if row else None
+        if predicted_value is None:
+            return None
+
+        expected_unit = "C" if location in self.international_locations else "F"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return Forecast(
+            timestamp=now_iso,
+            source="wunderground",
+            location_key=location,
+            location_name=self._resolve_location_name(location),
+            target_date=date_str,
+            metric=metric,
+            predicted_value=predicted_value,
+            unit=expected_unit,
+            retrieved_at=now_iso,
+            fallback_date=fallback_date,
+            fallback_reason=fallback_reason,
+        )
+
     def has_cached_location(self, location: str) -> bool:
         return self._cache_refresh_reason(location) is None
 
@@ -73,6 +109,11 @@ class ForecastProvider:
         if location in self.locations:
             return self.locations[location].get("name", location)
         return location
+
+    def _resolve_location_config(self, location: str) -> Optional[dict]:
+        if location in self.locations:
+            return self.locations[location]
+        return self.international_locations.get(location)
 
     def _fetch_location_forecasts(self, location: str) -> Dict[str, dict]:
         self._last_errors.pop(location, None)
@@ -299,3 +340,65 @@ class ForecastProvider:
             self._last_errors[location] = "NOAA returned zero forecast periods"
 
         return forecasts
+
+    def get_wunderground_station_forecast(self, station: str, location: str) -> Dict[str, dict]:
+        url = f"https://www.wunderground.com/forecast/{station}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        try:
+            response = requests.get(url, headers=headers, timeout=30, verify=certifi.where())
+            response.raise_for_status()
+            html = response.text
+        except requests.exceptions.RequestException as e:
+            self._last_errors[f"wunderground:{location}"] = f"Request error: {e}"
+            return {}
+
+        text = re.sub(r"\s+", " ", html)
+        base_date = self._parse_wunderground_base_date(text)
+        expected_unit = "C" if location in self.international_locations else "F"
+        rows = []
+        seen = set()
+        pattern = re.compile(
+            r"((?:Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\.]{0,160}?\.\s*"
+            r"(High|Low)\s+(-?\d+)\s*°?\s*([FC])?)",
+            re.IGNORECASE,
+        )
+        for phrase, metric_name, value, unit in pattern.findall(text):
+            key = (phrase, metric_name.lower(), value, unit or "F")
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((metric_name.lower(), int(value), (unit or "F").upper()))
+
+        forecasts: Dict[str, dict] = {}
+        day_index = 0
+        for metric_name, value, unit in rows:
+            if metric_name != "high":
+                continue
+            date_str = (base_date + timedelta(days=day_index)).strftime("%Y-%m-%d")
+            normalized_value = self._convert_temperature(value, unit, expected_unit)
+            forecasts.setdefault(date_str, {"high": None, "low": None})["high"] = round(normalized_value)
+            day_index += 1
+
+        if not forecasts:
+            self._last_errors[f"wunderground:{location}"] = "No forecast highs parsed"
+        return forecasts
+
+    @staticmethod
+    def _parse_wunderground_base_date(text: str):
+        match = re.search(r"access_time\s+[^,]*,\s*([A-Z][a-z]{2})\s+(\d{1,2}),\s+(\d{4})", text)
+        if match:
+            try:
+                return datetime.strptime(" ".join(match.groups()), "%b %d %Y").date()
+            except Exception:
+                pass
+        return datetime.now(timezone.utc).date()
+
+    @staticmethod
+    def _convert_temperature(value: float, source_unit: str, target_unit: str) -> float:
+        if source_unit == target_unit:
+            return float(value)
+        if source_unit == "F" and target_unit == "C":
+            return (float(value) - 32.0) * 5.0 / 9.0
+        if source_unit == "C" and target_unit == "F":
+            return float(value) * 9.0 / 5.0 + 32.0
+        return float(value)
