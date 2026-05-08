@@ -28,6 +28,8 @@ STATE = Path(
 STATE_ROOT = STATE.parent
 REFRESH_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_REFRESH_SECONDS", "30"))
 CLOSED_ROWS_PER_COLUMN = int(os.environ.get("WEATHER_DASHBOARD_CLOSED_ROWS_PER_COLUMN", "20"))
+OPEN_POSITIONS_LIMIT = int(os.environ.get("WEATHER_DASHBOARD_OPEN_POSITIONS_LIMIT", "15"))
+OPEN_SECTION_SIZE = int(os.environ.get("WEATHER_DASHBOARD_OPEN_SECTION_SIZE", "22"))
 
 console = Console()
 DISPLAY_TZ = timezone(timedelta(hours=3))
@@ -65,8 +67,10 @@ STRATEGY_ORDER = (
     "ensemble_bias_corrected",
     "early_only",
     "low_risk_cities_only",
+    "no_early_stop",
+    "wunderground_reverse",
 )
-STRATEGY_KEYS = dict(zip("abcdefgh", STRATEGY_ORDER))
+STRATEGY_KEYS = dict(zip("abcdefghij", STRATEGY_ORDER))
 STRATEGY_LABELS = {
     "baseline": "BASELINE",
     "stop20_early": "STOP20 EARLY",
@@ -76,6 +80,8 @@ STRATEGY_LABELS = {
     "ensemble_bias_corrected": "BIAS ENSEMBLE",
     "early_only": "EARLY ONLY",
     "low_risk_cities_only": "LOW RISK",
+    "no_early_stop": "NO EARLY STOP",
+    "wunderground_reverse": "WU REVERSE",
     "compare": "COMPARE ALL",
 }
 
@@ -387,7 +393,7 @@ def build_view_tabs(active_view, active_strategy):
         label = f" {key} {STRATEGY_LABELS[strategy]} "
         text.append(label, style=("black on #ffd166" if selected else "bold #ffd166"))
         text.append(" ")
-    text.append(" c COMPARE ", style=("black on #ff9f43" if active_strategy == "compare" else "bold #ff9f43"))
+    text.append(" x COMPARE ", style=("black on #ff9f43" if active_strategy == "compare" else "bold #ff9f43"))
     text.append(" ")
     text.append(" q EXIT ", style="dim white")
     return text
@@ -557,7 +563,7 @@ def build_curve_panel(trades):
 
 
 def build_open_panel(positions, frame):
-    table = Table(title="OPEN POSITIONS", expand=True, box=box.SIMPLE)
+    table = Table(title=f"OPEN POSITIONS ({min(len(positions), OPEN_POSITIONS_LIMIT)}/{len(positions)})", expand=True, box=box.SIMPLE)
     table.add_column("", width=2)
     table.add_column("Side", width=5)
     table.add_column("Regime", justify="center", width=6)
@@ -566,7 +572,7 @@ def build_open_panel(positions, frame):
     table.add_column("PnL", justify="right", width=9)
     table.add_column("PnL%", justify="right", width=8)
     table.add_column("Held", justify="right", width=8)
-    table.add_column("Market", overflow="fold")
+    table.add_column("Market", overflow="ellipsis", no_wrap=True)
     table.add_column("Forecast", justify="center", width=8)
 
     sorted_positions = sorted(
@@ -576,7 +582,7 @@ def build_open_panel(positions, frame):
             -(abs(position_pnl(position)[0] or 0.0)),
         ),
     )
-    for position in sorted_positions[:24]:
+    for position in sorted_positions[:OPEN_POSITIONS_LIMIT]:
         pnl, pnl_pct = position_pnl(position)
         side = (position.get("side") or "?").upper()
         current = to_float(position.get("current_price"))
@@ -704,8 +710,8 @@ def build(frame=0, active_view="old", active_strategy="baseline"):
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=5),
-        Layout(name="main", ratio=2),
-        Layout(name="closed", ratio=6),
+        Layout(name="main", size=OPEN_SECTION_SIZE),
+        Layout(name="closed", ratio=1),
     )
     layout["main"].split_row(Layout(name="left", ratio=1), Layout(name="open", ratio=4))
 
@@ -725,7 +731,7 @@ def apply_key(key, active_view, active_strategy):
         return "all", active_strategy, False
     if key in STRATEGY_KEYS:
         return active_view, STRATEGY_KEYS[key], False
-    if key and key.lower() == "c":
+    if key and key.lower() == "x":
         return active_view, "compare", False
     if key and key.lower() == "q":
         return active_view, active_strategy, True

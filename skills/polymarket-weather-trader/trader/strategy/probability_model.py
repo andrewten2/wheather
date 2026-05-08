@@ -86,6 +86,10 @@ class GaussianTemperatureModel(ProbabilityModel):
         else:
             low = float(getattr(bucket, "low"))
             high = float(getattr(bucket, "high"))
+            if getattr(bucket, "bucket_type", None) == "exact":
+                # A single displayed degree resolves as a rounded-temperature bucket.
+                low -= 0.5
+                high += 0.5
             raw_probability = self._bucket_probability(
                 mean=float(forecast_temp),
                 sigma=sigma_used,
