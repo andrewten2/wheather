@@ -240,6 +240,11 @@ STRATEGY_VARIANTS = {
         # Keep the normal take-profit path, but effectively disable early YES stop-outs.
         "early_yes_stop_loss_pct": 1.00,
     },
+    "celsius_exact_direct": {
+        "label": "Celsius Exact Direct",
+        "forecast_mode": "primary",
+        "strict_celsius_exact_buckets": True,
+    },
 }
 
 
@@ -437,6 +442,28 @@ def _strategy_v1_mid_yes_thresholds(bucket) -> tuple:
             STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
         )
     return STRATEGY_V1_MID_YES_MIN_PRICE, STRATEGY_V1_MID_YES_MAX_PRICE, STRATEGY_V1_MID_YES_MIN_EDGE
+
+
+def _strategy_v1_yes_entry_relations(bucket, unit_label: str) -> set:
+    strategy_config = get_active_strategy_config()
+    if (
+        strategy_config.get("strict_celsius_exact_buckets")
+        and str(unit_label or "").upper() == "°C"
+    ):
+        return {"central"}
+    return {"adjacent_lower", "central", "adjacent_upper"}
+
+
+def _strategy_v1_yes_candidate_allowed(item: dict, unit_label: str) -> bool:
+    bucket = item.get("bucket")
+    strategy_config = get_active_strategy_config()
+    if (
+        strategy_config.get("strict_celsius_exact_buckets")
+        and str(unit_label or "").upper() == "°C"
+        and not _is_exact_bucket(bucket)
+    ):
+        return False
+    return item.get("entry_bucket_relation") in _strategy_v1_yes_entry_relations(bucket, unit_label)
 
 
 def apply_strategy_side_reversal(decision: Optional[dict]) -> Optional[dict]:
@@ -1026,7 +1053,7 @@ def select_strategy_v1_event_trade(
         central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
         early_candidates = [
             item for item in ranked_candidates
-            if item["entry_bucket_relation"] in {"adjacent_lower", "central", "adjacent_upper"}
+            if _strategy_v1_yes_candidate_allowed(item, unit_label)
             and item["yes_price"] <= STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE
         ]
         if not central_candidates:
@@ -1207,7 +1234,7 @@ def select_strategy_v1_event_trade(
     if regime_mode == "mid":
         near_forecast_candidates = [
             item for item in ranked_candidates
-            if item.get("entry_bucket_relation") in {"adjacent_lower", "central", "adjacent_upper"}
+            if _strategy_v1_yes_candidate_allowed(item, unit_label)
             and _bucket_distance_to_forecast(item["bucket"], float(forecast.predicted_value)) <= 1.0
         ]
         eligible = []
@@ -2453,7 +2480,7 @@ def resolve_strategy_forecast(
 
     diff = abs(primary_value - float(wunderground.predicted_value))
     threshold = float(strategy_config.get("agreement_threshold", 2.0))
-    if diff > threshold:
+    if diff >= threshold:
         if logger is not None:
             logger.event(
                 "strategy_forecast_disagreement",
@@ -3626,6 +3653,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 signal.metadata["strategy"] = "strategy_v1" if strategy_v1_enabled(execution_mode) else "legacy_threshold"
                 signal.metadata["strategy_id"] = ACTIVE_STRATEGY_ID
                 signal.metadata["forecast_source"] = forecast.source
+                signal.metadata["entry_forecast_value"] = round(float(forecast.predicted_value), 6)
+                signal.metadata["entry_forecast_unit"] = forecast.unit
+                signal.metadata["entry_forecast_source"] = forecast.source
+                signal.metadata["entry_forecast_retrieved_at"] = forecast.retrieved_at
+                signal.metadata["entry_forecast_target_date"] = getattr(forecast, "target_date", None)
+                signal.metadata["entry_forecast_location"] = getattr(forecast, "location_name", None) or candidate.location
+                signal.metadata["entry_forecast_metric"] = getattr(forecast, "metric", None)
                 signal.metadata["bucket_type"] = getattr(candidate.bucket, "bucket_type", None)
                 signal.metadata["city"] = candidate.location
                 signal.metadata["question"] = candidate.market.question

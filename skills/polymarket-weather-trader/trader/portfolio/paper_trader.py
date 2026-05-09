@@ -311,6 +311,24 @@ class PaperTrader:
             return fallback_market.get("question") or fallback_market.get("event_name") or market_id
         return market_id
 
+    @staticmethod
+    def _entry_forecast_fields(source: Optional[dict]) -> dict:
+        source = source or {}
+        fields = {}
+        for key in (
+            "entry_forecast_value",
+            "entry_forecast_unit",
+            "entry_forecast_source",
+            "entry_forecast_retrieved_at",
+            "entry_forecast_target_date",
+            "entry_forecast_location",
+            "entry_forecast_metric",
+        ):
+            value = source.get(key)
+            if value is not None:
+                fields[key] = value
+        return fields
+
     def simulate_order(
         self,
         adapter,
@@ -329,6 +347,7 @@ class PaperTrader:
         entry_reason = signal_data.get("entry_reason")
         entry_bucket_relation = signal_data.get("entry_bucket_relation")
         exit_reason = signal_data.get("exit_reason")
+        signal_forecast_fields = self._entry_forecast_fields(signal_data)
 
         price = market_price if market_price is not None else self._get_market_price(adapter, market_id, side)
         if price is None:
@@ -362,6 +381,7 @@ class PaperTrader:
             "status": "filled",
             "strategy_id": self.strategy_id,
         }
+        order_entry.update(signal_forecast_fields)
         self.state["orders"].append(order_entry)
         self._log_event(
             "paper_order_created",
@@ -396,6 +416,8 @@ class PaperTrader:
             "entry_bucket_relation": entry_bucket_relation,
             "sources": ["sdk:weather"] if signal_source else [],
         })
+        for key, value in signal_forecast_fields.items():
+            position.setdefault(key, value)
         position_question = (
             position.get("question")
             or market_question
@@ -430,6 +452,8 @@ class PaperTrader:
                 position["entry_reason"] = entry_reason
             if entry_bucket_relation:
                 position["entry_bucket_relation"] = entry_bucket_relation
+            for key, value in signal_forecast_fields.items():
+                position[key] = value
             self.state["cash_balance"] -= cost
             self._log_event(
                 "paper_buy",
@@ -535,6 +559,7 @@ class PaperTrader:
             "strategy_id": self.strategy_id,
             "realized_pnl": round(realized_pnl, 6),
         }
+        trade_entry.update(signal_forecast_fields or self._entry_forecast_fields(position))
         self.state["trades"].append(trade_entry)
         self._save_state()
 

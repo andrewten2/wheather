@@ -99,8 +99,9 @@ STRATEGY_ORDER = (
     "low_risk_cities_only",
     "no_early_stop",
     "wunderground_reverse",
+    "celsius_exact_direct",
 )
-STRATEGY_KEYS = dict(zip("abcdefghij", STRATEGY_ORDER))
+STRATEGY_KEYS = dict(zip("abcdefghijk", STRATEGY_ORDER))
 STRATEGY_LABELS = {
     "baseline": "BASELINE",
     "stop20_early": "STOP20 EARLY",
@@ -112,6 +113,7 @@ STRATEGY_LABELS = {
     "low_risk_cities_only": "LOW RISK",
     "no_early_stop": "NO EARLY STOP",
     "wunderground_reverse": "WU REVERSE",
+    "celsius_exact_direct": "C EXACT",
     "compare": "COMPARE ALL",
 }
 
@@ -432,61 +434,44 @@ def metric_for_question(question):
     return "low" if "lowest temperature" in text or "low temp" in text else "high"
 
 
-def dashboard_forecast_provider():
-    global FORECAST_PROVIDER
-    if FORECAST_PROVIDER is not None:
-        return FORECAST_PROVIDER
+def _nested_signal(item):
+    metadata = item.get("metadata") if isinstance(item, dict) else None
+    if isinstance(metadata, dict):
+        signal = metadata.get("signal")
+        if isinstance(signal, dict):
+            return signal
+    return {}
+
+
+def stored_forecast_label(item):
+    """Render the entry-time forecast saved in paper state. Never calls APIs."""
+    if not isinstance(item, dict):
+        return "F:-"
+    signal = _nested_signal(item)
+    value = (
+        item.get("entry_forecast_value")
+        if item.get("entry_forecast_value") is not None
+        else signal.get("entry_forecast_value")
+    )
+    if value is None:
+        value = item.get("forecast_value") if item.get("forecast_value") is not None else signal.get("forecast_value")
+    if value is None:
+        return "F:-"
+    unit = (
+        item.get("entry_forecast_unit")
+        or signal.get("entry_forecast_unit")
+        or item.get("forecast_unit")
+        or signal.get("unit_label")
+        or ""
+    )
+    unit = str(unit).replace("°", "")
+    source = item.get("entry_forecast_source") or signal.get("entry_forecast_source") or item.get("forecast_source") or signal.get("forecast_source")
+    source_mark = "W" if source == "wunderground" else "F"
     try:
-        root = Path(__file__).resolve().parent
-        skill_path = root / "skills" / "polymarket-weather-trader"
-        if str(skill_path) not in sys.path:
-            sys.path.insert(0, str(skill_path))
-        from weather_trader import get_forecast_provider
-
-        FORECAST_PROVIDER = get_forecast_provider()
-    except Exception:
-        FORECAST_PROVIDER = False
-    return FORECAST_PROVIDER or None
-
-
-def forecast_label(position, active_strategy=None):
-    question = position.get("question") or ""
-    city = city_for_question(question)
-    date_str = target_date_for_question(question, position)
-    metric = metric_for_question(question)
-    if not city or not date_str:
-        return forecast_icon(question)
-
-    source = "wunderground" if str(active_strategy or "").startswith("wunderground") else "primary"
-    cache_key = (city, date_str, metric, source)
-    cached = FORECAST_CACHE.get(cache_key)
-    now = time.time()
-    if cached and now - cached[0] < FORECAST_CACHE_SECONDS:
-        return cached[1]
-
-    provider = dashboard_forecast_provider()
-    if provider is None:
-        return "F n/a"
-
-    try:
-        forecast = (
-            provider.get_wunderground_forecast(city, date_str, metric)
-            if source == "wunderground"
-            else provider.get_forecast(city, date_str, metric)
-        )
-        if forecast is None and source == "wunderground":
-            forecast = provider.get_forecast(city, date_str, metric)
-        if forecast is None:
-            label = "F n/a"
-        else:
-            value = getattr(forecast, "predicted_value", None)
-            unit = getattr(forecast, "unit", "") or ""
-            source_mark = "W" if getattr(forecast, "source", "") == "wunderground" else "F"
-            label = f"{source_mark}:{value}°{unit}" if value is not None else "F n/a"
-    except Exception:
-        label = "F err"
-    FORECAST_CACHE[cache_key] = (now, label)
-    return label
+        value = f"{float(value):g}"
+    except (TypeError, ValueError):
+        value = str(value)
+    return f"{source_mark}:{value}°{unit}" if unit else f"{source_mark}:{value}"
 
 
 def _contains_city_alias(text, alias):
@@ -555,7 +540,7 @@ def build_buy_history(trades):
         )
         if market_key and entry is not None:
             history.setdefault((market_key, side), []).append(
-                (parse_dt(trade.get("timestamp")), entry, trade.get("entry_regime"))
+                (parse_dt(trade.get("timestamp")), entry, trade.get("entry_regime"), stored_forecast_label(trade))
             )
 
     for items in history.values():
@@ -599,6 +584,26 @@ def closed_entry_regime(trade, buy_history):
         if len(item) > 2 and item[2]:
             return item[2]
     return None
+
+
+def closed_entry_forecast(trade, buy_history):
+    label = stored_forecast_label(trade)
+    if label != "F:-":
+        return label
+
+    market_key = trade.get("market_id") or market_name(trade.get("question"))
+    side = (trade.get("side") or "?").upper()
+    sell_time = parse_dt(trade.get("timestamp"))
+    history = buy_history.get((market_key, side), [])
+    if sell_time:
+        prior_buys = [item for item in history if item[0] is None or item[0] <= sell_time]
+        for item in reversed(prior_buys):
+            if len(item) > 3 and item[3] != "F:-":
+                return item[3]
+    for item in reversed(history):
+        if len(item) > 3 and item[3] != "F:-":
+            return item[3]
+    return "F:-"
 
 
 def summarize(positions, trades):
@@ -738,7 +743,7 @@ def build_open_panel(positions, frame, active_strategy="baseline"):
             Text(pnl_pct_text, style="yellow" if is_stale else pnl_style(pnl)),
             age_label(position.get("opened_at")),
             market_name(position.get("question") or position.get("market_id"))[:118],
-            Text(forecast_label(position, active_strategy), style="#ffd166"),
+            Text(stored_forecast_label(position), style="#ffd166"),
             style=row_style,
         )
     return Panel(table, border_style="#725cff", box=box.ROUNDED, style="on #07111a")
@@ -753,6 +758,7 @@ def build_closed_table(rows, buy_history, title):
     table.add_column("Entry", justify="right", width=8)
     table.add_column("Exit", justify="right", width=8)
     table.add_column("PnL", justify="right", width=9)
+    table.add_column("Forecast", justify="center", width=9)
     table.add_column("Market", overflow="fold")
     for trade in rows:
         pnl = to_float(trade.get("realized_pnl"))
@@ -767,6 +773,7 @@ def build_closed_table(rows, buy_history, title):
             price(closed_entry_price(trade, buy_history)),
             price(trade.get("simulated_fill_price")),
             Text(money(pnl), style=style),
+            Text(closed_entry_forecast(trade, buy_history), style="#ffd166"),
             market_name(trade.get("question") or trade.get("market_id"))[:130],
             style=style,
         )
