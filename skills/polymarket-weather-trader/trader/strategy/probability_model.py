@@ -62,8 +62,14 @@ class GaussianTemperatureModel(ProbabilityModel):
         model_version: str = "v1",
         model_name: str = "gaussian_temperature",
         sigma_schedule: Optional[List[dict]] = None,
+        exact_temperature_sigma: Optional[float] = None,
     ):
         self.temperature_sigma = max(temperature_sigma, 0.001)
+        self.exact_temperature_sigma = (
+            max(float(exact_temperature_sigma), 0.001)
+            if exact_temperature_sigma is not None
+            else None
+        )
         self.min_model_probability = max(0.0, min(min_model_probability, 1.0))
         self.model_version = model_version
         self.model_name = model_name
@@ -90,6 +96,8 @@ class GaussianTemperatureModel(ProbabilityModel):
                 # A single displayed degree resolves as a rounded-temperature bucket.
                 low -= 0.5
                 high += 0.5
+                if self.exact_temperature_sigma is not None:
+                    sigma_used = self.exact_temperature_sigma
             raw_probability = self._bucket_probability(
                 mean=float(forecast_temp),
                 sigma=sigma_used,
@@ -112,6 +120,7 @@ class GaussianTemperatureModel(ProbabilityModel):
             reasoning=reasoning,
             metadata={
                 "temperature_sigma": self.temperature_sigma,
+                "exact_temperature_sigma": self.exact_temperature_sigma,
                 "sigma_used": sigma_used,
                 "horizon_hours": horizon_hours,
                 "sigma_schedule": self.sigma_schedule,
@@ -168,6 +177,11 @@ def create_probability_model(config: Optional[dict] = None) -> ProbabilityModel:
         sigma_schedule = config["sigma_schedule"] if "sigma_schedule" in config else DEFAULT_SIGMA_SCHEDULE
         return GaussianTemperatureModel(
             temperature_sigma=float(config.get("temperature_sigma", 2.5)),
+            exact_temperature_sigma=(
+                float(config["exact_temperature_sigma"])
+                if config.get("exact_temperature_sigma") not in (None, "")
+                else None
+            ),
             min_model_probability=float(config.get("min_model_probability", 0.01)),
             model_name=str(config.get("model_name", "gaussian_temperature")),
             sigma_schedule=sigma_schedule,

@@ -131,6 +131,8 @@ CONFIG_SCHEMA = {
                           "help": "Probability model to use: constant (default) or gaussian."},
     "temperature_sigma": {"env": "SIMMER_WEATHER_TEMPERATURE_SIGMA", "default": 2.5, "type": float,
                           "help": "Gaussian temperature model sigma in degrees."},
+    "exact_temperature_sigma": {"env": "SIMMER_WEATHER_EXACT_TEMPERATURE_SIGMA", "default": 1.0, "type": float,
+                                "help": "Gaussian sigma for single-degree exact buckets."},
     "min_model_probability": {"env": "SIMMER_WEATHER_MIN_MODEL_PROBABILITY", "default": 0.01, "type": float,
                               "help": "Lower floor applied to model probability estimates."},
     "model_name":        {"env": "SIMMER_WEATHER_MODEL_NAME",        "default": "gaussian_temperature", "type": str,
@@ -345,6 +347,7 @@ def get_probability_model():
         _probability_model = create_probability_model({
             "probability_model": _config.get("probability_model", "constant"),
             "temperature_sigma": _config.get("temperature_sigma", 2.5),
+            "exact_temperature_sigma": _config.get("exact_temperature_sigma", 1.0),
             "min_model_probability": _config.get("min_model_probability", 0.01),
             "model_name": _config.get("model_name", "gaussian_temperature"),
             "sigma_schedule": sigma_schedule,
@@ -369,6 +372,7 @@ def get_strategy_v1_probability_model():
         _strategy_v1_probability_model = create_probability_model({
             "probability_model": "gaussian",
             "temperature_sigma": _config.get("temperature_sigma", 2.5),
+            "exact_temperature_sigma": _config.get("exact_temperature_sigma", 1.0),
             "min_model_probability": _config.get("min_model_probability", 0.01),
             "model_name": "strategy_v1_gaussian",
             "sigma_schedule": sigma_schedule,
@@ -389,6 +393,11 @@ STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
 STRATEGY_V1_MID_YES_MIN_PRICE = 0.12
 STRATEGY_V1_MID_YES_MAX_PRICE = 0.30
 STRATEGY_V1_MID_YES_MIN_EDGE = 0.20
+STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE = 0.01
+STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE = 0.25
+STRATEGY_V1_EXACT_MID_YES_MIN_PRICE = 0.01
+STRATEGY_V1_EXACT_MID_YES_MAX_PRICE = 0.25
+STRATEGY_V1_EXACT_MID_YES_MIN_EDGE = 0.02
 STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
 STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
 STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
@@ -408,6 +417,26 @@ MARKET_EXIT_COOLDOWN_MINUTES = 120
 MARKET_REENTRY_COOLDOWN_MINUTES = 120
 MAX_POSITION_AGE_HOURS = 48
 PAPER_SLIPPAGE_MAX_PCT = 0.45
+
+
+def _is_exact_bucket(bucket) -> bool:
+    return getattr(bucket, "bucket_type", None) == "exact"
+
+
+def _strategy_v1_early_yes_price_bounds(bucket) -> tuple:
+    if _is_exact_bucket(bucket):
+        return STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE, STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE
+    return STRATEGY_V1_EARLY_YES_MIN_PRICE, STRATEGY_V1_EARLY_YES_MAX_PRICE
+
+
+def _strategy_v1_mid_yes_thresholds(bucket) -> tuple:
+    if _is_exact_bucket(bucket):
+        return (
+            STRATEGY_V1_EXACT_MID_YES_MIN_PRICE,
+            STRATEGY_V1_EXACT_MID_YES_MAX_PRICE,
+            STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
+        )
+    return STRATEGY_V1_MID_YES_MIN_PRICE, STRATEGY_V1_MID_YES_MAX_PRICE, STRATEGY_V1_MID_YES_MIN_EDGE
 
 
 def apply_strategy_side_reversal(decision: Optional[dict]) -> Optional[dict]:
@@ -1053,7 +1082,8 @@ def select_strategy_v1_event_trade(
                 -item["gaussian_probability"],
             ),
         )[0]
-        if selected["yes_price"] < STRATEGY_V1_EARLY_YES_MIN_PRICE:
+        early_yes_min_price, early_yes_max_price = _strategy_v1_early_yes_price_bounds(selected["bucket"])
+        if selected["yes_price"] < early_yes_min_price:
             return {
                 "action": "skip",
                 "reason": "early_yes_too_cheap",
@@ -1068,7 +1098,7 @@ def select_strategy_v1_event_trade(
                 "edge_no": selected["edge_no"],
                 "entry_bucket_relation": selected.get("entry_bucket_relation"),
             }
-        if selected["yes_price"] > STRATEGY_V1_EARLY_YES_MAX_PRICE:
+        if selected["yes_price"] > early_yes_max_price:
             return {
                 "action": "skip",
                 "reason": "early_yes_too_expensive",
@@ -1096,7 +1126,7 @@ def select_strategy_v1_event_trade(
                 else "early_central_yes" if decision["action"] == "trade"
                 else decision["reason"]
             ),
-            "threshold": STRATEGY_V1_EARLY_YES_MAX_PRICE,
+            "threshold": early_yes_max_price,
             "selected_edge": selected["edge_yes"],
             "candidate": selected["candidate"],
             "probability_estimate": selected["probability_estimate"],
@@ -1180,11 +1210,14 @@ def select_strategy_v1_event_trade(
             if item.get("entry_bucket_relation") in {"adjacent_lower", "central", "adjacent_upper"}
             and _bucket_distance_to_forecast(item["bucket"], float(forecast.predicted_value)) <= 1.0
         ]
-        eligible = [
-            item for item in near_forecast_candidates
-            if STRATEGY_V1_MID_YES_MIN_PRICE <= item["yes_price"] <= STRATEGY_V1_MID_YES_MAX_PRICE
-            and item["edge_yes"] >= STRATEGY_V1_MID_YES_MIN_EDGE
-        ]
+        eligible = []
+        for item in near_forecast_candidates:
+            mid_yes_min_price, mid_yes_max_price, mid_yes_min_edge = _strategy_v1_mid_yes_thresholds(item["bucket"])
+            if (
+                mid_yes_min_price <= item["yes_price"] <= mid_yes_max_price
+                and item["edge_yes"] >= mid_yes_min_edge
+            ):
+                eligible.append(item)
         if not eligible:
             first = sorted(
                 ranked_candidates,
@@ -1195,9 +1228,9 @@ def select_strategy_v1_event_trade(
             )[0]
             if not near_forecast_candidates:
                 reason = "mid_bucket_not_near_forecast"
-            elif all(item["yes_price"] < STRATEGY_V1_MID_YES_MIN_PRICE for item in near_forecast_candidates):
+            elif all(item["yes_price"] < _strategy_v1_mid_yes_thresholds(item["bucket"])[0] for item in near_forecast_candidates):
                 reason = "mid_yes_too_cheap"
-            elif all(item["yes_price"] > STRATEGY_V1_MID_YES_MAX_PRICE for item in near_forecast_candidates):
+            elif all(item["yes_price"] > _strategy_v1_mid_yes_thresholds(item["bucket"])[1] for item in near_forecast_candidates):
                 reason = "mid_yes_too_expensive"
             else:
                 reason = "mid_yes_edge_too_low"
@@ -1224,6 +1257,7 @@ def select_strategy_v1_event_trade(
                 -item["gaussian_probability"],
             ),
         )[0]
+        _, selected_mid_yes_max_price, _ = _strategy_v1_mid_yes_thresholds(selected["bucket"])
         decision = _apply_strategy_v1_rebuy_guard(
             selected,
             "yes",
@@ -1232,7 +1266,7 @@ def select_strategy_v1_event_trade(
         )
         decision.update({
             "reason": "mid_strong_edge_yes" if decision["action"] == "trade" else decision["reason"],
-            "threshold": STRATEGY_V1_MID_YES_MAX_PRICE,
+            "threshold": selected_mid_yes_max_price,
             "selected_edge": selected["edge_yes"],
             "candidate": selected["candidate"],
             "probability_estimate": selected["probability_estimate"],
@@ -3031,6 +3065,12 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             mid_yes_min_price=STRATEGY_V1_MID_YES_MIN_PRICE,
             mid_yes_max_price=STRATEGY_V1_MID_YES_MAX_PRICE,
             mid_yes_min_edge=STRATEGY_V1_MID_YES_MIN_EDGE,
+            exact_temperature_sigma=_config.get("exact_temperature_sigma", 1.0),
+            exact_early_yes_min_price=STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE,
+            exact_early_yes_max_price=STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE,
+            exact_mid_yes_min_price=STRATEGY_V1_EXACT_MID_YES_MIN_PRICE,
+            exact_mid_yes_max_price=STRATEGY_V1_EXACT_MID_YES_MAX_PRICE,
+            exact_mid_yes_min_edge=STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
             late_far_max_probability=STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
             late_almost_impossible_max_probability=STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY,
             no_min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
