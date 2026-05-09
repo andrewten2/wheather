@@ -30,10 +30,40 @@ REFRESH_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_REFRESH_SECONDS", "30"))
 CLOSED_ROWS_PER_COLUMN = int(os.environ.get("WEATHER_DASHBOARD_CLOSED_ROWS_PER_COLUMN", "20"))
 OPEN_POSITIONS_LIMIT = int(os.environ.get("WEATHER_DASHBOARD_OPEN_POSITIONS_LIMIT", "15"))
 OPEN_SECTION_SIZE = int(os.environ.get("WEATHER_DASHBOARD_OPEN_SECTION_SIZE", "22"))
+FORECAST_CACHE_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_FORECAST_CACHE_SECONDS", "300"))
 
 console = Console()
 DISPLAY_TZ = timezone(timedelta(hours=3))
 DISPLAY_TZ_LABEL = "UTC+3"
+FORECAST_PROVIDER = None
+FORECAST_CACHE = {}
+
+MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
 
 SPINNER = ["ϟ", "·", ":", "·"]
 SPARK = "▁▂▃▄▅▆▇█"
@@ -354,6 +384,111 @@ def market_name(question):
     return re.sub(r"\s+", " ", question).strip()
 
 
+def all_city_aliases():
+    aliases = {}
+    aliases.update(OLD_CITY_ALIASES)
+    aliases.update(NEW_CITY_ALIASES)
+    return aliases
+
+
+def city_for_question(question):
+    text = market_name(question).lower()
+    for city, aliases in all_city_aliases().items():
+        if any(_contains_city_alias(text, alias) for alias in aliases):
+            return city
+    return None
+
+
+def target_year_for_position(position):
+    opened_at = parse_dt(position.get("opened_at"))
+    return (opened_at or datetime.now(timezone.utc)).year
+
+
+def target_date_for_question(question, position):
+    text = market_name(question)
+    match = re.search(
+        r"\b("
+        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+        r")\s+(\d{1,2})(?:,\s*(\d{4}))?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    month = MONTHS.get(match.group(1).lower())
+    day = int(match.group(2))
+    year = int(match.group(3) or target_year_for_position(position))
+    if not month:
+        return None
+    try:
+        return datetime(year, month, day).date().isoformat()
+    except ValueError:
+        return None
+
+
+def metric_for_question(question):
+    text = market_name(question).lower()
+    return "low" if "lowest temperature" in text or "low temp" in text else "high"
+
+
+def dashboard_forecast_provider():
+    global FORECAST_PROVIDER
+    if FORECAST_PROVIDER is not None:
+        return FORECAST_PROVIDER
+    try:
+        root = Path(__file__).resolve().parent
+        skill_path = root / "skills" / "polymarket-weather-trader"
+        if str(skill_path) not in sys.path:
+            sys.path.insert(0, str(skill_path))
+        from weather_trader import get_forecast_provider
+
+        FORECAST_PROVIDER = get_forecast_provider()
+    except Exception:
+        FORECAST_PROVIDER = False
+    return FORECAST_PROVIDER or None
+
+
+def forecast_label(position, active_strategy=None):
+    question = position.get("question") or ""
+    city = city_for_question(question)
+    date_str = target_date_for_question(question, position)
+    metric = metric_for_question(question)
+    if not city or not date_str:
+        return forecast_icon(question)
+
+    source = "wunderground" if str(active_strategy or "").startswith("wunderground") else "primary"
+    cache_key = (city, date_str, metric, source)
+    cached = FORECAST_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached[0] < FORECAST_CACHE_SECONDS:
+        return cached[1]
+
+    provider = dashboard_forecast_provider()
+    if provider is None:
+        return "F n/a"
+
+    try:
+        forecast = (
+            provider.get_wunderground_forecast(city, date_str, metric)
+            if source == "wunderground"
+            else provider.get_forecast(city, date_str, metric)
+        )
+        if forecast is None and source == "wunderground":
+            forecast = provider.get_forecast(city, date_str, metric)
+        if forecast is None:
+            label = "F n/a"
+        else:
+            value = getattr(forecast, "predicted_value", None)
+            unit = getattr(forecast, "unit", "") or ""
+            source_mark = "W" if getattr(forecast, "source", "") == "wunderground" else "F"
+            label = f"{source_mark}:{value}°{unit}" if value is not None else "F n/a"
+    except Exception:
+        label = "F err"
+    FORECAST_CACHE[cache_key] = (now, label)
+    return label
+
+
 def _contains_city_alias(text, alias):
     return re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", text) is not None
 
@@ -562,7 +697,7 @@ def build_curve_panel(trades):
     return Panel(chart, title="PnL CURVE", border_style="#00aa55", box=box.ROUNDED, style="on #06150f")
 
 
-def build_open_panel(positions, frame):
+def build_open_panel(positions, frame, active_strategy="baseline"):
     table = Table(title=f"OPEN POSITIONS ({min(len(positions), OPEN_POSITIONS_LIMIT)}/{len(positions)})", expand=True, box=box.SIMPLE)
     table.add_column("", width=2)
     table.add_column("Side", width=5)
@@ -573,7 +708,7 @@ def build_open_panel(positions, frame):
     table.add_column("PnL%", justify="right", width=8)
     table.add_column("Held", justify="right", width=8)
     table.add_column("Market", overflow="ellipsis", no_wrap=True)
-    table.add_column("Forecast", justify="center", width=8)
+    table.add_column("Forecast", justify="center", width=9)
 
     sorted_positions = sorted(
         positions,
@@ -603,7 +738,7 @@ def build_open_panel(positions, frame):
             Text(pnl_pct_text, style="yellow" if is_stale else pnl_style(pnl)),
             age_label(position.get("opened_at")),
             market_name(position.get("question") or position.get("market_id"))[:118],
-            Text(forecast_icon(position.get("question"), frame), style="#ffd166"),
+            Text(forecast_label(position, active_strategy), style="#ffd166"),
             style=row_style,
         )
     return Panel(table, border_style="#725cff", box=box.ROUNDED, style="on #07111a")
@@ -717,7 +852,7 @@ def build(frame=0, active_view="old", active_strategy="baseline"):
 
     layout["header"].update(build_header(summary, frame, active_view, active_strategy))
     layout["left"].update(build_stats_panel(positions, trades, summary))
-    layout["open"].update(build_open_panel(positions, frame))
+    layout["open"].update(build_open_panel(positions, frame, active_strategy))
     layout["closed"].update(build_closed_panel(trades))
     return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
 
