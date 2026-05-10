@@ -434,6 +434,11 @@ def metric_for_question(question):
     return "low" if "lowest temperature" in text or "low temp" in text else "high"
 
 
+def unit_for_question(question):
+    match = re.search(r"°\s*([CF])\b", market_name(question), flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
 def _nested_signal(item):
     metadata = item.get("metadata") if isinstance(item, dict) else None
     if isinstance(metadata, dict):
@@ -443,7 +448,7 @@ def _nested_signal(item):
     return {}
 
 
-def stored_forecast_label(item):
+def stored_forecast_label(item, forecast_history=None):
     """Render the entry-time forecast saved in paper state. Never calls APIs."""
     if not isinstance(item, dict):
         return "F:-"
@@ -456,16 +461,33 @@ def stored_forecast_label(item):
     if value is None:
         value = item.get("forecast_value") if item.get("forecast_value") is not None else signal.get("forecast_value")
     if value is None:
-        return "F:-"
-    unit = (
-        item.get("entry_forecast_unit")
-        or signal.get("entry_forecast_unit")
-        or item.get("forecast_unit")
-        or signal.get("unit_label")
-        or ""
-    )
+        question = item.get("question") or ""
+        city = city_for_question(question)
+        date_str = target_date_for_question(question, item)
+        metric = metric_for_question(question)
+        event_id = f"{city}_{date_str}_{metric}" if city and date_str else None
+        history = (forecast_history or {}).get(event_id) if event_id else None
+        if isinstance(history, dict):
+            value = history.get("forecast_value")
+            unit = unit_for_question(question)
+            source = "forecast_history"
+        if value is None:
+            return "F:-"
+    else:
+        unit = (
+            item.get("entry_forecast_unit")
+            or signal.get("entry_forecast_unit")
+            or item.get("forecast_unit")
+            or signal.get("unit_label")
+            or ""
+        )
+        source = (
+            item.get("entry_forecast_source")
+            or signal.get("entry_forecast_source")
+            or item.get("forecast_source")
+            or signal.get("forecast_source")
+        )
     unit = str(unit).replace("°", "")
-    source = item.get("entry_forecast_source") or signal.get("entry_forecast_source") or item.get("forecast_source") or signal.get("forecast_source")
     source_mark = "W" if source == "wunderground" else "F"
     try:
         value = f"{float(value):g}"
@@ -527,7 +549,7 @@ def trade_price(trade, fields):
     return None
 
 
-def build_buy_history(trades):
+def build_buy_history(trades, forecast_history=None):
     history = {}
     for trade in trades:
         if trade.get("action") != "buy":
@@ -540,7 +562,7 @@ def build_buy_history(trades):
         )
         if market_key and entry is not None:
             history.setdefault((market_key, side), []).append(
-                (parse_dt(trade.get("timestamp")), entry, trade.get("entry_regime"), stored_forecast_label(trade))
+                (parse_dt(trade.get("timestamp")), entry, trade.get("entry_regime"), stored_forecast_label(trade, forecast_history))
             )
 
     for items in history.values():
@@ -586,8 +608,8 @@ def closed_entry_regime(trade, buy_history):
     return None
 
 
-def closed_entry_forecast(trade, buy_history):
-    label = stored_forecast_label(trade)
+def closed_entry_forecast(trade, buy_history, forecast_history=None):
+    label = stored_forecast_label(trade, forecast_history)
     if label != "F:-":
         return label
 
@@ -702,7 +724,7 @@ def build_curve_panel(trades):
     return Panel(chart, title="PnL CURVE", border_style="#00aa55", box=box.ROUNDED, style="on #06150f")
 
 
-def build_open_panel(positions, frame, active_strategy="baseline"):
+def build_open_panel(positions, frame, active_strategy="baseline", forecast_history=None):
     table = Table(title=f"OPEN POSITIONS ({min(len(positions), OPEN_POSITIONS_LIMIT)}/{len(positions)})", expand=True, box=box.SIMPLE)
     table.add_column("", width=2)
     table.add_column("Side", width=5)
@@ -743,13 +765,13 @@ def build_open_panel(positions, frame, active_strategy="baseline"):
             Text(pnl_pct_text, style="yellow" if is_stale else pnl_style(pnl)),
             age_label(position.get("opened_at")),
             market_name(position.get("question") or position.get("market_id"))[:118],
-            Text(stored_forecast_label(position), style="#ffd166"),
+            Text(stored_forecast_label(position, forecast_history), style="#ffd166"),
             style=row_style,
         )
     return Panel(table, border_style="#725cff", box=box.ROUNDED, style="on #07111a")
 
 
-def build_closed_table(rows, buy_history, title):
+def build_closed_table(rows, buy_history, title, forecast_history=None):
     table = Table(title=title, expand=True, box=box.SIMPLE)
     table.add_column("", width=2)
     table.add_column("Time", width=12)
@@ -773,28 +795,28 @@ def build_closed_table(rows, buy_history, title):
             price(closed_entry_price(trade, buy_history)),
             price(trade.get("simulated_fill_price")),
             Text(money(pnl), style=style),
-            Text(closed_entry_forecast(trade, buy_history), style="#ffd166"),
+            Text(closed_entry_forecast(trade, buy_history, forecast_history), style="#ffd166"),
             market_name(trade.get("question") or trade.get("market_id"))[:130],
             style=style,
         )
     return table
 
 
-def build_closed_panel(trades):
+def build_closed_panel(trades, forecast_history=None):
     sells = [trade for trade in trades if trade.get("action") == "sell"]
     sorted_sells = sorted(
         sells,
         key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
         reverse=True,
     )
-    buy_history = build_buy_history(trades)
+    buy_history = build_buy_history(trades, forecast_history)
     recent_sells = sorted_sells[: CLOSED_ROWS_PER_COLUMN * 2]
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
     grid.add_row(
-        build_closed_table(recent_sells[:CLOSED_ROWS_PER_COLUMN], buy_history, f"LATEST {CLOSED_ROWS_PER_COLUMN}"),
-        build_closed_table(recent_sells[CLOSED_ROWS_PER_COLUMN:CLOSED_ROWS_PER_COLUMN * 2], buy_history, f"NEXT {CLOSED_ROWS_PER_COLUMN}"),
+        build_closed_table(recent_sells[:CLOSED_ROWS_PER_COLUMN], buy_history, f"LATEST {CLOSED_ROWS_PER_COLUMN}", forecast_history),
+        build_closed_table(recent_sells[CLOSED_ROWS_PER_COLUMN:CLOSED_ROWS_PER_COLUMN * 2], buy_history, f"NEXT {CLOSED_ROWS_PER_COLUMN}", forecast_history),
     )
     return Panel(grid, title="CLOSED TRADES", border_style="#aa55ff", box=box.ROUNDED, style="on #080d18")
 
@@ -847,6 +869,7 @@ def build(frame=0, active_view="old", active_strategy="baseline"):
     state = load_state(active_strategy)
     positions = filter_by_view(state.get("positions"), active_view)
     trades = filter_by_view(state.get("trades") or [], active_view)
+    forecast_history = state.get("forecast_history") or {}
     summary = summarize(positions, trades)
 
     layout = Layout()
@@ -859,8 +882,8 @@ def build(frame=0, active_view="old", active_strategy="baseline"):
 
     layout["header"].update(build_header(summary, frame, active_view, active_strategy))
     layout["left"].update(build_stats_panel(positions, trades, summary))
-    layout["open"].update(build_open_panel(positions, frame, active_strategy))
-    layout["closed"].update(build_closed_panel(trades))
+    layout["open"].update(build_open_panel(positions, frame, active_strategy, forecast_history))
+    layout["closed"].update(build_closed_panel(trades, forecast_history))
     return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
 
 
