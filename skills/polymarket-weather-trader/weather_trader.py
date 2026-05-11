@@ -243,6 +243,12 @@ STRATEGY_VARIANTS = {
     "celsius_exact_direct": {
         "label": "Celsius Exact Direct",
         "forecast_mode": "primary",
+        "allowed_regimes": {"early", "mid"},
+        "exact_yes_min_price": 0.05,
+        "exact_early_yes_max_price": 0.22,
+        "exact_mid_yes_max_price": 0.20,
+        "require_wunderground_agreement": True,
+        "agreement_threshold": 1.0,
         "strict_celsius_exact_buckets": True,
     },
 }
@@ -430,39 +436,55 @@ def _is_exact_bucket(bucket) -> bool:
 
 def _strategy_v1_early_yes_price_bounds(bucket) -> tuple:
     if _is_exact_bucket(bucket):
-        return STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE, STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE
+        strategy_config = get_active_strategy_config()
+        return (
+            float(strategy_config.get("exact_yes_min_price", STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE)),
+            float(strategy_config.get("exact_early_yes_max_price", STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE)),
+        )
     return STRATEGY_V1_EARLY_YES_MIN_PRICE, STRATEGY_V1_EARLY_YES_MAX_PRICE
 
 
 def _strategy_v1_mid_yes_thresholds(bucket) -> tuple:
     if _is_exact_bucket(bucket):
+        strategy_config = get_active_strategy_config()
         return (
-            STRATEGY_V1_EXACT_MID_YES_MIN_PRICE,
-            STRATEGY_V1_EXACT_MID_YES_MAX_PRICE,
+            float(strategy_config.get("exact_yes_min_price", STRATEGY_V1_EXACT_MID_YES_MIN_PRICE)),
+            float(strategy_config.get("exact_mid_yes_max_price", STRATEGY_V1_EXACT_MID_YES_MAX_PRICE)),
             STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
         )
     return STRATEGY_V1_MID_YES_MIN_PRICE, STRATEGY_V1_MID_YES_MAX_PRICE, STRATEGY_V1_MID_YES_MIN_EDGE
+
+
+def _is_celsius_unit(unit_label: str) -> bool:
+    return str(unit_label or "").upper() in {"°C", "C"}
 
 
 def _strategy_v1_yes_entry_relations(bucket, unit_label: str) -> set:
     strategy_config = get_active_strategy_config()
     if (
         strategy_config.get("strict_celsius_exact_buckets")
-        and str(unit_label or "").upper() == "°C"
+        and _is_celsius_unit(unit_label)
     ):
         return {"central"}
     return {"adjacent_lower", "central", "adjacent_upper"}
 
 
-def _strategy_v1_yes_candidate_allowed(item: dict, unit_label: str) -> bool:
+def _strategy_v1_yes_candidate_allowed(item: dict, unit_label: str, forecast_temp: float = None) -> bool:
     bucket = item.get("bucket")
     strategy_config = get_active_strategy_config()
     if (
         strategy_config.get("strict_celsius_exact_buckets")
-        and str(unit_label or "").upper() == "°C"
-        and not _is_exact_bucket(bucket)
+        and _is_celsius_unit(unit_label)
     ):
-        return False
+        if not _is_exact_bucket(bucket):
+            return False
+        if forecast_temp is not None:
+            try:
+                bucket_midpoint = (float(bucket.low) + float(bucket.high)) / 2.0
+                if abs(bucket_midpoint - float(forecast_temp)) > 0.001:
+                    return False
+            except (TypeError, ValueError):
+                return False
     return item.get("entry_bucket_relation") in _strategy_v1_yes_entry_relations(bucket, unit_label)
 
 
@@ -1053,7 +1075,7 @@ def select_strategy_v1_event_trade(
         central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
         early_candidates = [
             item for item in ranked_candidates
-            if _strategy_v1_yes_candidate_allowed(item, unit_label)
+            if _strategy_v1_yes_candidate_allowed(item, unit_label, float(forecast.predicted_value))
             and item["yes_price"] <= STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE
         ]
         if not central_candidates:
@@ -1234,7 +1256,7 @@ def select_strategy_v1_event_trade(
     if regime_mode == "mid":
         near_forecast_candidates = [
             item for item in ranked_candidates
-            if _strategy_v1_yes_candidate_allowed(item, unit_label)
+            if _strategy_v1_yes_candidate_allowed(item, unit_label, float(forecast.predicted_value))
             and _bucket_distance_to_forecast(item["bucket"], float(forecast.predicted_value)) <= 1.0
         ]
         eligible = []
@@ -2463,23 +2485,51 @@ def resolve_strategy_forecast(
 ) -> tuple[Optional[Forecast], Optional[str]]:
     strategy_config = get_active_strategy_config()
     mode = strategy_config.get("forecast_mode", "primary")
-    if mode == "primary":
+    requires_wunderground_agreement = bool(strategy_config.get("require_wunderground_agreement"))
+    if mode == "primary" and not requires_wunderground_agreement:
         return primary_forecast, None
 
     wunderground = get_forecast_provider().get_wunderground_forecast(location, date_str, metric)
     if wunderground is None:
-        return None, "wunderground_forecast_unavailable"
+        return None, (
+            "wunderground_agreement_unavailable"
+            if requires_wunderground_agreement
+            else "wunderground_forecast_unavailable"
+        )
+
+    primary_value = float(primary_forecast.predicted_value)
+    threshold = float(strategy_config.get("agreement_threshold", 2.0))
+    if requires_wunderground_agreement:
+        diff = abs(primary_value - float(wunderground.predicted_value))
+        if diff > threshold:
+            if logger is not None:
+                logger.event(
+                    "strategy_forecast_disagreement",
+                    strategy_id=ACTIVE_STRATEGY_ID,
+                    location=location,
+                    target_date=date_str,
+                    metric=metric,
+                    primary_forecast=round(primary_value, 4),
+                    wunderground_forecast=wunderground.predicted_value,
+                    diff=round(diff, 4),
+                    threshold=threshold,
+                )
+            return None, "forecast_sources_disagree"
+        return clone_forecast(
+            primary_forecast,
+            predicted_value=primary_value,
+            source=primary_forecast.source,
+            metadata_note=f"wunderground_agreement_diff_{diff:.2f}",
+        ), None
 
     if mode == "wunderground":
         return wunderground, None
 
-    primary_value = float(primary_forecast.predicted_value)
     bias = float(FORECAST_BIAS_BY_LOCATION.get(location, 0.0))
     if mode == "ensemble_bias_corrected":
         primary_value = primary_value - bias
 
     diff = abs(primary_value - float(wunderground.predicted_value))
-    threshold = float(strategy_config.get("agreement_threshold", 2.0))
     if diff >= threshold:
         if logger is not None:
             logger.event(
