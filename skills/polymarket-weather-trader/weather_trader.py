@@ -189,6 +189,10 @@ ACTIVE_STRATEGY_ID = BASELINE_STRATEGY_ID
 LOW_RISK_STRATEGY_CITIES = {
     "Atlanta", "Houston", "Miami", "Moscow", "Munich", "Los Angeles", "Taipei"
 }
+WATCHLIST_STRATEGY_CITIES = {
+    "Munich", "Ankara", "Tel Aviv", "Atlanta", "Chicago", "Miami",
+    "Wellington", "Lucknow", "Busan", "Panama City", "Paris", "Milan",
+}
 STRATEGY_VARIANTS = {
     "baseline": {
         "label": "Baseline",
@@ -199,6 +203,7 @@ STRATEGY_VARIANTS = {
         "label": "Early Stop 20%",
         "forecast_mode": "primary",
         "early_yes_stop_loss_pct": 0.20,
+        "shadow_only": True,
     },
     "no_reentry_after_stop": {
         "label": "No Reentry After Stop",
@@ -208,21 +213,26 @@ STRATEGY_VARIANTS = {
     "wunderground_only": {
         "label": "Wunderground Only",
         "forecast_mode": "wunderground",
+        "suite_entries_enabled": False,
+        "disabled_reason": "negative_realized_pnl",
     },
     "wunderground_reverse": {
         "label": "Wunderground Reverse",
         "forecast_mode": "wunderground",
         "reverse_trade_side": True,
+        "shadow_only": True,
     },
     "ensemble_agreement": {
         "label": "Ensemble Agreement",
         "forecast_mode": "ensemble_agreement",
         "agreement_threshold": 2.0,
+        "shadow_only": True,
     },
     "ensemble_bias_corrected": {
         "label": "Ensemble Bias Corrected",
         "forecast_mode": "ensemble_bias_corrected",
         "agreement_threshold": 3.0,
+        "shadow_only": True,
     },
     "early_only": {
         "label": "Early Only",
@@ -233,11 +243,33 @@ STRATEGY_VARIANTS = {
         "label": "Low Risk Cities Only",
         "forecast_mode": "primary",
         "allowed_cities": LOW_RISK_STRATEGY_CITIES,
+        "max_position_usd": 20.0,
     },
     "no_early_stop": {
         "label": "No Early Stop",
         "forecast_mode": "primary",
         # Keep the normal take-profit path, but effectively disable early YES stop-outs.
+        "early_yes_stop_loss_pct": 1.00,
+    },
+    "watchlist_no_reentry": {
+        "label": "Watchlist No Reentry",
+        "forecast_mode": "primary",
+        "allowed_cities": WATCHLIST_STRATEGY_CITIES,
+        "allowed_entry_bucket_relations": {"central", "adjacent_upper"},
+        "block_reentry_after_stop_loss": True,
+    },
+    "watchlist_early_central": {
+        "label": "Watchlist Early Central",
+        "forecast_mode": "primary",
+        "allowed_cities": WATCHLIST_STRATEGY_CITIES,
+        "allowed_regimes": {"early"},
+        "allowed_entry_bucket_relations": {"central"},
+    },
+    "watchlist_no_early_stop": {
+        "label": "Watchlist No Early Stop",
+        "forecast_mode": "primary",
+        "allowed_cities": WATCHLIST_STRATEGY_CITIES,
+        "allowed_entry_bucket_relations": {"central", "adjacent_upper"},
         "early_yes_stop_loss_pct": 1.00,
     },
     "celsius_exact_direct": {
@@ -250,12 +282,17 @@ STRATEGY_VARIANTS = {
         "require_wunderground_agreement": True,
         "agreement_threshold": 1.0,
         "strict_celsius_exact_buckets": True,
+        "shadow_only": True,
     },
 }
 
 
 def get_active_strategy_config() -> dict:
     return STRATEGY_VARIANTS.get(ACTIVE_STRATEGY_ID, STRATEGY_VARIANTS[BASELINE_STRATEGY_ID])
+
+
+def strategy_suite_entries_enabled(strategy_id: str) -> bool:
+    return bool(STRATEGY_VARIANTS.get(strategy_id, {}).get("suite_entries_enabled", True))
 
 
 def set_active_strategy(strategy_id: str) -> None:
@@ -466,6 +503,9 @@ def _strategy_v1_yes_entry_relations(bucket, unit_label: str) -> set:
         and _is_celsius_unit(unit_label)
     ):
         return {"central"}
+    allowed_relations = strategy_config.get("allowed_entry_bucket_relations")
+    if allowed_relations:
+        return set(allowed_relations)
     return {"adjacent_lower", "central", "adjacent_upper"}
 
 
@@ -2266,7 +2306,7 @@ def calculate_position_size(default_size: float, smart_sizing: bool) -> float:
         return default_size
 
     smart_size = balance * SMART_SIZING_PCT
-    smart_size = min(smart_size, MAX_POSITION_USD)
+    smart_size = min(smart_size, default_size)
     smart_size = max(smart_size, 1.0)
 
     print(f"  💡 Smart sizing: ${smart_size:.2f} ({SMART_SIZING_PCT:.0%} of ${balance:.2f} balance)")
@@ -2274,6 +2314,12 @@ def calculate_position_size(default_size: float, smart_sizing: bool) -> float:
 
 
 def get_max_position_usd_for_mode(execution_mode: ExecutionMode) -> float:
+    strategy_max_position = get_active_strategy_config().get("max_position_usd")
+    if strategy_max_position is not None:
+        strategy_max_position = float(strategy_max_position)
+        if execution_mode == ExecutionMode.LIVE_ENABLED:
+            return min(strategy_max_position, LIVE_MAX_POSITION_USD)
+        return strategy_max_position
     if execution_mode == ExecutionMode.LIVE_ENABLED:
         return LIVE_MAX_POSITION_USD
     return MAX_POSITION_USD
@@ -3920,6 +3966,15 @@ def run_strategy_suite(args):
         print("\n" + "=" * 72)
         print(f"🧪 Strategy suite: {strategy_id} ({variant.get('label', strategy_id)})")
         print(f"   state: {get_strategy_state_dir(strategy_id) / 'state.json'}")
+        if not strategy_suite_entries_enabled(strategy_id):
+            print(f"   new entries: disabled ({variant.get('disabled_reason', 'disabled')}); running exits only")
+            run_paper_exit_check_cycle(
+                dry_run=False,
+                use_safeguards=not args.no_safeguards,
+                quiet=args.quiet,
+            )
+            print(f"✅ Strategy suite exits completed: {strategy_id}")
+            continue
         run_weather_strategy(
             dry_run=False,
             positions_only=args.positions,

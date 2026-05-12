@@ -83,11 +83,12 @@ STAT_ICONS = {
     "Unrealized": "◉",
 }
 
-VIEW_ORDER = ("old", "new", "all")
+VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
     "old": "OLD CITIES",
     "new": "NEW CITIES",
     "all": "ALL CITIES",
+    "watchlist": "WATCHLIST",
 }
 
 STRATEGY_ORDER = (
@@ -100,10 +101,13 @@ STRATEGY_ORDER = (
     "early_only",
     "low_risk_cities_only",
     "no_early_stop",
+    "watchlist_no_reentry",
+    "watchlist_early_central",
+    "watchlist_no_early_stop",
     "wunderground_reverse",
     "celsius_exact_direct",
 )
-STRATEGY_KEYS = dict(zip("abcdefghijk", STRATEGY_ORDER))
+STRATEGY_KEYS = dict(zip("abcdefghijklmn", STRATEGY_ORDER))
 STRATEGY_LABELS = {
     "baseline": "BASELINE",
     "stop20_early": "STOP20 EARLY",
@@ -114,6 +118,9 @@ STRATEGY_LABELS = {
     "early_only": "EARLY ONLY",
     "low_risk_cities_only": "LOW RISK",
     "no_early_stop": "NO EARLY STOP",
+    "watchlist_no_reentry": "WL NO RE",
+    "watchlist_early_central": "WL EARLY",
+    "watchlist_no_early_stop": "WL NO ESTOP",
     "wunderground_reverse": "WU REVERSE",
     "celsius_exact_direct": "C EXACT",
     "compare": "COMPARE ALL",
@@ -174,6 +181,21 @@ NEW_CITY_ALIASES = {
     "Toronto": ("toronto",),
     "Warsaw": ("warsaw",),
     "Wuhan": ("wuhan",),
+}
+
+WATCHLIST_CITY_ALIASES = {
+    "Munich": OLD_CITY_ALIASES["Munich"],
+    "Ankara": OLD_CITY_ALIASES["Ankara"],
+    "Tel Aviv": OLD_CITY_ALIASES["Tel Aviv"],
+    "Atlanta": OLD_CITY_ALIASES["Atlanta"],
+    "Chicago": OLD_CITY_ALIASES["Chicago"],
+    "Miami": OLD_CITY_ALIASES["Miami"],
+    "Wellington": OLD_CITY_ALIASES["Wellington"],
+    "Lucknow": OLD_CITY_ALIASES["Lucknow"],
+    "Busan": NEW_CITY_ALIASES["Busan"],
+    "Panama City": NEW_CITY_ALIASES["Panama City"],
+    "Paris": NEW_CITY_ALIASES["Paris"],
+    "Milan": NEW_CITY_ALIASES["Milan"],
 }
 
 
@@ -514,6 +536,14 @@ def _contains_city_alias(text, alias):
     return re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", text) is not None
 
 
+def question_matches_aliases(question, aliases_by_city):
+    text = market_name(question).lower()
+    for aliases in aliases_by_city.values():
+        if any(_contains_city_alias(text, alias) for alias in aliases):
+            return True
+    return False
+
+
 def city_group_for_question(question):
     text = market_name(question).lower()
     for aliases in OLD_CITY_ALIASES.values():
@@ -533,12 +563,17 @@ def filter_by_view(items, view):
     items = vals(items)
     if view == "all":
         return items
+    if view == "watchlist":
+        return [
+            item for item in items
+            if question_matches_aliases(item.get("question") or item.get("market_id") or "", WATCHLIST_CITY_ALIASES)
+        ]
     return [item for item in items if item_city_group(item) == view]
 
 
 def build_view_tabs(active_view, active_strategy):
     text = Text()
-    for key, view in zip(("1", "2", "3"), VIEW_ORDER):
+    for key, view in zip(("1", "2", "3", "4"), VIEW_ORDER):
         selected = view == active_view
         label = f" {key} {VIEW_LABELS[view]} "
         text.append(label, style=("black on #66ff7a" if selected else "bold #66e3ff"))
@@ -931,6 +966,8 @@ def apply_key(key, active_view, active_strategy, active_lookback_hours):
         return "new", active_strategy, active_lookback_hours, False
     if key == "3":
         return "all", active_strategy, active_lookback_hours, False
+    if key == "4":
+        return "watchlist", active_strategy, active_lookback_hours, False
     if key in STRATEGY_KEYS:
         return active_view, STRATEGY_KEYS[key], active_lookback_hours, False
     if key and key.lower() == "t":
