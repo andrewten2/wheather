@@ -101,6 +101,7 @@ def refresh_outcome_cache(
     cache_path: Path,
     refresh_resolved: bool = False,
     refresh_unresolved: bool = True,
+    progress_every: int = 25,
 ) -> Dict[str, Any]:
     from simmer_sdk import SimmerClient
 
@@ -114,11 +115,14 @@ def refresh_outcome_cache(
         live=True,
     )
     cache: Dict[str, Any] = load_json(cache_path, {})
+    unique_market_ids = sorted(set(market_ids))
+    total_count = len(unique_market_ids)
     total = 0
     fetched = 0
     errors = 0
+    skipped = 0
 
-    for market_id in sorted(set(market_ids)):
+    for market_id in unique_market_ids:
         total += 1
         cached = cache.get(market_id)
         cached_outcome = cached.get("outcome") if isinstance(cached, dict) else None
@@ -130,8 +134,16 @@ def refresh_outcome_cache(
             or (refresh_unresolved and not is_resolved)
         )
         if not should_fetch:
+            skipped += 1
+            if progress_every > 0 and total % progress_every == 0:
+                print(
+                    f"progress {total}/{total_count}: fetched={fetched} "
+                    f"errors={errors} cached_skip={skipped}"
+                )
             continue
         try:
+            if progress_every > 0 and (fetched + errors) % progress_every == 0:
+                print(f"fetching {total}/{total_count}: {market_id}")
             response = client._request("GET", f"/api/sdk/markets/{market_id}")
             cache[market_id] = outcome_cache_entry(market_id, response)
             fetched += 1
@@ -143,6 +155,11 @@ def refresh_outcome_cache(
                 "outcome": cached_outcome,
             }
             errors += 1
+        if progress_every > 0 and total % progress_every == 0:
+            print(
+                f"progress {total}/{total_count}: fetched={fetched} "
+                f"errors={errors} cached_skip={skipped}"
+            )
 
     write_json(cache_path, cache)
     print(f"outcome_cache={cache_path}")
@@ -275,6 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-refresh-unresolved", action="store_true", help="Do not refetch cached unresolved markets")
     parser.add_argument("--refresh-resolved", action="store_true", help="Refetch markets that already have true/false outcome")
     parser.add_argument("--details-limit", type=int, default=25)
+    parser.add_argument("--progress-every", type=int, default=25, help="Print API fetch progress every N markets; 0 disables")
     return parser.parse_args()
 
 
@@ -286,6 +304,7 @@ def main() -> None:
         cache_path=args.outcome_cache,
         refresh_resolved=args.refresh_resolved,
         refresh_unresolved=not args.no_refresh_unresolved,
+        progress_every=args.progress_every,
     )
     if not args.cache_only:
         analyze_take_profit(args.paper_root, outcome_cache, details_limit=args.details_limit)
