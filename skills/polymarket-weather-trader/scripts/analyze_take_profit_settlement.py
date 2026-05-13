@@ -116,9 +116,10 @@ def bulk_refresh_outcomes(
     request_timeout: int,
     limit: int,
 ) -> int:
-    statuses = ["resolved", "closed", "all", "active"]
-    queries = [None, "temperature", "highest temperature", "weather"]
+    statuses = ["resolved", "active"]
+    queries = [None, "highest temperature", "temperature"]
     found = 0
+    found_ids: set[str] = set()
     seen_request_keys: set[tuple] = set()
 
     for status in statuses:
@@ -159,10 +160,12 @@ def bulk_refresh_outcomes(
                 if not market_id or market_id not in target_market_ids:
                     continue
                 cache[market_id] = market_cache_entry(market)
-                matched += 1
-            found += matched
+                if market_id not in found_ids:
+                    matched += 1
+                    found_ids.add(market_id)
+            found = len(found_ids)
             print(
-                f"bulk result params={params}: returned={len(markets)} matched={matched} total_matched={found}",
+                f"bulk result params={params}: returned={len(markets)} new_matched={matched} total_unique_matched={found}",
                 flush=True,
             )
     return found
@@ -178,6 +181,14 @@ def refresh_outcome_cache(
     bulk_first: bool = True,
     bulk_limit: int = 1000,
 ) -> Dict[str, Any]:
+    cache: Dict[str, Any] = load_json(cache_path, {})
+    unique_market_ids = sorted(set(market_ids))
+
+    if not bulk_first and not refresh_resolved and not refresh_unresolved:
+        print(f"outcome_cache={cache_path}")
+        print(f"markets_total={len(unique_market_ids)} fetched=0 errors=0 cached={len(cache)} api_skipped=true")
+        return cache
+
     from simmer_sdk import SimmerClient
 
     api_key = os.environ.get("SIMMER_API_KEY")
@@ -186,11 +197,9 @@ def refresh_outcome_cache(
 
     client = SimmerClient(
         api_key=api_key,
-        venue=os.environ.get("TRADING_VENUE", "polymarket"),
+        venue=os.environ.get("TRADING_VENUE") or "polymarket",
         live=True,
     )
-    cache: Dict[str, Any] = load_json(cache_path, {})
-    unique_market_ids = sorted(set(market_ids))
     if bulk_first:
         bulk_refresh_outcomes(
             client=client,
@@ -283,6 +292,7 @@ def evaluate_take_profit_sell(sell: Dict[str, Any], outcome: Optional[bool]) -> 
         }
     side = str(sell.get("side") or "").lower()
     shares = float(sell.get("filled_shares") or 0.0)
+    actual_exit_price = float(sell.get("simulated_fill_price") or 0.0)
     avg_cost = sell_avg_cost(sell)
     if side not in {"yes", "no"} or shares <= 0 or avg_cost is None:
         return {"status": "invalid", "closed_pnl": float(sell.get("realized_pnl") or 0.0)}
@@ -297,11 +307,85 @@ def evaluate_take_profit_sell(sell: Dict[str, Any], outcome: Optional[bool]) -> 
         "hold_pnl": hold_pnl,
         "diff": hold_pnl - closed_pnl,
         "avg_cost": avg_cost,
+        "actual_exit_price": actual_exit_price,
+        "shares": shares,
         "settlement_price": settlement_price,
     }
 
 
-def analyze_take_profit(paper_root: Path, outcome_cache: Dict[str, Any], details_limit: int) -> None:
+def parse_tp_grid(value: str) -> list[float]:
+    grid: list[float] = []
+    for raw in value.split(","):
+        raw = raw.strip().rstrip("%")
+        if not raw:
+            continue
+        grid.append(float(raw))
+    return sorted(set(grid))
+
+
+def simulated_tp_pnl(row: Dict[str, Any], take_profit_pct: float) -> float:
+    avg_cost = float(row["avg_cost"])
+    shares = float(row["shares"])
+    actual_exit_price = float(row["actual_exit_price"])
+    target_price = min(1.0, avg_cost * (1.0 + take_profit_pct / 100.0))
+
+    if row["side_won"]:
+        return shares * (target_price - avg_cost)
+
+    # If the original take-profit exit reached this target, assume this target
+    # would also have filled. Otherwise the position would have settled to zero.
+    if actual_exit_price + 1e-9 >= target_price:
+        return shares * (target_price - avg_cost)
+    return shares * (0.0 - avg_cost)
+
+
+def print_take_profit_grid(rows: list[Dict[str, Any]], tp_grid: list[float]) -> None:
+    if not rows or not tp_grid:
+        return
+
+    print("\n=== TAKE PROFIT THRESHOLD SIMULATION ===")
+    print(
+        "Assumption: if original exit price reached a TP target, it would fill there; "
+        "if not, winning positions can still reach target by settlement, losing positions go to zero."
+    )
+    print("scope\tthreshold\tresolved\tclosed_actual\tsimulated_pnl\tdiff_vs_actual")
+
+    scopes: Dict[str, list[Dict[str, Any]]] = {"ALL": rows}
+    for row in rows:
+        scopes.setdefault(str(row["strategy"]), []).append(row)
+
+    for scope, scope_rows in sorted(scopes.items(), key=lambda item: (item[0] != "ALL", item[0])):
+        actual = sum(float(row["closed_pnl"]) for row in scope_rows)
+        hold = sum(float(row["hold_pnl"]) for row in scope_rows)
+        best_label = "HOLD"
+        best_pnl = hold
+
+        for take_profit_pct in tp_grid:
+            simulated = sum(simulated_tp_pnl(row, take_profit_pct) for row in scope_rows)
+            if simulated > best_pnl:
+                best_label = f"TP{take_profit_pct:g}%"
+                best_pnl = simulated
+            print(
+                f"{scope}\tTP{take_profit_pct:g}%\t{len(scope_rows)}\t"
+                f"{actual:.2f}\t{simulated:.2f}\t{simulated - actual:.2f}"
+            )
+
+        print(
+            f"{scope}\tHOLD\t{len(scope_rows)}\t"
+            f"{actual:.2f}\t{hold:.2f}\t{hold - actual:.2f}"
+        )
+        print(
+            f"{scope}\tBEST={best_label}\t{len(scope_rows)}\t"
+            f"{actual:.2f}\t{best_pnl:.2f}\t{best_pnl - actual:.2f}"
+        )
+
+
+def analyze_take_profit(
+    paper_root: Path,
+    outcome_cache: Dict[str, Any],
+    details_limit: int,
+    tp_grid: list[float],
+) -> None:
     rows = []
     for path in state_files(paper_root):
         state = load_json(path, {})
@@ -357,6 +441,7 @@ def analyze_take_profit(paper_root: Path, outcome_cache: Dict[str, Any], details
         f"\nALL_RESOLVED\tcount={len(resolved_all)}\twould_win={wins} "
         f"({wins / len(resolved_all) * 100:.1f}%)\tclosed={closed:.2f}\thold={hold:.2f}\tdiff={hold - closed:.2f}"
     )
+    print_take_profit_grid(resolved_all, tp_grid)
 
     print("\n=== MISSED UPSIDE: hold better than take-profit close ===")
     for row in sorted(resolved_all, key=lambda item: item["diff"], reverse=True)[:details_limit]:
@@ -387,8 +472,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outcome-cache", type=Path, default=default_cache)
     parser.add_argument("--cache-only", action="store_true", help="Fetch outcomes but skip analysis output")
     parser.add_argument("--no-refresh-unresolved", action="store_true", help="Do not refetch cached unresolved markets")
+    parser.add_argument(
+        "--single-fallback",
+        action="store_true",
+        help="Fetch missing/unresolved market ids one by one after bulk/cache. Uses more API quota.",
+    )
     parser.add_argument("--refresh-resolved", action="store_true", help="Refetch markets that already have true/false outcome")
     parser.add_argument("--details-limit", type=int, default=25)
+    parser.add_argument(
+        "--tp-grid",
+        default="20,30,40,50,60,80,100,150,200",
+        help="Comma-separated take-profit percentages to simulate, e.g. 20,40,60,100",
+    )
     parser.add_argument("--progress-every", type=int, default=25, help="Print API fetch progress every N markets; 0 disables")
     parser.add_argument("--request-timeout", type=int, default=10, help="Simmer market API timeout in seconds")
     parser.add_argument("--no-bulk", action="store_true", help="Skip bulk /api/sdk/markets pass and use per-market fallback only")
@@ -403,14 +498,19 @@ def main() -> None:
         market_ids=market_ids,
         cache_path=args.outcome_cache,
         refresh_resolved=args.refresh_resolved,
-        refresh_unresolved=not args.no_refresh_unresolved,
+        refresh_unresolved=args.single_fallback and not args.no_refresh_unresolved,
         progress_every=args.progress_every,
         request_timeout=args.request_timeout,
         bulk_first=not args.no_bulk,
         bulk_limit=args.bulk_limit,
     )
     if not args.cache_only:
-        analyze_take_profit(args.paper_root, outcome_cache, details_limit=args.details_limit)
+        analyze_take_profit(
+            args.paper_root,
+            outcome_cache,
+            details_limit=args.details_limit,
+            tp_grid=parse_tp_grid(args.tp_grid),
+        )
 
 
 if __name__ == "__main__":
