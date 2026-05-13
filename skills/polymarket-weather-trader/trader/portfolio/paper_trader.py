@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -41,16 +43,41 @@ class PaperTrader:
             "updated_at": now,
         }
 
+    def _backup_path(self) -> Path:
+        return self.state_path.with_name(f"{self.state_path.name}.bak")
+
+    def _load_json_file(self, path: Path) -> dict:
+        with path.open() as f:
+            return json.load(f)
+
     def _load_state(self) -> dict:
         if not self.state_path.exists():
             state = self._default_state()
             self._save_state(state)
             return state
         try:
-            with self.state_path.open() as f:
-                state = json.load(f)
-        except Exception:
-            state = self._default_state()
+            state = self._load_json_file(self.state_path)
+        except Exception as exc:
+            backup_path = self._backup_path()
+            if backup_path.exists():
+                try:
+                    state = self._load_json_file(backup_path)
+                except Exception:
+                    pass
+                else:
+                    if self.logger:
+                        self.logger.event(
+                            "paper_state_restored_from_backup",
+                            state_path=str(self.state_path),
+                            backup_path=str(backup_path),
+                        )
+                    return self._normalize_state(state)
+            raise RuntimeError(
+                f"Could not load paper state {self.state_path}; refusing to reset ledger"
+            ) from exc
+        return self._normalize_state(state)
+
+    def _normalize_state(self, state: dict) -> dict:
         state.setdefault("positions", {})
         state.setdefault("orders", [])
         state.setdefault("trades", [])
@@ -67,8 +94,14 @@ class PaperTrader:
         if state is not None:
             self.state = state
         self.state["updated_at"] = self._now()
-        with self.state_path.open("w") as f:
+        if self.state_path.exists() and self.state_path.stat().st_size > 0:
+            shutil.copy2(self.state_path, self._backup_path())
+        tmp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
+        with tmp_path.open("w") as f:
             json.dump(self.state, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(self.state_path)
 
     def _log_event(self, event: str, **fields) -> None:
         if self.logger:
@@ -168,6 +201,36 @@ class PaperTrader:
         position["unrealized_pnl"] = unrealized_pnl
         position["unrealized_pnl_pct"] = unrealized_pnl_pct
         position["updated_at"] = updated_at or self._now()
+        if current_price is not None:
+            observed_at = position["updated_at"]
+            price = float(current_price)
+            position["price_observation_count"] = int(position.get("price_observation_count", 0) or 0) + 1
+            position["last_price_observed_at"] = observed_at
+            if position.get("max_price_after_entry") is None or price > float(position.get("max_price_after_entry") or 0.0):
+                position["max_price_after_entry"] = price
+                position["max_price_observed_at"] = observed_at
+                position["max_unrealized_pnl"] = unrealized_pnl
+                position["max_unrealized_pnl_pct"] = unrealized_pnl_pct
+            if position.get("min_price_after_entry") is None or price < float(position.get("min_price_after_entry") or 1.0):
+                position["min_price_after_entry"] = price
+                position["min_price_observed_at"] = observed_at
+            history_limit = int(os.environ.get("WEATHER_PAPER_PRICE_HISTORY_LIMIT", "500"))
+            if history_limit > 0:
+                history = position.setdefault("price_history", [])
+                last_price = history[-1].get("price") if history else None
+                if last_price is None or abs(float(last_price) - price) > 1e-9:
+                    history.append(
+                        {
+                            "timestamp": observed_at,
+                            "price": round(price, 6),
+                            "unrealized_pnl": None if unrealized_pnl is None else round(float(unrealized_pnl), 6),
+                            "unrealized_pnl_pct": (
+                                None if unrealized_pnl_pct is None else round(float(unrealized_pnl_pct), 6)
+                            ),
+                        }
+                    )
+                    if len(history) > history_limit:
+                        del history[: len(history) - history_limit]
         self._save_state()
 
     def _get_market_price(self, adapter, market_id: str, side: str) -> Optional[float]:
@@ -347,6 +410,8 @@ class PaperTrader:
         entry_reason = signal_data.get("entry_reason")
         entry_bucket_relation = signal_data.get("entry_bucket_relation")
         exit_reason = signal_data.get("exit_reason")
+        partial_exit = bool(signal_data.get("partial_exit"))
+        runner_after_partial_exit = bool(signal_data.get("runner_after_partial_exit"))
         signal_forecast_fields = self._entry_forecast_fields(signal_data)
 
         price = market_price if market_price is not None else self._get_market_price(adapter, market_id, side)
@@ -381,6 +446,9 @@ class PaperTrader:
             "status": "filled",
             "strategy_id": self.strategy_id,
         }
+        if partial_exit:
+            order_entry["partial_exit"] = True
+            order_entry["runner_after_partial_exit"] = runner_after_partial_exit
         order_entry.update(signal_forecast_fields)
         self.state["orders"].append(order_entry)
         self._log_event(
@@ -507,6 +575,23 @@ class PaperTrader:
                 (position["unrealized_pnl"] / remaining_cost_basis)
                 if remaining_shares > 0 and remaining_cost_basis > 0 else None
             )
+            if partial_exit and remaining_shares > 0:
+                position["partial_take_profit_done"] = True
+                position["partial_take_profit_at"] = timestamp
+                position["partial_take_profit_price"] = price
+                position["partial_take_profit_shares"] = filled_shares
+                position["partial_take_profit_realized_pnl"] = realized_pnl
+                position["runner_after_partial_exit"] = runner_after_partial_exit
+                position.setdefault("partial_exits", []).append(
+                    {
+                        "timestamp": timestamp,
+                        "reason": exit_reason,
+                        "price": round(price, 6),
+                        "shares": round(filled_shares, 6),
+                        "realized_pnl": round(realized_pnl, 6),
+                        "remaining_shares": round(remaining_shares, 6),
+                    }
+                )
             self.state["cash_balance"] += proceeds
             self.state["realized_pnl"] += realized_pnl
             if remaining_shares == 0:
@@ -559,6 +644,9 @@ class PaperTrader:
             "strategy_id": self.strategy_id,
             "realized_pnl": round(realized_pnl, 6),
         }
+        if partial_exit:
+            trade_entry["partial_exit"] = True
+            trade_entry["runner_after_partial_exit"] = runner_after_partial_exit
         trade_entry.update(signal_forecast_fields or self._entry_forecast_fields(position))
         self.state["trades"].append(trade_entry)
         self._save_state()

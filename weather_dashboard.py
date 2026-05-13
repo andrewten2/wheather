@@ -91,6 +91,19 @@ VIEW_LABELS = {
     "watchlist": "WATCHLIST",
 }
 
+EXIT_MODE_ORDER = ("tp40", "tp40_runner")
+EXIT_MODE_KEYS = {
+    "5": "tp40",
+    "6": "tp40_runner",
+}
+EXIT_MODE_LABELS = {
+    "tp40": "TP40",
+    "tp40_runner": "TP40+RUNNER",
+}
+EXIT_MODE_STRATEGY_MAP = {
+    ("baseline", "tp40_runner"): "tp40_runner",
+}
+
 STRATEGY_ORDER = (
     "baseline",
     "stop20_early",
@@ -115,6 +128,7 @@ STRATEGY_LABELS = {
     "watchlist_early_central": "WL EARLY",
     "watchlist_no_early_stop": "WL NO ESTOP",
     "celsius_exact_direct": "C EXACT",
+    "tp40_runner": "TP40 RUNNER",
     "compare": "COMPARE ALL",
 }
 
@@ -195,6 +209,23 @@ def state_path_for_strategy(strategy):
     if strategy == "baseline":
         return STATE
     return STATE_ROOT / "strategies" / strategy / "state.json"
+
+
+def effective_strategy(active_strategy, active_exit_mode="tp40"):
+    if active_strategy == "compare":
+        return active_strategy
+    return EXIT_MODE_STRATEGY_MAP.get((active_strategy, active_exit_mode), active_strategy)
+
+
+def display_strategy_label(active_strategy, active_exit_mode="tp40"):
+    base = STRATEGY_LABELS.get(active_strategy, active_strategy)
+    mode = EXIT_MODE_LABELS.get(active_exit_mode, active_exit_mode)
+    if active_exit_mode == "tp40":
+        return base
+    mapped = effective_strategy(active_strategy, active_exit_mode)
+    if mapped == active_strategy:
+        return f"{base} / {mode} N/A"
+    return f"{base} / {mode}"
 
 
 def load_state(strategy="baseline"):
@@ -563,12 +594,18 @@ def filter_by_view(items, view):
     return [item for item in items if item_city_group(item) == view]
 
 
-def build_view_tabs(active_view, active_strategy):
+def build_view_tabs(active_view, active_strategy, active_exit_mode="tp40"):
     text = Text()
     for key, view in zip(("1", "2", "3", "4"), VIEW_ORDER):
         selected = view == active_view
         label = f" {key} {VIEW_LABELS[view]} "
         text.append(label, style=("black on #66ff7a" if selected else "bold #66e3ff"))
+        text.append(" ")
+    text.append("  ")
+    for key, exit_mode in EXIT_MODE_KEYS.items():
+        selected = exit_mode == active_exit_mode
+        label = f" {key} {EXIT_MODE_LABELS[exit_mode]} "
+        text.append(label, style=("black on #66e3ff" if selected else "bold #66e3ff"))
         text.append(" ")
     text.append("  ")
     for key, strategy in STRATEGY_KEYS.items():
@@ -702,10 +739,18 @@ def lookback_label(hours=DEFAULT_TRADE_LOOKBACK_HOURS):
     return f"{hours:g}H"
 
 
-def build_header(summary, frame, active_view, active_strategy, active_lookback_hours=DEFAULT_TRADE_LOOKBACK_HOURS, trades_for_stats=None):
+def build_header(
+    summary,
+    frame,
+    active_view,
+    active_strategy,
+    active_lookback_hours=DEFAULT_TRADE_LOOKBACK_HOURS,
+    trades_for_stats=None,
+    active_exit_mode="tp40",
+):
     now = datetime.now(DISPLAY_TZ).strftime(f"%H:%M:%S {DISPLAY_TZ_LABEL}")
     pulse = "●" if frame % 2 == 0 else "•"
-    state = load_state(active_strategy if active_strategy != "compare" else "baseline")
+    state = load_state(effective_strategy(active_strategy, active_exit_mode) if active_strategy != "compare" else "baseline")
     heartbeat = sparkline(closed_pnl_values(trades_for_stats if trades_for_stats is not None else state.get("trades") or []), width=22)
     grid = Table.grid(expand=True)
     grid.add_column(ratio=3)
@@ -723,7 +768,7 @@ def build_header(summary, frame, active_view, active_strategy, active_lookback_h
             (" LIVE  ", "bold white"),
             (VIEW_LABELS.get(active_view, "ALL CITIES"), "bold #ffd166"),
             (" / ", "dim"),
-            (STRATEGY_LABELS.get(active_strategy, active_strategy).upper(), "bold #ff9f43"),
+            (display_strategy_label(active_strategy, active_exit_mode).upper(), "bold #ff9f43"),
             (" / ", "dim"),
             (f"{lookback_label(active_lookback_hours)} CLOSED", "bold #66e3ff"),
         ),
@@ -736,7 +781,11 @@ def build_header(summary, frame, active_view, active_strategy, active_lookback_h
     )
     lookback_hint = "24H" if not active_lookback_hours or active_lookback_hours <= 0 else "ALL"
     return Panel(
-        Group(grid, build_view_tabs(active_view, active_strategy), Text(f" t {lookback_hint} CLOSED ", style="bold #66e3ff")),
+        Group(
+            grid,
+            build_view_tabs(active_view, active_strategy, active_exit_mode),
+            Text(f" t {lookback_hint} CLOSED ", style="bold #66e3ff"),
+        ),
         border_style="#2277aa",
         box=box.ROUNDED,
         style="on #061019",
@@ -884,8 +933,15 @@ def build_closed_panel(trades, forecast_history=None, active_lookback_hours=DEFA
     )
 
 
-def build_compare_panel(active_view, active_lookback_hours=DEFAULT_TRADE_LOOKBACK_HOURS):
-    table = Table(title=f"STRATEGY COMPARISON / {VIEW_LABELS.get(active_view, active_view)}", expand=True, box=box.SIMPLE)
+def build_compare_panel(active_view, active_lookback_hours=DEFAULT_TRADE_LOOKBACK_HOURS, active_exit_mode="tp40"):
+    table = Table(
+        title=(
+            f"STRATEGY COMPARISON / {VIEW_LABELS.get(active_view, active_view)}"
+            f" / {EXIT_MODE_LABELS.get(active_exit_mode, active_exit_mode)}"
+        ),
+        expand=True,
+        box=box.SIMPLE,
+    )
     table.add_column("Key", width=4)
     table.add_column("Strategy", overflow="fold")
     table.add_column("Open", justify="right", width=7)
@@ -895,7 +951,10 @@ def build_compare_panel(active_view, active_lookback_hours=DEFAULT_TRADE_LOOKBAC
     table.add_column("Realized", justify="right", width=10)
     table.add_column("Unrealized", justify="right", width=10)
     table.add_column("Winrate", justify="right", width=9)
-    for key, strategy in STRATEGY_KEYS.items():
+    rows = list(STRATEGY_KEYS.items())
+    if active_exit_mode == "tp40_runner":
+        rows.append(("6", "tp40_runner"))
+    for key, strategy in rows:
         state = load_state(strategy)
         positions = filter_by_view(state.get("positions"), active_view)
         trades = filter_recent_trades(filter_by_view(state.get("trades") or [], active_view), active_lookback_hours)
@@ -914,7 +973,13 @@ def build_compare_panel(active_view, active_lookback_hours=DEFAULT_TRADE_LOOKBAC
     return Panel(table, border_style="#ff9f43", box=box.ROUNDED, style="on #080d18")
 
 
-def build(frame=0, active_view="old", active_strategy="baseline", active_lookback_hours=DEFAULT_TRADE_LOOKBACK_HOURS):
+def build(
+    frame=0,
+    active_view="old",
+    active_strategy="baseline",
+    active_lookback_hours=DEFAULT_TRADE_LOOKBACK_HOURS,
+    active_exit_mode="tp40",
+):
     if active_strategy == "compare":
         state = {"positions": {}, "trades": []}
         positions = []
@@ -925,11 +990,13 @@ def build(frame=0, active_view="old", active_strategy="baseline", active_lookbac
             Layout(name="header", size=5),
             Layout(name="compare", ratio=1),
         )
-        layout["header"].update(build_header(summary, frame, active_view, active_strategy, active_lookback_hours))
-        layout["compare"].update(build_compare_panel(active_view, active_lookback_hours))
+        layout["header"].update(
+            build_header(summary, frame, active_view, active_strategy, active_lookback_hours, active_exit_mode=active_exit_mode)
+        )
+        layout["compare"].update(build_compare_panel(active_view, active_lookback_hours, active_exit_mode))
         return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
 
-    state = load_state(active_strategy)
+    state = load_state(effective_strategy(active_strategy, active_exit_mode))
     positions = filter_by_view(state.get("positions"), active_view)
     all_trades = filter_by_view(state.get("trades") or [], active_view)
     trades = filter_recent_trades(all_trades, active_lookback_hours)
@@ -944,36 +1011,40 @@ def build(frame=0, active_view="old", active_strategy="baseline", active_lookbac
     )
     layout["main"].split_row(Layout(name="left", ratio=1), Layout(name="open", ratio=4))
 
-    layout["header"].update(build_header(summary, frame, active_view, active_strategy, active_lookback_hours, trades))
+    layout["header"].update(
+        build_header(summary, frame, active_view, active_strategy, active_lookback_hours, trades, active_exit_mode)
+    )
     layout["left"].update(build_stats_panel(positions, trades, summary))
     layout["open"].update(build_open_panel(positions, frame, active_strategy, forecast_history))
     layout["closed"].update(build_closed_panel(trades, forecast_history, active_lookback_hours))
     return Panel(layout, border_style="#225588", box=box.ROUNDED, style="on #02060d")
 
 
-def apply_key(key, active_view, active_strategy, active_lookback_hours):
+def apply_key(key, active_view, active_strategy, active_lookback_hours, active_exit_mode):
     if key == "1":
-        return "old", active_strategy, active_lookback_hours, False
+        return "old", active_strategy, active_lookback_hours, active_exit_mode, False
     if key == "2":
-        return "new", active_strategy, active_lookback_hours, False
+        return "new", active_strategy, active_lookback_hours, active_exit_mode, False
     if key == "3":
-        return "all", active_strategy, active_lookback_hours, False
+        return "all", active_strategy, active_lookback_hours, active_exit_mode, False
     if key == "4":
-        return "watchlist", active_strategy, active_lookback_hours, False
+        return "watchlist", active_strategy, active_lookback_hours, active_exit_mode, False
+    if key in EXIT_MODE_KEYS:
+        return active_view, active_strategy, active_lookback_hours, EXIT_MODE_KEYS[key], False
     if key in STRATEGY_KEYS:
-        return active_view, STRATEGY_KEYS[key], active_lookback_hours, False
+        return active_view, STRATEGY_KEYS[key], active_lookback_hours, active_exit_mode, False
     if key and key.lower() == "t":
         next_lookback = (
             TOGGLE_TRADE_LOOKBACK_HOURS
             if not active_lookback_hours or active_lookback_hours <= 0
             else 0
         )
-        return active_view, active_strategy, next_lookback, False
+        return active_view, active_strategy, next_lookback, active_exit_mode, False
     if key and key.lower() == "x":
-        return active_view, "compare", active_lookback_hours, False
+        return active_view, "compare", active_lookback_hours, active_exit_mode, False
     if key and key.lower() == "q":
-        return active_view, active_strategy, active_lookback_hours, True
-    return active_view, active_strategy, active_lookback_hours, False
+        return active_view, active_strategy, active_lookback_hours, active_exit_mode, True
+    return active_view, active_strategy, active_lookback_hours, active_exit_mode, False
 
 
 def read_key(timeout):
@@ -994,6 +1065,9 @@ def run():
     active_strategy = os.environ.get("WEATHER_DASHBOARD_STRATEGY", "baseline").lower()
     if active_strategy not in STRATEGY_ORDER and active_strategy != "compare":
         active_strategy = "baseline"
+    active_exit_mode = os.environ.get("WEATHER_DASHBOARD_EXIT_MODE", "tp40").lower()
+    if active_exit_mode not in EXIT_MODE_ORDER:
+        active_exit_mode = "tp40"
     active_lookback_hours = DEFAULT_TRADE_LOOKBACK_HOURS
 
     old_tty = None
@@ -1003,27 +1077,49 @@ def run():
 
     try:
         with Live(
-            build(active_view=active_view, active_strategy=active_strategy, active_lookback_hours=active_lookback_hours),
+            build(
+                active_view=active_view,
+                active_strategy=active_strategy,
+                active_lookback_hours=active_lookback_hours,
+                active_exit_mode=active_exit_mode,
+            ),
             refresh_per_second=2,
             screen=True,
         ) as live:
             while True:
-                live.update(build(frame, active_view=active_view, active_strategy=active_strategy, active_lookback_hours=active_lookback_hours))
+                live.update(
+                    build(
+                        frame,
+                        active_view=active_view,
+                        active_strategy=active_strategy,
+                        active_lookback_hours=active_lookback_hours,
+                        active_exit_mode=active_exit_mode,
+                    )
+                )
                 frame += 1
 
                 deadline = time.time() + max(1, REFRESH_SECONDS)
                 while time.time() < deadline:
                     key = read_key(min(0.25, max(0.0, deadline - time.time())))
-                    active_view, active_strategy, active_lookback_hours, should_quit = apply_key(
+                    active_view, active_strategy, active_lookback_hours, active_exit_mode, should_quit = apply_key(
                         key,
                         active_view,
                         active_strategy,
                         active_lookback_hours,
+                        active_exit_mode,
                     )
                     if should_quit:
                         return
                     if key:
-                        live.update(build(frame, active_view=active_view, active_strategy=active_strategy, active_lookback_hours=active_lookback_hours))
+                        live.update(
+                            build(
+                                frame,
+                                active_view=active_view,
+                                active_strategy=active_strategy,
+                                active_lookback_hours=active_lookback_hours,
+                                active_exit_mode=active_exit_mode,
+                            )
+                        )
     finally:
         if old_tty is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)

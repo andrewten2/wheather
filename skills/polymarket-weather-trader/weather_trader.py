@@ -210,6 +210,13 @@ STRATEGY_VARIANTS = {
         "forecast_mode": "primary",
         "block_reentry_after_stop_loss": True,
     },
+    "tp40_runner": {
+        "label": "TP40 Half Runner",
+        "forecast_mode": "primary",
+        "partial_take_profit_enabled": True,
+        "partial_take_profit_fraction": 0.50,
+        "runner_exit_mode": "settlement",
+    },
     "wunderground_only": {
         "label": "Wunderground Only",
         "forecast_mode": "wunderground",
@@ -2360,6 +2367,19 @@ def get_exit_targets(
     return take_profit, stop_loss
 
 
+def get_runner_exit_mode() -> Optional[str]:
+    return get_active_strategy_config().get("runner_exit_mode")
+
+
+def should_hold_runner_to_settlement(position_state: Optional[dict]) -> bool:
+    if not position_state:
+        return False
+    return (
+        bool(position_state.get("runner_after_partial_exit"))
+        and str(get_runner_exit_mode() or "").lower() == "settlement"
+    )
+
+
 def is_placeholder_paper_exit_price(
     yes_price: Optional[float],
     no_price: Optional[float],
@@ -2966,14 +2986,24 @@ def check_exit_opportunities(
             execution_mode=execution_mode,
             entry_regime=entry_regime,
         )
+        strategy_config = get_active_strategy_config()
+        partial_tp_enabled = bool(strategy_config.get("partial_take_profit_enabled"))
+        partial_tp_fraction = float(strategy_config.get("partial_take_profit_fraction", 0.50) or 0.50)
+        partial_tp_done = bool(position_state.get("partial_take_profit_done")) if position_state else False
+        hold_runner_to_settlement = should_hold_runner_to_settlement(position_state)
         exit_reason = None
+        partial_exit = False
         ignored_edge_invalidated = False
         if settlement_info is not None:
             exit_reason = "market_settlement"
+        elif hold_runner_to_settlement:
+            exit_reason = None
         elif position_age_hours is not None and position_age_hours > MAX_POSITION_AGE_HOURS:
             exit_reason = "max_age_exit"
         elif current_price >= take_profit:
             exit_reason = "take_profit"
+            if execution_mode == ExecutionMode.PAPER and partial_tp_enabled and not partial_tp_done:
+                partial_exit = True
         elif current_price <= stop_loss:
             exit_reason = "stop_loss"
         else:
@@ -3001,6 +3031,8 @@ def check_exit_opportunities(
                 ),
                 settlement_bucket_won=settlement_info["bucket_won"] if settlement_info is not None else None,
                 exit_reason=exit_reason,
+                partial_exit=partial_exit,
+                runner_after_partial_exit=hold_runner_to_settlement,
             )
             if ignored_edge_invalidated:
                 logger.event(
@@ -3024,10 +3056,16 @@ def check_exit_opportunities(
 
         if exit_reason is not None:
             exits_found += 1
+            shares_to_sell = shares
+            if partial_exit:
+                shares_to_sell = max(0.0, shares * min(1.0, max(0.0, partial_tp_fraction)))
+                if shares_to_sell <= 0:
+                    continue
             print(f"  📤 {question}...")
+            exit_label = "take_profit_partial" if partial_exit else exit_reason
             print(
                 f"     {position_side.upper()} entry ${entry_price:.2f} -> current ${current_price:.2f} "
-                f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_reason}"
+                f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_label}"
             )
 
             # Check safeguards before selling
@@ -3057,17 +3095,26 @@ def check_exit_opportunities(
                     print(f"     ℹ️  Share count updated: {shares:.1f} → {fresh_shares:.1f}")
                     shares = fresh_shares
                 position_side = fresh_side
+                if partial_exit:
+                    shares_to_sell = max(0.0, shares * min(1.0, max(0.0, partial_tp_fraction)))
+                else:
+                    shares_to_sell = shares
 
             tag = "PAPER" if execution_mode == ExecutionMode.PAPER else ("SIMULATED" if dry_run else "LIVE")
             side_label = position_side.upper()
-            print(f"     Selling {side_label} {shares:.1f} shares ({tag})...")
+            print(f"     Selling {side_label} {shares_to_sell:.1f} shares ({tag})...")
             result = execute_sell(
                 market_id,
-                shares,
+                shares_to_sell,
                 side=position_side,
                 market_price=current_price,
                 market_question=stored_question,
-                signal_data={"exit_reason": exit_reason, "strategy_id": ACTIVE_STRATEGY_ID},
+                signal_data={
+                    "exit_reason": exit_reason,
+                    "strategy_id": ACTIVE_STRATEGY_ID,
+                    "partial_exit": partial_exit,
+                    "runner_after_partial_exit": partial_exit,
+                },
                 execution_mode=execution_mode,
             )
 
@@ -3076,7 +3123,7 @@ def check_exit_opportunities(
                 trade_id = result.get("trade_id")
                 print(
                     f"     ✅ {'[PAPER] ' if result.get('simulated') else ''}"
-                    f"Sold {position_side.upper()} {shares:.1f} shares @ ${current_price:.2f}"
+                    f"Sold {position_side.upper()} {shares_to_sell:.1f} shares @ ${current_price:.2f}"
                 )
                 if execution_mode == ExecutionMode.PAPER and logger is not None:
                     logger.event(
@@ -3088,6 +3135,8 @@ def check_exit_opportunities(
                         position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
                         realized_pnl=result.get("realized_pnl"),
                         reason_for_exit=exit_reason,
+                        partial_exit=partial_exit,
+                        runner_after_partial_exit=partial_exit,
                     )
 
                 # Log sell trade context for journal (skip for paper trades)
@@ -3107,10 +3156,16 @@ def check_exit_opportunities(
                 print(f"     ❌ Sell failed: {error}")
         else:
             print(f"  📊 {question}...")
-            print(
-                f"     {position_side.upper()} hold: entry ${entry_price:.2f}, current ${current_price:.2f}, "
-                f"tp ${take_profit:.2f}, sl ${stop_loss:.2f}"
-            )
+            if hold_runner_to_settlement:
+                print(
+                    f"     {position_side.upper()} runner hold to settlement: "
+                    f"entry ${entry_price:.2f}, current ${current_price:.2f}"
+                )
+            else:
+                print(
+                    f"     {position_side.upper()} hold: entry ${entry_price:.2f}, current ${current_price:.2f}, "
+                    f"tp ${take_profit:.2f}, sl ${stop_loss:.2f}"
+                )
 
     return exits_found, exits_executed
 
