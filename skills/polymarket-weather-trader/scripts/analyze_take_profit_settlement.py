@@ -85,6 +85,19 @@ def outcome_cache_entry(market_id: str, response: Any) -> Dict[str, Any]:
     }
 
 
+def market_cache_entry(market: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "market_id": market.get("id") or market.get("market_id"),
+        "fetched_at": utc_now(),
+        "outcome": extract_outcome(market),
+        "question": market.get("question") or market.get("event_name"),
+        "status": market.get("status"),
+        "closed": market.get("closed"),
+        "resolved": market.get("resolved"),
+        "raw_has_market_wrapper": False,
+    }
+
+
 def collect_market_ids(paper_root: Path) -> set[str]:
     market_ids: set[str] = set()
     for path in state_files(paper_root):
@@ -96,12 +109,74 @@ def collect_market_ids(paper_root: Path) -> set[str]:
     return market_ids
 
 
+def bulk_refresh_outcomes(
+    client: Any,
+    target_market_ids: set[str],
+    cache: Dict[str, Any],
+    request_timeout: int,
+    limit: int,
+) -> int:
+    statuses = ["resolved", "closed", "all", "active"]
+    queries = [None, "temperature", "highest temperature", "weather"]
+    found = 0
+    seen_request_keys: set[tuple] = set()
+
+    for status in statuses:
+        for query in queries:
+            params = {
+                "status": status,
+                "limit": limit,
+                "venue": os.environ.get("TRADING_VENUE", "polymarket") or "polymarket",
+            }
+            if query is None:
+                params["tags"] = "weather"
+            else:
+                params["q"] = query
+            request_key = tuple(sorted(params.items()))
+            if request_key in seen_request_keys:
+                continue
+            seen_request_keys.add(request_key)
+            print(f"bulk fetching markets params={params} timeout={request_timeout}s", flush=True)
+            try:
+                response = client._request(
+                    "GET",
+                    "/api/sdk/markets",
+                    params=params,
+                    timeout=request_timeout,
+                )
+            except Exception as exc:
+                print(f"bulk error params={params}: {exc}", flush=True)
+                continue
+
+            markets = response.get("markets") if isinstance(response, dict) else None
+            if not isinstance(markets, list):
+                markets = response if isinstance(response, list) else []
+            matched = 0
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                market_id = str(market.get("id") or market.get("market_id") or "")
+                if not market_id or market_id not in target_market_ids:
+                    continue
+                cache[market_id] = market_cache_entry(market)
+                matched += 1
+            found += matched
+            print(
+                f"bulk result params={params}: returned={len(markets)} matched={matched} total_matched={found}",
+                flush=True,
+            )
+    return found
+
+
 def refresh_outcome_cache(
     market_ids: Iterable[str],
     cache_path: Path,
     refresh_resolved: bool = False,
     refresh_unresolved: bool = True,
     progress_every: int = 25,
+    request_timeout: int = 10,
+    bulk_first: bool = True,
+    bulk_limit: int = 1000,
 ) -> Dict[str, Any]:
     from simmer_sdk import SimmerClient
 
@@ -116,52 +191,74 @@ def refresh_outcome_cache(
     )
     cache: Dict[str, Any] = load_json(cache_path, {})
     unique_market_ids = sorted(set(market_ids))
+    if bulk_first:
+        bulk_refresh_outcomes(
+            client=client,
+            target_market_ids=set(unique_market_ids),
+            cache=cache,
+            request_timeout=request_timeout,
+            limit=bulk_limit,
+        )
+        write_json(cache_path, cache)
+
     total_count = len(unique_market_ids)
     total = 0
     fetched = 0
     errors = 0
     skipped = 0
 
-    for market_id in unique_market_ids:
-        total += 1
-        cached = cache.get(market_id)
-        cached_outcome = cached.get("outcome") if isinstance(cached, dict) else None
-        has_cached = isinstance(cached, dict)
-        is_resolved = cached_outcome in (True, False)
-        should_fetch = (
-            not has_cached
-            or (refresh_resolved and is_resolved)
-            or (refresh_unresolved and not is_resolved)
-        )
-        if not should_fetch:
-            skipped += 1
+    try:
+        for market_id in unique_market_ids:
+            total += 1
+            cached = cache.get(market_id)
+            cached_outcome = cached.get("outcome") if isinstance(cached, dict) else None
+            has_cached = isinstance(cached, dict)
+            is_resolved = cached_outcome in (True, False)
+            should_fetch = (
+                not has_cached
+                or (refresh_resolved and is_resolved)
+                or (refresh_unresolved and not is_resolved)
+            )
+            if not should_fetch:
+                skipped += 1
+                if progress_every > 0 and total % progress_every == 0:
+                    print(
+                        f"progress {total}/{total_count}: fetched={fetched} "
+                        f"errors={errors} cached_skip={skipped}",
+                        flush=True,
+                    )
+                continue
+            try:
+                print(
+                    f"fetching {total}/{total_count}: {market_id} "
+                    f"(timeout={request_timeout}s)",
+                    flush=True,
+                )
+                response = client._request(
+                    "GET",
+                    f"/api/sdk/markets/{market_id}",
+                    timeout=request_timeout,
+                )
+                cache[market_id] = outcome_cache_entry(market_id, response)
+                fetched += 1
+            except Exception as exc:
+                cache[market_id] = {
+                    "market_id": market_id,
+                    "fetched_at": utc_now(),
+                    "error": str(exc),
+                    "outcome": cached_outcome,
+                }
+                errors += 1
+                print(f"error {market_id}: {exc}", flush=True)
             if progress_every > 0 and total % progress_every == 0:
                 print(
                     f"progress {total}/{total_count}: fetched={fetched} "
-                    f"errors={errors} cached_skip={skipped}"
+                    f"errors={errors} cached_skip={skipped}",
+                    flush=True,
                 )
-            continue
-        try:
-            if progress_every > 0 and (fetched + errors) % progress_every == 0:
-                print(f"fetching {total}/{total_count}: {market_id}")
-            response = client._request("GET", f"/api/sdk/markets/{market_id}")
-            cache[market_id] = outcome_cache_entry(market_id, response)
-            fetched += 1
-        except Exception as exc:
-            cache[market_id] = {
-                "market_id": market_id,
-                "fetched_at": utc_now(),
-                "error": str(exc),
-                "outcome": cached_outcome,
-            }
-            errors += 1
-        if progress_every > 0 and total % progress_every == 0:
-            print(
-                f"progress {total}/{total_count}: fetched={fetched} "
-                f"errors={errors} cached_skip={skipped}"
-            )
+    finally:
+        write_json(cache_path, cache)
 
-    write_json(cache_path, cache)
     print(f"outcome_cache={cache_path}")
     print(f"markets_total={total} fetched={fetched} errors={errors} cached={len(cache)}")
     return cache
@@ -293,6 +390,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh-resolved", action="store_true", help="Refetch markets that already have true/false outcome")
     parser.add_argument("--details-limit", type=int, default=25)
     parser.add_argument("--progress-every", type=int, default=25, help="Print API fetch progress every N markets; 0 disables")
+    parser.add_argument("--request-timeout", type=int, default=10, help="Simmer market API timeout in seconds")
+    parser.add_argument("--no-bulk", action="store_true", help="Skip bulk /api/sdk/markets pass and use per-market fallback only")
+    parser.add_argument("--bulk-limit", type=int, default=1000, help="Limit for each bulk /api/sdk/markets request")
     return parser.parse_args()
 
 
@@ -305,6 +405,9 @@ def main() -> None:
         refresh_resolved=args.refresh_resolved,
         refresh_unresolved=not args.no_refresh_unresolved,
         progress_every=args.progress_every,
+        request_timeout=args.request_timeout,
+        bulk_first=not args.no_bulk,
+        bulk_limit=args.bulk_limit,
     )
     if not args.cache_only:
         analyze_take_profit(args.paper_root, outcome_cache, details_limit=args.details_limit)
