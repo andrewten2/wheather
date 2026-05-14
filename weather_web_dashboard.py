@@ -568,20 +568,25 @@ INDEX_HTML = r"""<!doctype html>
   <title>Weather Bot Control</title>
   <style>
     :root {
-      --bg: #06100d;
-      --ink: #f3f0df;
-      --muted: #a6ad9c;
-      --panel: rgba(16, 30, 24, .82);
-      --panel-strong: rgba(20, 38, 31, .96);
-      --line: rgba(231, 218, 163, .18);
-      --line-hot: rgba(245, 180, 91, .55);
-      --good: #6df58a;
-      --bad: #ff6961;
-      --warn: #f8c35d;
-      --sky: #7bdff2;
-      --earth: #d7a86e;
-      --font: "Aptos Display", "Sora", "IBM Plex Sans", "Helvetica Neue", sans-serif;
-      --mono: "Berkeley Mono", "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+      --bg: #f6f8fc;
+      --ink: #0c1834;
+      --muted: #73809a;
+      --soft: #eef3f9;
+      --card: #ffffff;
+      --line: #dde5f0;
+      --green: #16b978;
+      --green-soft: #dff8eb;
+      --red: #ff405c;
+      --red-soft: #ffe8ed;
+      --blue: #2292ff;
+      --blue-soft: #e5f2ff;
+      --amber: #f7b955;
+      --amber-soft: #fff1d8;
+      --nav: #061a2b;
+      --nav-2: #09243a;
+      --shadow: 0 22px 60px rgba(28, 45, 74, .10);
+      --font: "Inter", "Aptos", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+      --mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
     }
     * { box-sizing: border-box; }
     body {
@@ -590,349 +595,504 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--ink);
       font-family: var(--font);
       background:
-        radial-gradient(circle at 12% -10%, rgba(120, 245, 162, .22), transparent 28%),
-        radial-gradient(circle at 92% 6%, rgba(255, 181, 84, .20), transparent 30%),
-        radial-gradient(circle at 55% 110%, rgba(123, 223, 242, .12), transparent 35%),
-        linear-gradient(135deg, #07120d 0%, #11170f 48%, #050806 100%);
-      overflow-x: hidden;
+        radial-gradient(circle at 28% -8%, rgba(52, 179, 255, .16), transparent 32%),
+        radial-gradient(circle at 95% 0%, rgba(29, 185, 120, .12), transparent 30%),
+        linear-gradient(180deg, #fbfcff 0%, var(--bg) 100%);
     }
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 272px minmax(0, 1fr);
+    }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 24px;
+      color: #eff9ff;
       background:
-        linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
-        linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px);
-      background-size: 54px 54px;
-      mask-image: radial-gradient(circle at 50% 20%, black, transparent 82%);
+        radial-gradient(circle at 20% 8%, rgba(42, 219, 147, .22), transparent 22%),
+        linear-gradient(180deg, var(--nav) 0%, #03111f 100%);
+      box-shadow: inset -1px 0 0 rgba(255,255,255,.06);
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+    .logo {
+      display: grid;
+      grid-template-columns: 48px 1fr;
+      gap: 14px;
+      align-items: center;
+    }
+    .logo-mark {
+      width: 48px;
+      height: 48px;
+      border-radius: 16px;
+      display: grid;
+      place-items: center;
+      background: rgba(255,255,255,.08);
+      color: #38e59b;
+      font-size: 28px;
+    }
+    .logo strong { display: block; font-size: 17px; }
+    .logo span { color: rgba(239,249,255,.68); font-size: 14px; }
+    .nav {
+      display: grid;
+      gap: 9px;
+    }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      padding: 14px 15px;
+      border-radius: 14px;
+      color: rgba(239,249,255,.78);
+      font-weight: 700;
+    }
+    .nav-item.active {
+      color: #49e5a1;
+      background: rgba(255,255,255,.10);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
+    }
+    .nav-icon { width: 22px; text-align: center; opacity: .92; }
+    .connection {
+      margin-top: auto;
+      padding: 18px;
+      border: 1px solid rgba(255,255,255,.16);
+      border-radius: 16px;
+      background: rgba(255,255,255,.04);
+      color: rgba(239,249,255,.78);
+      line-height: 1.8;
+    }
+    .dot-live {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 8px;
+      border-radius: 50%;
+      background: #48dd93;
+      box-shadow: 0 0 18px rgba(72,221,147,.8);
     }
     .page {
-      position: relative;
-      z-index: 1;
-      max-width: 1720px;
-      margin: 0 auto;
-      padding: 22px;
+      min-width: 0;
+      padding: 24px 28px 28px;
     }
-    .hero {
-      display: grid;
-      grid-template-columns: minmax(320px, 1.45fr) repeat(4, minmax(130px, .42fr));
-      gap: 14px;
-      align-items: stretch;
-      margin-bottom: 16px;
-    }
-    .brand, .card, .panel {
-      border: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,.012)), var(--panel);
-      box-shadow: 0 20px 70px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.07);
-      border-radius: 24px;
-    }
-    .brand {
-      padding: 22px;
-      overflow: hidden;
-      position: relative;
-    }
-    .brand::after {
-      content: "";
-      position: absolute;
-      width: 230px;
-      height: 230px;
-      right: -76px;
-      top: -88px;
-      border-radius: 999px;
-      background: radial-gradient(circle, rgba(248,195,93,.22), transparent 68%);
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 18px;
     }
     .eyebrow {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      color: var(--sky);
+      color: var(--muted);
       font-family: var(--mono);
       font-size: 12px;
-      letter-spacing: .12em;
-      text-transform: uppercase;
+      font-weight: 800;
     }
-    .pulse {
-      width: 9px;
-      height: 9px;
-      border-radius: 99px;
-      background: var(--good);
-      box-shadow: 0 0 22px var(--good);
-      animation: pulse 1.8s infinite;
-    }
-    @keyframes pulse { 50% { transform: scale(1.35); opacity: .55; } }
+    .eyebrow b { color: var(--green); }
     h1 {
-      margin: 14px 0 8px;
-      font-size: clamp(30px, 4vw, 58px);
-      line-height: .92;
-      letter-spacing: -.06em;
+      margin: 12px 0 8px;
+      font-size: clamp(30px, 3.1vw, 46px);
+      line-height: 1;
+      letter-spacing: -.055em;
     }
     .subtitle {
       color: var(--muted);
-      max-width: 720px;
-      line-height: 1.5;
+      font-size: 17px;
+      font-weight: 600;
     }
-    .card {
-      padding: 18px;
-      min-height: 116px;
+    .top-actions {
       display: flex;
-      flex-direction: column;
-      justify-content: space-between;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    .date-chip, .icon-chip {
+      height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: 0 8px 30px rgba(28,45,74,.06);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 14px;
+      color: #20304e;
+      font-weight: 800;
+    }
+    .icon-chip { width: 42px; justify-content: center; padding: 0; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(170px, 1fr));
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+    .metric-card, .panel, .control {
+      background: rgba(255,255,255,.86);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+    .metric-card {
+      min-height: 102px;
+      padding: 18px 20px;
+      display: grid;
+      grid-template-columns: 1fr 120px;
+      gap: 12px;
+      align-items: end;
     }
     .label {
       color: var(--muted);
       font-family: var(--mono);
       font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .08em;
       text-transform: uppercase;
-      letter-spacing: .13em;
     }
     .value {
-      font-family: var(--mono);
-      font-size: clamp(22px, 2.2vw, 34px);
+      margin-top: 12px;
+      font-size: 28px;
       font-weight: 900;
-      letter-spacing: -.04em;
+      letter-spacing: -.03em;
     }
-    .positive { color: var(--good); }
-    .negative { color: var(--bad); }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
     .neutral { color: var(--ink); }
+    .mini-spark {
+      height: 48px;
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(22,185,120,.09), transparent);
+    }
     .toolbar {
       display: grid;
-      grid-template-columns: 1.1fr .65fr 1.65fr auto;
+      grid-template-columns: 1.1fr 1.25fr 1.5fr .95fr;
       gap: 12px;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
     .control {
+      min-width: 0;
+      padding: 15px;
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
+      gap: 9px;
       align-items: center;
-      padding: 12px;
-      border-radius: 20px;
-      border: 1px solid var(--line);
-      background: rgba(6, 14, 11, .58);
-    }
-    button {
-      border: 1px solid rgba(255,255,255,.09);
-      background: rgba(255,255,255,.045);
-      color: var(--ink);
-      border-radius: 999px;
-      padding: 10px 13px;
-      font-family: var(--mono);
-      font-size: 12px;
-      cursor: pointer;
-      transition: background .18s ease, border-color .18s ease;
-    }
-    button:hover { border-color: var(--line-hot); }
-    button.active {
-      color: #15100a;
-      background: linear-gradient(135deg, #f8c35d, #6df58a);
-      border-color: transparent;
-      font-weight: 900;
     }
     .selectlike {
-      min-width: 150px;
+      width: 100%;
       color: var(--muted);
       font-family: var(--mono);
-      padding-left: 8px;
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin-bottom: 3px;
+    }
+    button {
+      min-width: 96px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, #fff, #f7f9fd);
+      color: #21304f;
+      border-radius: 9px;
+      padding: 9px 13px;
+      font-size: 12px;
+      font-weight: 900;
+      cursor: pointer;
+      box-shadow: 0 6px 18px rgba(32,48,78,.04);
+    }
+    button.active {
+      color: #0f5b3b;
+      background: linear-gradient(180deg, #dff8eb, #c7f0d9);
+      border-color: #a8e5c4;
     }
     .search {
-      width: 210px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,.035);
+      flex: 1 1 210px;
+      min-width: 0;
+      border: 0;
+      background: var(--soft);
       color: var(--ink);
-      border-radius: 999px;
-      padding: 12px 15px;
-      font-family: var(--mono);
+      border-radius: 12px;
+      padding: 13px 14px;
+      font-size: 14px;
       outline: none;
     }
     .grid {
       display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
-      gap: 16px;
+      grid-template-columns: 350px minmax(0, 1fr);
+      gap: 18px;
     }
-    .stack { display: grid; gap: 16px; }
-    .panel { padding: 18px; min-width: 0; }
+    .stack { display: grid; gap: 12px; }
+    .panel {
+      min-width: 0;
+      padding: 18px 20px;
+    }
     .panel-head {
       display: flex;
-      align-items: baseline;
       justify-content: space-between;
-      gap: 14px;
+      align-items: baseline;
+      gap: 12px;
       margin-bottom: 14px;
     }
     h2 {
       margin: 0;
       font-size: 17px;
-      letter-spacing: -.02em;
+      letter-spacing: -.025em;
     }
     .hint {
       color: var(--muted);
-      font-family: var(--mono);
       font-size: 12px;
+      font-weight: 800;
     }
-    .stats-list { display: grid; gap: 10px; }
+    .stats-list { display: grid; gap: 8px; }
     .stat {
       display: flex;
       justify-content: space-between;
-      border-bottom: 1px solid rgba(255,255,255,.07);
-      padding: 8px 0;
-      font-family: var(--mono);
+      gap: 14px;
+      padding: 6px 0;
+      color: #2e3c59;
+      font-size: 14px;
+      font-weight: 750;
     }
-    .chart-box { height: 230px; }
+    .stat strong {
+      font-family: var(--mono);
+      color: var(--ink);
+    }
+    .chart-box { height: 190px; }
     canvas { width: 100%; height: 100%; display: block; }
-    .table-wrap { overflow: auto; max-height: 570px; border-radius: 18px; }
+    .table-wrap {
+      overflow: auto;
+      max-height: 520px;
+      border-radius: 14px;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
       font-family: var(--mono);
-      font-size: 13px;
+      font-size: 12px;
     }
     th {
       position: sticky;
       top: 0;
       z-index: 1;
-      background: rgba(17, 29, 24, .96);
+      background: #fbfcff;
       color: var(--muted);
       text-transform: uppercase;
-      letter-spacing: .08em;
+      letter-spacing: .06em;
       font-size: 10px;
       text-align: left;
-      padding: 12px 10px;
+      padding: 11px 10px;
       border-bottom: 1px solid var(--line);
     }
     td {
-      padding: 12px 10px;
-      border-bottom: 1px solid rgba(255,255,255,.055);
-      vertical-align: top;
+      padding: 11px 10px;
+      border-bottom: 1px solid #edf1f7;
+      vertical-align: middle;
     }
-    tbody tr:hover { background: rgba(248,195,93,.045); }
+    tbody tr:hover { background: #fbfdff; }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
-    .market { min-width: 320px; color: #fff7d5; line-height: 1.35; }
+    .market {
+      min-width: 360px;
+      color: #43516f;
+      line-height: 1.35;
+      font-family: var(--font);
+      font-weight: 650;
+    }
     .pill {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 42px;
-      padding: 5px 9px;
-      border-radius: 999px;
-      background: rgba(255,255,255,.06);
+      min-width: 38px;
+      padding: 5px 8px;
+      border-radius: 7px;
       font-weight: 900;
     }
-    .yes { color: var(--good); }
-    .no { color: #ff8d74; }
-    .regime { color: var(--sky); }
+    .yes { color: #0f8e58; background: var(--green-soft); }
+    .no { color: var(--red); background: var(--red-soft); }
+    .regime { color: var(--blue); font-weight: 900; }
     .city-chip {
-      display: inline-block;
-      color: #16120b;
-      background: var(--earth);
-      border-radius: 999px;
-      padding: 3px 8px;
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 9px;
+      border-radius: 7px;
+      color: #5d3a06;
+      background: var(--amber-soft);
       font-size: 11px;
       font-weight: 900;
-      margin-bottom: 5px;
+      margin-right: 8px;
+      margin-bottom: 4px;
+    }
+    .forecast-chip {
+      display: inline-flex;
+      padding: 5px 8px;
+      border-radius: 7px;
+      color: #1162ad;
+      background: var(--blue-soft);
+      font-weight: 900;
+      white-space: nowrap;
     }
     .footer {
-      display: flex;
-      justify-content: space-between;
-      gap: 14px;
-      color: rgba(243,240,223,.48);
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 14px 4px 0;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 22px 0 6px;
     }
+    .footer span:first-child { display: block; margin-bottom: 6px; }
     .empty {
       color: var(--muted);
+      background: #fbfcff;
       border: 1px dashed var(--line);
-      border-radius: 18px;
-      padding: 24px;
+      border-radius: 14px;
+      padding: 22px;
       text-align: center;
+      font-weight: 700;
     }
     .compare-only .standard-view { display: none; }
     .compare-view { display: none; }
     .compare-only .compare-view { display: block; }
-    @media (max-width: 1180px) {
-      .hero, .toolbar, .grid { grid-template-columns: 1fr; }
-      .card { min-height: 96px; }
-      body { overflow-x: auto; }
+    @media (max-width: 1320px) {
+      .shell { grid-template-columns: 220px minmax(0, 1fr); }
+      .toolbar { grid-template-columns: 1fr 1fr; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 980px) {
+      .shell { display: block; }
+      .sidebar {
+        position: relative;
+        height: auto;
+        padding: 18px;
+        border-radius: 0 0 24px 24px;
+      }
+      .nav {
+        display: flex;
+        overflow-x: auto;
+        padding-bottom: 4px;
+      }
+      .nav-item { min-width: max-content; }
+      .connection { display: none; }
+      .page { padding: 18px; }
+      .topbar, .grid { grid-template-columns: 1fr; display: grid; }
+      .top-actions { justify-content: start; }
+      .toolbar, .metrics { grid-template-columns: 1fr; }
+      .market { min-width: 280px; }
+    }
+    @media (max-width: 560px) {
+      .page { padding: 14px; }
+      h1 { font-size: 32px; }
+      .metric-card { grid-template-columns: 1fr; }
+      .mini-spark { display: none; }
+      button { min-width: calc(50% - 6px); }
+      .search { flex-basis: 100%; }
+      .panel { padding: 14px; }
+      table { font-size: 11px; }
     }
   </style>
 </head>
 <body>
-  <main class="page">
-    <section class="hero">
-      <div class="brand">
-        <div class="eyebrow"><span class="pulse"></span> Weather Bot Web Control</div>
-        <h1 id="title">Loading dashboard</h1>
-        <div class="subtitle" id="subtitle">Live paper-state view with city filters, strategy switching, TP40 and TP40+Runner modes.</div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="logo">
+        <div class="logo-mark">☁</div>
+        <div><strong>Weather Bot</strong><span>Web Control</span></div>
       </div>
-      <div class="card"><div class="label">Total PnL</div><div class="value" id="m-total">...</div></div>
-      <div class="card"><div class="label">Realized</div><div class="value" id="m-realized">...</div></div>
-      <div class="card"><div class="label">Unrealized</div><div class="value" id="m-unrealized">...</div></div>
-      <div class="card"><div class="label">Winrate</div><div class="value neutral" id="m-winrate">...</div></div>
-    </section>
+      <nav class="nav">
+        <div class="nav-item active"><span class="nav-icon">⌂</span>Dashboard</div>
+        <div class="nav-item"><span class="nav-icon">◷</span>Portfolio Pulse</div>
+        <div class="nav-item"><span class="nav-icon">▣</span>Open Positions</div>
+        <div class="nav-item"><span class="nav-icon">▤</span>Closed Trades</div>
+        <div class="nav-item"><span class="nav-icon">⌁</span>Realized Curve</div>
+        <div class="nav-item"><span class="nav-icon">◎</span>Top Cities</div>
+        <div class="nav-item"><span class="nav-icon">✣</span>Strategies</div>
+        <div class="nav-item"><span class="nav-icon">☆</span>Watchlist</div>
+      </nav>
+      <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
+    </aside>
 
-    <section class="toolbar">
-      <div class="control" id="view-buttons"><span class="selectlike">Cities</span></div>
-      <div class="control" id="exit-buttons"><span class="selectlike">Exit</span></div>
-      <div class="control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
-      <div class="control">
-        <input class="search" id="search" placeholder="search market/city" />
-        <button id="compare-btn" data-strategy="compare">x Compare</button>
-      </div>
-    </section>
-
-    <section class="grid standard-view">
-      <aside class="stack">
-        <div class="panel">
-          <div class="panel-head"><h2>Portfolio Pulse</h2><span class="hint" id="lookback-label">24h closed</span></div>
-          <div class="stats-list" id="stats"></div>
+    <main class="page">
+      <section class="topbar">
+        <div>
+          <div class="eyebrow"><span class="dot-live"></span><span id="status-line">24h closed · effective state: <b>baseline</b></span></div>
+          <h1 id="title">Loading dashboard</h1>
+          <div class="subtitle" id="subtitle">TP40 · 24h closed</div>
         </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Realized Curve</h2><span class="hint">closed trades</span></div>
-          <div class="chart-box"><canvas id="curve"></canvas></div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Top Cities</h2><span class="hint">realized</span></div>
-          <div id="cities"></div>
-        </div>
-      </aside>
-
-      <section class="stack">
-        <div class="panel">
-          <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL%</th><th>Held</th><th>Market</th><th>Forecast</th></tr></thead>
-              <tbody id="positions"></tbody>
-            </table>
-          </div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th><th>Forecast</th></tr></thead>
-              <tbody id="closed"></tbody>
-            </table>
-          </div>
+        <div class="top-actions">
+          <div class="date-chip">▦ <span id="date-chip">May 14, 2026</span></div>
+          <div class="icon-chip">☀</div>
+          <div class="icon-chip">☾</div>
         </div>
       </section>
-    </section>
 
-    <section class="panel compare-view">
-      <div class="panel-head"><h2>Strategy Comparison</h2><span class="hint" id="compare-subtitle"></span></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Key</th><th>Strategy</th><th class="num">Open</th><th class="num">Buys</th><th class="num">Sells</th><th class="num">Total</th><th class="num">Realized</th><th class="num">Unrealized</th><th class="num">Winrate</th><th>State</th></tr></thead>
-          <tbody id="compare"></tbody>
-        </table>
+      <section class="metrics">
+        <div class="metric-card"><div><div class="label">Total PnL</div><div class="value" id="m-total">...</div></div><canvas class="mini-spark" id="spark-total"></canvas></div>
+        <div class="metric-card"><div><div class="label">Realized</div><div class="value" id="m-realized">...</div></div><canvas class="mini-spark" id="spark-realized"></canvas></div>
+        <div class="metric-card"><div><div class="label">Unrealized</div><div class="value" id="m-unrealized">...</div></div><canvas class="mini-spark" id="spark-unrealized"></canvas></div>
+        <div class="metric-card"><div><div class="label">Winrate</div><div class="value neutral" id="m-winrate">...</div></div><canvas class="mini-spark" id="spark-winrate"></canvas></div>
+      </section>
+
+      <section class="toolbar">
+        <div class="control" id="view-buttons"><span class="selectlike">Cities</span></div>
+        <div class="control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
+        <div class="control" id="exit-buttons"><span class="selectlike">Market Regime</span></div>
+        <div class="control">
+          <input class="search" id="search" placeholder="Search market/city..." />
+          <button id="compare-btn" data-strategy="compare">⌘ Compare</button>
+        </div>
+      </section>
+
+      <section class="grid standard-view">
+        <aside class="stack">
+          <div class="panel">
+            <div class="panel-head"><h2>Portfolio Pulse</h2><span class="hint" id="lookback-label">24h closed</span></div>
+            <div class="stats-list" id="stats"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Realized Curve</h2><span class="hint">Closed trades</span></div>
+            <div class="chart-box"><canvas id="curve"></canvas></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Top Cities</h2><span class="hint">Realized</span></div>
+            <div id="cities"></div>
+          </div>
+        </aside>
+
+        <section class="stack">
+          <div class="panel">
+            <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL %</th><th>Held</th><th>Market</th><th>Forecast</th></tr></thead>
+                <tbody id="positions"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th><th>Forecast</th></tr></thead>
+                <tbody id="closed"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="panel compare-view">
+        <div class="panel-head"><h2>Strategy Comparison</h2><span class="hint" id="compare-subtitle"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Strategy</th><th class="num">Open</th><th class="num">Buys</th><th class="num">Sells</th><th class="num">Total</th><th class="num">Realized</th><th class="num">Unrealized</th><th class="num">Winrate</th><th>State</th></tr></thead>
+            <tbody id="compare"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="footer">
+        <span id="state-path">state: ...</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/all</span>
       </div>
-    </section>
-
-    <div class="footer">
-      <span id="state-path">state: ...</span>
-      <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/all</span>
-    </div>
-  </main>
+    </main>
+  </div>
 
   <script>
     const state = {
@@ -1010,6 +1170,38 @@ INDEX_HTML = r"""<!doctype html>
       ctx.shadowBlur = 0;
     }
 
+    function drawSpark(id, values, color = "#16b978") {
+      const canvas = document.getElementById(id);
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, rect.width * ratio);
+      canvas.height = Math.max(1, rect.height * ratio);
+      ctx.scale(ratio, ratio);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      const series = values && values.length > 1 ? values : [0, 1, .65, 1.25, 1.05, 1.45, 1.25, 1.75];
+      const min = Math.min(...series), max = Math.max(...series), span = max - min || 1;
+      const pad = 5;
+      const x = i => pad + (rect.width - pad * 2) * i / (series.length - 1);
+      const y = v => rect.height - pad - (rect.height - pad * 2) * (v - min) / span;
+      const grad = ctx.createLinearGradient(0, 0, 0, rect.height);
+      grad.addColorStop(0, color.replace(")", ", .18)").replace("rgb", "rgba"));
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.beginPath();
+      ctx.moveTo(x(0), rect.height - pad);
+      series.forEach((v, i) => ctx.lineTo(x(i), y(v)));
+      ctx.lineTo(x(series.length - 1), rect.height - pad);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.beginPath();
+      series.forEach((v, i) => i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v)));
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
     function buttonGroup(id, rows, activeKey, attr) {
       const root = document.getElementById(id);
       const label = root.querySelector(".selectlike")?.outerHTML || "";
@@ -1070,7 +1262,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
           <td class="market"><span class="city-chip">${esc(p.city)}</span><br>${esc(p.question)}</td>
-          <td>${esc(p.forecast)}</td>
+          <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
       `).join("") : `<tr><td colspan="9"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
@@ -1088,7 +1280,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
           <td class="market"><span class="city-chip">${esc(t.city)}</span><br>${esc(t.question)}</td>
-          <td>${esc(t.forecast)}</td>
+          <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `).join("") : `<tr><td colspan="8"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
@@ -1104,6 +1296,7 @@ INDEX_HTML = r"""<!doctype html>
       const meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
       setText("subtitle", "Side-by-side strategy health check across the selected city universe.");
+      setText("status-line", `${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: compare`);
       setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h" : "all history"}`);
       setHTML("compare", data.rows.map(r => `
         <tr>
@@ -1124,6 +1317,10 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", 0);
       setText("m-winrate", "scan");
       setText("state-path", `state root: ${meta.state_path}`);
+      drawSpark("spark-total", data.rows.map(r => r.total), "#16b978");
+      drawSpark("spark-realized", data.rows.map(r => r.realized), "#16b978");
+      drawSpark("spark-unrealized", data.rows.map(r => r.unrealized), "#2292ff");
+      drawSpark("spark-winrate", data.rows.map(r => r.winrate), "#16b978");
     }
 
     function renderStandard(data) {
@@ -1131,6 +1328,9 @@ INDEX_HTML = r"""<!doctype html>
       const s = data.stats, meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.strategy_label}`);
       setText("subtitle", `${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", `${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: ${meta.effective_strategy}`);
+      setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
+      setText("sidebar-meta", `${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", state.lookback > 0 ? `${state.lookback}h closed` : "all closed");
       setMetric("m-total", s.total);
       setMetric("m-realized", s.realized);
@@ -1143,6 +1343,10 @@ INDEX_HTML = r"""<!doctype html>
       renderClosed(data.closed_trades);
       renderCities(data.city_pnl);
       drawCurve(data.pnl_curve);
+      drawSpark("spark-total", data.pnl_curve, "#16b978");
+      drawSpark("spark-realized", data.pnl_curve, "#16b978");
+      drawSpark("spark-unrealized", [0, s.unrealized], s.unrealized >= 0 ? "#16b978" : "#ff405c");
+      drawSpark("spark-winrate", [0, s.winrate / 100], "#16b978");
     }
 
     async function refresh() {
