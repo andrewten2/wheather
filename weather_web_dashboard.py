@@ -819,6 +819,23 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 9px;
       box-shadow: none;
     }
+    .layout-toggle {
+      height: 42px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: 0 8px 30px rgba(28,45,74,.06);
+      display: inline-flex;
+      gap: 4px;
+    }
+    .layout-toggle button {
+      min-width: 86px;
+      height: 32px;
+      padding: 0 12px;
+      border-radius: 9px;
+      box-shadow: none;
+    }
     .metrics {
       display: grid;
       grid-template-columns: repeat(4, minmax(170px, 1fr));
@@ -1116,6 +1133,219 @@ INDEX_HTML = r"""<!doctype html>
     .compare-only .standard-view { display: none; }
     .compare-view { display: none; }
     .compare-only .compare-view { display: block; }
+    .terminal-view { display: none; }
+    body.terminal-layout {
+      background: #000;
+    }
+    body.terminal-layout .shell {
+      display: block;
+      min-height: 100vh;
+      background: #000;
+    }
+    body.terminal-layout .sidebar,
+    body.terminal-layout .metrics,
+    body.terminal-layout .toolbar,
+    body.terminal-layout .standard-view,
+    body.terminal-layout .compare-view,
+    body.terminal-layout .footer {
+      display: none !important;
+    }
+    body.terminal-layout .page {
+      min-height: 100vh;
+      padding: 12px;
+      color: #e9fff6;
+      background: #000;
+    }
+    body.terminal-layout .topbar {
+      margin-bottom: 10px;
+      padding: 8px 10px;
+      border: 1px solid #00b7d8;
+      border-radius: 4px;
+      background: #020405;
+    }
+    body.terminal-layout h1,
+    body.terminal-layout .subtitle,
+    body.terminal-layout .eyebrow {
+      display: none;
+    }
+    body.terminal-layout .date-chip,
+    body.terminal-layout .lookback-toggle,
+    body.terminal-layout .layout-toggle,
+    body.terminal-layout .icon-chip {
+      background: #050707;
+      border-color: #00b7d8;
+      color: #e9fff6;
+      box-shadow: none;
+    }
+    body.terminal-layout button {
+      background: #050707;
+      color: #f5d84a;
+      border-color: transparent;
+      box-shadow: none;
+      text-transform: uppercase;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    body.terminal-layout button.active {
+      color: #000;
+      background: #62ff99;
+      border-color: #62ff99;
+    }
+    body.terminal-layout .terminal-view {
+      display: block;
+      font-family: var(--mono);
+      color: #f2fff8;
+      font-size: 15px;
+      font-weight: 850;
+    }
+    .terminal-header {
+      display: grid;
+      grid-template-columns: auto 1fr auto auto auto auto;
+      gap: 18px;
+      align-items: center;
+      min-height: 46px;
+      padding: 8px 12px;
+      border: 1px solid #00b7d8;
+      border-radius: 4px;
+      background: #020405;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .terminal-brand { color: #49f58b; font-weight: 950; letter-spacing: .02em; }
+    .terminal-brand::before { content: "╭ WEATHER BOT TERMINAL ● LIVE "; color: #7df7ff; }
+    .terminal-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 13px;
+      color: #f5d84a;
+      overflow: hidden;
+    }
+    .terminal-tabs span.active {
+      color: #000;
+      background: #62ff99;
+      padding: 2px 8px;
+    }
+    .terminal-kpi {
+      display: grid;
+      min-width: 130px;
+      text-align: center;
+      color: #7f8790;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    .terminal-kpi strong {
+      margin-top: 2px;
+      color: #42ff87;
+      font-size: 15px;
+    }
+    .terminal-main {
+      display: grid;
+      grid-template-columns: 390px minmax(0, 1fr);
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .terminal-panel {
+      min-width: 0;
+      border: 1px solid #6b48ff;
+      border-radius: 3px;
+      background: #000;
+      padding: 10px 12px;
+    }
+    .terminal-panel.accent-green { border-color: #00d28b; }
+    .terminal-title {
+      margin: -20px auto 10px;
+      width: max-content;
+      padding: 0 10px;
+      color: #b66cff;
+      background: #000;
+      font-style: italic;
+      text-transform: uppercase;
+    }
+    .terminal-stats {
+      display: grid;
+      gap: 4px;
+      font-size: 15px;
+    }
+    .terminal-stat {
+      display: grid;
+      grid-template-columns: 22px 1fr auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .terminal-stat .icon { color: #5ae9ff; }
+    .terminal-stat .name { color: #7df7ff; }
+    .terminal-total {
+      margin: 18px 0 8px;
+      padding: 10px 14px;
+      border: 1px solid #00d28b;
+      border-radius: 3px;
+      color: #62ff99;
+      font-weight: 950;
+      display: flex;
+      justify-content: space-between;
+    }
+    .terminal-note { color: #c9c500; margin-top: 10px; }
+    .terminal-table-wrap {
+      overflow: auto;
+      max-height: 380px;
+    }
+    .terminal-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 850;
+    }
+    .terminal-table th {
+      position: static;
+      background: #000;
+      color: #fff;
+      border-bottom: 1px solid #f2fff8;
+      padding: 8px 10px;
+      font-size: 13px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .terminal-table td {
+      border: 0;
+      padding: 7px 10px;
+      color: #f2fff8;
+      vertical-align: top;
+    }
+    .terminal-table tbody tr:hover { background: transparent; }
+    .terminal-market {
+      min-width: 430px;
+      max-width: 780px;
+      white-space: normal;
+      color: #f2fff8;
+      line-height: 1.35;
+    }
+    .terminal-side-yes { color: #62ff99; }
+    .terminal-side-no { color: #ff5a66; }
+    .terminal-regime { color: #41d9ff; }
+    .terminal-forecast { color: #f5d84a; white-space: nowrap; }
+    .terminal-closed {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .terminal-closed .terminal-table-wrap {
+      max-height: 560px;
+    }
+    .terminal-compare {
+      margin-top: 8px;
+    }
+    @media (max-width: 1180px) {
+      .terminal-main,
+      .terminal-closed {
+        grid-template-columns: 1fr;
+      }
+      .terminal-header {
+        grid-template-columns: 1fr;
+        white-space: normal;
+      }
+    }
       @media (max-width: 1320px) {
       .shell { grid-template-columns: 220px minmax(0, 1fr); }
       .toolbar { grid-template-columns: 1fr 1fr; }
@@ -1186,6 +1416,10 @@ INDEX_HTML = r"""<!doctype html>
           <div class="lookback-toggle">
             <button id="lookback-24" data-lookback="24">24h</button>
             <button id="lookback-all" data-lookback="0">All</button>
+          </div>
+          <div class="layout-toggle">
+            <button data-layout="modern">Web</button>
+            <button data-layout="terminal">Terminal</button>
           </div>
           <button class="icon-chip" id="theme-light" data-theme-choice="light" title="Light theme">☀</button>
           <button class="icon-chip" id="theme-dark" data-theme-choice="dark" title="Dark theme">☾</button>
@@ -1260,9 +1494,21 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="terminal-view" id="terminal-view">
+        <div class="terminal-header">
+          <div class="terminal-brand" id="terminal-brand">ALL CITIES / BASELINE</div>
+          <div class="terminal-tabs" id="terminal-tabs"></div>
+          <div class="terminal-kpi">TotalPnL<strong id="terminal-total">...</strong></div>
+          <div class="terminal-kpi">Realized<strong id="terminal-realized">...</strong></div>
+          <div class="terminal-kpi">Unrealized<strong id="terminal-unrealized">...</strong></div>
+          <div class="terminal-kpi">Winrate<strong id="terminal-winrate">...</strong></div>
+        </div>
+        <div id="terminal-body"></div>
+      </section>
+
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/all</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/all · m terminal/web · d dark/light</span>
       </div>
     </main>
   </div>
@@ -1274,6 +1520,7 @@ INDEX_HTML = r"""<!doctype html>
       strategy: localStorage.weatherStrategy || "baseline",
       lookback: Number(localStorage.weatherLookback || 24),
       theme: localStorage.weatherTheme || "light",
+      layout: localStorage.weatherLayout || "modern",
       search: "",
       options: null,
       lastData: null,
@@ -1388,6 +1635,7 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
       document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
+      document.querySelectorAll("[data-layout]").forEach(btn => btn.classList.toggle("active", btn.dataset.layout === state.layout));
     }
 
     function applyTheme(theme) {
@@ -1397,6 +1645,13 @@ INDEX_HTML = r"""<!doctype html>
       syncActiveButtons();
       state.lastCurveKey = "";
       if (state.lastData && state.strategy !== "compare") drawCurve(state.lastData.pnl_curve);
+    }
+
+    function applyLayout(layout) {
+      state.layout = layout === "terminal" ? "terminal" : "modern";
+      document.body.classList.toggle("terminal-layout", state.layout === "terminal");
+      localStorage.weatherLayout = state.layout;
+      syncActiveButtons();
     }
 
     async function loadOptions() {
@@ -1478,6 +1733,167 @@ INDEX_HTML = r"""<!doctype html>
       `).join("") : `<div class="empty">No city PnL yet.</div>`);
     }
 
+    function terminalStatusDot(value) {
+      const n = Number(value || 0);
+      if (n > 0) return `<span class="terminal-side-yes">●</span>`;
+      if (n < 0) return `<span class="terminal-side-no">●</span>`;
+      return `<span style="color:#c9c500">●</span>`;
+    }
+
+    function renderTerminalTabs(meta) {
+      if (!state.options) return;
+      const viewTabs = state.options.views.map(v => `<span class="${v.id === state.view ? "active" : ""}">${v.key} ${esc(v.label).toUpperCase()}</span>`);
+      const strategyTabs = state.options.strategies.map(s => `<span class="${s.id === state.strategy ? "active" : ""}">${s.key} ${esc(s.label).toUpperCase()}</span>`);
+      const exitTabs = state.options.exit_modes.map(e => `<span class="${e.id === state.exit_mode ? "active" : ""}">${e.key} ${esc(e.label).toUpperCase()}</span>`);
+      const compare = `<span class="${state.strategy === "compare" ? "active" : ""}">x COMPARE</span>`;
+      setHTML("terminal-tabs", [...viewTabs, ...exitTabs, ...strategyTabs, compare].join(""));
+      setText("terminal-brand", `${meta.view_label} / ${meta.strategy_label || meta.exit_mode_label}`);
+    }
+
+    function renderTerminalStats(s) {
+      const rows = [
+        ["▣", "Open Trades", s.open_positions],
+        ["↔", "Total Trades", s.buys + s.sells],
+        ["↗", "Buys", s.buys],
+        ["↘", "Sells", s.sells],
+        ["✣", "Wins", s.wins],
+        ["◇", "Losses", s.losses],
+        ["⌁", "Winrate", `${s.winrate.toFixed(1)}%`],
+        ["◆", "Exposure", money(s.exposure)],
+        ["▣", "Realized", money(s.realized)],
+        ["●", "Unrealized", money(s.unrealized)],
+      ];
+      return `
+        <div class="terminal-stats">
+          ${rows.map(([ic, label, value]) => `
+            <div class="terminal-stat">
+              <span class="icon">${esc(ic)}</span>
+              <span class="name">${esc(label)}</span>
+              <strong class="${typeof value === "string" && value.startsWith("-") ? "negative" : ""}">${esc(value)}</strong>
+            </div>
+          `).join("")}
+        </div>
+        <div class="terminal-total"><span>TOTAL PnL</span><strong class="${cls(s.total)}">${money(s.total)}</strong></div>
+        <div class="terminal-note">stale prices: ${s.stale}</div>
+      `;
+    }
+
+    function terminalOpenRows(rows) {
+      const q = state.search.toLowerCase();
+      const filtered = rows.filter(p => !q || `${p.city} ${p.question}`.toLowerCase().includes(q));
+      return filtered.length ? filtered.slice(0, 40).map(p => `
+        <tr>
+          <td>${terminalStatusDot(p.pnl)}</td>
+          <td class="${p.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(p.side)}</td>
+          <td class="terminal-regime">${esc(p.regime)}</td>
+          <td class="num">${price(p.entry_price)}</td>
+          <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
+          <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
+          <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
+          <td>${esc(p.age)}</td>
+          <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
+        </tr>
+      `).join("") : `<tr><td colspan="9" class="terminal-market">No open positions for this filter.</td></tr>`;
+    }
+
+    function terminalClosedRows(rows) {
+      return rows.length ? rows.map(t => `
+        <tr>
+          <td>${terminalStatusDot(t.pnl)}</td>
+          <td>${esc(t.time)}</td>
+          <td class="${t.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(t.side)}</td>
+          <td class="terminal-regime">${esc(t.regime)}</td>
+          <td class="num">${price(t.entry_price)}</td>
+          <td class="num">${price(t.exit_price)}</td>
+          <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
+          <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
+        </tr>
+      `).join("") : `<tr><td colspan="8" class="terminal-market">No closed trades for this filter.</td></tr>`;
+    }
+
+    function renderTerminalStandard(data) {
+      const s = data.stats, meta = data.meta;
+      renderTerminalTabs(meta);
+      setText("terminal-total", money(s.total));
+      setText("terminal-realized", money(s.realized));
+      setText("terminal-unrealized", money(s.unrealized));
+      setText("terminal-winrate", `${s.winrate.toFixed(1)}%`);
+      const q = state.search.toLowerCase();
+      const closed = data.closed_trades.filter(t => !q || `${t.city} ${t.question}`.toLowerCase().includes(q));
+      const left = closed.slice(0, 20);
+      const right = closed.slice(20, 40);
+      setHTML("terminal-body", `
+        <div class="terminal-main">
+          <div class="terminal-panel accent-green">
+            <div class="terminal-title">P&L / STATS</div>
+            ${renderTerminalStats(s)}
+          </div>
+          <div class="terminal-panel">
+            <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
+            <div class="terminal-table-wrap">
+              <table class="terminal-table">
+                <thead><tr><th></th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
+                <tbody>${terminalOpenRows(data.positions)}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="terminal-closed">
+          <div class="terminal-panel">
+            <div class="terminal-title">LATEST 20 CLOSED / ${state.lookback > 0 ? state.lookback + "H" : "ALL"}</div>
+            <div class="terminal-table-wrap">
+              <table class="terminal-table">
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+                <tbody>${terminalClosedRows(left)}</tbody>
+              </table>
+            </div>
+          </div>
+          <div class="terminal-panel">
+            <div class="terminal-title">NEXT 20</div>
+            <div class="terminal-table-wrap">
+              <table class="terminal-table">
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+                <tbody>${terminalClosedRows(right)}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      `);
+    }
+
+    function renderTerminalCompare(data) {
+      const meta = data.meta;
+      renderTerminalTabs(meta);
+      setText("terminal-total", "$0.00");
+      setText("terminal-realized", "$0.00");
+      setText("terminal-unrealized", "$0.00");
+      setText("terminal-winrate", "scan");
+      setHTML("terminal-body", `
+        <div class="terminal-panel terminal-compare">
+          <div class="terminal-title">STRATEGY COMPARISON / ${esc(meta.view_label).toUpperCase()}</div>
+          <div class="terminal-table-wrap">
+            <table class="terminal-table">
+              <thead><tr><th>Key</th><th>Strategy</th><th class="num">Open</th><th class="num">Buys</th><th class="num">Sells</th><th class="num">Total</th><th class="num">Realized</th><th class="num">Unrealized</th><th class="num">Winrate</th><th>State</th></tr></thead>
+              <tbody>${data.rows.map(r => `
+                <tr>
+                  <td>${esc(r.key)}</td>
+                  <td>${esc(r.label)}</td>
+                  <td class="num">${r.open_positions}</td>
+                  <td class="num">${r.buys}</td>
+                  <td class="num">${r.sells}</td>
+                  <td class="num ${cls(r.total)}">${money(r.total)}</td>
+                  <td class="num ${cls(r.realized)}">${money(r.realized)}</td>
+                  <td class="num ${cls(r.unrealized)}">${money(r.unrealized)}</td>
+                  <td class="num">${r.winrate.toFixed(1)}%</td>
+                  <td>${r.state_exists ? "ready" : "missing"}</td>
+                </tr>
+              `).join("")}</tbody>
+            </table>
+          </div>
+        </div>
+      `);
+    }
+
     function renderCompare(data) {
       document.body.classList.add("compare-only");
       const meta = data.meta;
@@ -1508,6 +1924,7 @@ INDEX_HTML = r"""<!doctype html>
       drawSpark("spark-realized", data.rows.map(r => r.realized), "#16b978");
       drawSpark("spark-unrealized", data.rows.map(r => r.unrealized), "#2292ff");
       drawSpark("spark-winrate", data.rows.map(r => r.winrate), "#16b978");
+      renderTerminalCompare(data);
     }
 
     function renderStandard(data) {
@@ -1534,6 +1951,7 @@ INDEX_HTML = r"""<!doctype html>
       drawSpark("spark-realized", data.pnl_curve, "#16b978");
       drawSpark("spark-unrealized", [0, s.unrealized], s.unrealized >= 0 ? "#16b978" : "#ff405c");
       drawSpark("spark-winrate", [0, s.winrate / 100], "#16b978");
+      renderTerminalStandard(data);
     }
 
     async function refresh() {
@@ -1563,6 +1981,7 @@ INDEX_HTML = r"""<!doctype html>
       localStorage.weatherExitMode = state.exit_mode;
       localStorage.weatherStrategy = state.strategy;
       localStorage.weatherLookback = state.lookback;
+      localStorage.weatherLayout = state.layout;
       syncActiveButtons();
       refresh();
     }
@@ -1575,6 +1994,7 @@ INDEX_HTML = r"""<!doctype html>
       if (b.dataset.strategy) setState({strategy: b.dataset.strategy});
       if (b.dataset.lookback) setState({lookback: Number(b.dataset.lookback)});
       if (b.dataset.themeChoice) applyTheme(b.dataset.themeChoice);
+      if (b.dataset.layout) applyLayout(b.dataset.layout);
     });
     document.getElementById("search").addEventListener("input", e => {
       state.search = e.target.value;
@@ -1590,6 +2010,7 @@ INDEX_HTML = r"""<!doctype html>
       if (key === "x") setState({strategy: "compare"});
       if (key === "t") setState({lookback: state.lookback > 0 ? 0 : 24});
       if (key === "d") applyTheme(state.theme === "dark" ? "light" : "dark");
+      if (key === "m") applyLayout(state.layout === "terminal" ? "modern" : "terminal");
       if ("abcdefghij".includes(key) && state.options) {
         const found = state.options.strategies.find(s => s.key === key);
         if (found) setState({strategy: found.id});
@@ -1598,6 +2019,7 @@ INDEX_HTML = r"""<!doctype html>
     window.addEventListener("resize", () => state.lastData && state.strategy !== "compare" && drawCurve(state.lastData.pnl_curve));
 
     applyTheme(state.theme);
+    applyLayout(state.layout);
     loadOptions().then(refresh);
     setInterval(refresh, 30000);
   </script>
