@@ -46,6 +46,23 @@ class SimmerAdapter:
             )
         return client.get_market_context(market_id)
 
+    def get_market_outcome(self, market_id: str) -> Optional[bool]:
+        client = self.get_client()
+        response = client._request("GET", f"/api/sdk/markets/{market_id}")  # noqa: SLF001
+        market = response.get("market") if isinstance(response, dict) and isinstance(response.get("market"), dict) else response
+        if not isinstance(market, dict):
+            return None
+        outcome = market.get("outcome")
+        if outcome in (True, False, None):
+            return outcome
+        if isinstance(outcome, str):
+            lowered = outcome.strip().lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+        return None
+
     def get_price_history(self, market_id: str) -> List[dict]:
         return self.get_client().get_price_history(market_id)
 

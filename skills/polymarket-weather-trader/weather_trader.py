@@ -210,13 +210,6 @@ STRATEGY_VARIANTS = {
         "forecast_mode": "primary",
         "block_reentry_after_stop_loss": True,
     },
-    "tp40_runner": {
-        "label": "TP40 Half Runner",
-        "forecast_mode": "primary",
-        "partial_take_profit_enabled": True,
-        "partial_take_profit_fraction": 0.50,
-        "runner_exit_mode": "settlement",
-    },
     "wunderground_only": {
         "label": "Wunderground Only",
         "forecast_mode": "wunderground",
@@ -292,6 +285,44 @@ STRATEGY_VARIANTS = {
         "shadow_only": True,
     },
 }
+
+TP40_RUNNER_BASE_STRATEGIES = (
+    "baseline",
+    "stop20_early",
+    "no_reentry_after_stop",
+    "early_only",
+    "low_risk_cities_only",
+    "no_early_stop",
+    "watchlist_no_reentry",
+    "watchlist_early_central",
+    "watchlist_no_early_stop",
+    "celsius_exact_direct",
+)
+
+
+def tp40_runner_strategy_id(base_strategy_id: str) -> str:
+    return "tp40_runner" if base_strategy_id == BASELINE_STRATEGY_ID else f"{base_strategy_id}_tp40_runner"
+
+
+def _register_tp40_runner_strategies() -> None:
+    for base_strategy_id in TP40_RUNNER_BASE_STRATEGIES:
+        base_config = STRATEGY_VARIANTS.get(base_strategy_id)
+        if not base_config:
+            continue
+        runner_config = dict(base_config)
+        runner_config.update(
+            {
+                "label": f"{base_config.get('label', base_strategy_id)} TP40 Runner",
+                "base_strategy_id": base_strategy_id,
+                "partial_take_profit_enabled": True,
+                "partial_take_profit_fraction": 0.50,
+                "runner_exit_mode": "settlement",
+            }
+        )
+        STRATEGY_VARIANTS[tp40_runner_strategy_id(base_strategy_id)] = runner_config
+
+
+_register_tp40_runner_strategies()
 
 
 def get_active_strategy_config() -> dict:
@@ -458,6 +489,7 @@ STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY = 0.03
 STRATEGY_V1_NO_MIN_ENTRY_PRICE = 0.90
 STRATEGY_V1_NO_MAX_ENTRY_PRICE = 0.92
 STRATEGY_V1_NO_TAKE_PROFIT_PRICE = 0.98
+STRATEGY_V1_NO_MAX_POSITION_USD = float(os.environ.get("WEATHER_BOT_NO_MAX_POSITION_USD", "20.0"))
 STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
 STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
 STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
@@ -1938,6 +1970,14 @@ def get_price_history(market_id: str) -> list:
         return []
 
 
+def get_market_outcome(market_id: str) -> Optional[bool]:
+    """Return resolved market outcome: True means YES won, False means NO won, None unresolved/unknown."""
+    try:
+        return get_adapter().get_market_outcome(market_id)
+    except Exception:
+        return None
+
+
 def check_context_safeguards(
     context: dict,
     use_edge: bool = True,
@@ -2332,6 +2372,16 @@ def get_max_position_usd_for_mode(execution_mode: ExecutionMode) -> float:
     return MAX_POSITION_USD
 
 
+def get_max_position_usd_for_side(execution_mode: ExecutionMode, selected_side: str) -> float:
+    strategy_config = get_active_strategy_config()
+    if str(selected_side or "").lower() == "no":
+        no_max_position = float(strategy_config.get("no_max_position_usd", STRATEGY_V1_NO_MAX_POSITION_USD))
+        if execution_mode == ExecutionMode.LIVE_ENABLED:
+            return min(no_max_position, LIVE_MAX_POSITION_USD)
+        return no_max_position
+    return get_max_position_usd_for_mode(execution_mode)
+
+
 def get_position_side(pos) -> str:
     if (pos.shares_no or 0) > 0:
         return "no"
@@ -2653,6 +2703,30 @@ def resolve_paper_settlement_price(
     logger: StructuredLogger = None,
 ) -> Optional[dict]:
     """Resolve stale paper weather positions after event date has passed."""
+    market_outcome = get_market_outcome(market_id)
+    if market_outcome in (True, False):
+        yes_settlement_price = 1.0 if market_outcome is True else 0.0
+        chosen_settlement_price = 1.0 - yes_settlement_price if position_side == "no" else yes_settlement_price
+        result = {
+            "settlement_price": chosen_settlement_price,
+            "yes_settlement_price": yes_settlement_price,
+            "bucket_won": market_outcome is True,
+            "source": "simmer_market_outcome",
+        }
+        if logger is not None:
+            logger.event(
+                "paper_settlement_check",
+                market_id=market_id,
+                side=position_side,
+                stored_question=stored_question,
+                settlement_price=chosen_settlement_price,
+                yes_settlement_price=yes_settlement_price,
+                bucket_won=market_outcome is True,
+                market_outcome=market_outcome,
+                source="simmer_market_outcome",
+            )
+        return result
+
     event_info = parse_weather_event_model(stored_question, LOCATION_ALIASES, min_date=None)
     bucket = parse_temperature_bucket_model(stored_question)
     if not event_info or bucket is None:
@@ -3027,9 +3101,10 @@ def check_exit_opportunities(
                 stop_loss=round(stop_loss, 6),
                 position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
                 settlement_actual_temperature=(
-                    settlement_info["actual"]["actual_value"] if settlement_info is not None else None
+                    settlement_info.get("actual", {}).get("actual_value") if settlement_info is not None else None
                 ),
-                settlement_bucket_won=settlement_info["bucket_won"] if settlement_info is not None else None,
+                settlement_bucket_won=settlement_info.get("bucket_won") if settlement_info is not None else None,
+                settlement_source=settlement_info.get("source") if settlement_info is not None else None,
                 exit_reason=exit_reason,
                 partial_exit=partial_exit,
                 runner_after_partial_exit=hold_runner_to_settlement,
@@ -3276,6 +3351,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     )
     effective_max_position_usd = get_max_position_usd_for_mode(requested_execution_mode)
     log(f"  Max position:    ${effective_max_position_usd:.2f}")
+    if requested_execution_mode != ExecutionMode.LIVE_ENABLED:
+        log(f"  NO position:     ${STRATEGY_V1_NO_MAX_POSITION_USD:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")
     log(f"  Loop interval:   {WEATHER_BOT_LOOP_SECONDS}s")
@@ -3722,7 +3799,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             should_trade = price < ENTRY_THRESHOLD
 
         if should_trade:
-            max_position_usd = get_max_position_usd_for_mode(execution_mode)
+            max_position_usd = get_max_position_usd_for_side(execution_mode, selected_side)
             position_size = calculate_position_size(max_position_usd, smart_sizing)
             if execution_mode == ExecutionMode.LIVE_ENABLED:
                 position_size = min(position_size, LIVE_MAX_POSITION_USD)

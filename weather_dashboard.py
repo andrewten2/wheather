@@ -100,9 +100,6 @@ EXIT_MODE_LABELS = {
     "tp40": "TP40",
     "tp40_runner": "TP40+RUNNER",
 }
-EXIT_MODE_STRATEGY_MAP = {
-    ("baseline", "tp40_runner"): "tp40_runner",
-}
 
 STRATEGY_ORDER = (
     "baseline",
@@ -117,6 +114,17 @@ STRATEGY_ORDER = (
     "celsius_exact_direct",
 )
 STRATEGY_KEYS = dict(zip("abcdefghijklmn", STRATEGY_ORDER))
+
+
+def tp40_runner_strategy_id(base_strategy_id):
+    return "tp40_runner" if base_strategy_id == "baseline" else f"{base_strategy_id}_tp40_runner"
+
+
+EXIT_MODE_STRATEGY_MAP = {
+    (strategy, "tp40_runner"): tp40_runner_strategy_id(strategy)
+    for strategy in STRATEGY_ORDER
+}
+
 STRATEGY_LABELS = {
     "baseline": "BASELINE",
     "stop20_early": "STOP20 EARLY",
@@ -129,6 +137,15 @@ STRATEGY_LABELS = {
     "watchlist_no_early_stop": "WL NO ESTOP",
     "celsius_exact_direct": "C EXACT",
     "tp40_runner": "TP40 RUNNER",
+    "stop20_early_tp40_runner": "STOP20 TP40 RUNNER",
+    "no_reentry_after_stop_tp40_runner": "NO REENTRY TP40 RUNNER",
+    "early_only_tp40_runner": "EARLY TP40 RUNNER",
+    "low_risk_cities_only_tp40_runner": "LOW RISK TP40 RUNNER",
+    "no_early_stop_tp40_runner": "NO ESTOP TP40 RUNNER",
+    "watchlist_no_reentry_tp40_runner": "WL NO RE TP40 RUNNER",
+    "watchlist_early_central_tp40_runner": "WL EARLY TP40 RUNNER",
+    "watchlist_no_early_stop_tp40_runner": "WL NO ESTOP TP40 RUNNER",
+    "celsius_exact_direct_tp40_runner": "C EXACT TP40 RUNNER",
     "compare": "COMPARE ALL",
 }
 
@@ -951,17 +968,15 @@ def build_compare_panel(active_view, active_lookback_hours=DEFAULT_TRADE_LOOKBAC
     table.add_column("Realized", justify="right", width=10)
     table.add_column("Unrealized", justify="right", width=10)
     table.add_column("Winrate", justify="right", width=9)
-    rows = list(STRATEGY_KEYS.items())
-    if active_exit_mode == "tp40_runner":
-        rows.append(("6", "tp40_runner"))
-    for key, strategy in rows:
-        state = load_state(strategy)
+    for key, strategy in STRATEGY_KEYS.items():
+        effective = effective_strategy(strategy, active_exit_mode)
+        state = load_state(effective)
         positions = filter_by_view(state.get("positions"), active_view)
         trades = filter_recent_trades(filter_by_view(state.get("trades") or [], active_view), active_lookback_hours)
         summary = summarize(positions, trades)
         table.add_row(
             key,
-            STRATEGY_LABELS.get(strategy, strategy),
+            display_strategy_label(strategy, active_exit_mode),
             str(len(positions)),
             str(len(summary["buys"])),
             str(len(summary["sells"])),
