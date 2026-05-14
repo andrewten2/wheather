@@ -570,6 +570,7 @@ INDEX_HTML = r"""<!doctype html>
     document.documentElement.dataset.theme = localStorage.weatherTheme === "dark" ? "dark" : "light";
   </script>
   <style>
+    @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700;800&family=Manrope:wght@600;700;800;900&display=swap");
     :root {
       color-scheme: light;
       --bg: #f6f8fc;
@@ -602,7 +603,7 @@ INDEX_HTML = r"""<!doctype html>
       --nav: #061a2b;
       --nav-2: #09243a;
       --shadow: 0 18px 44px rgba(28, 45, 74, .09);
-      --font: "Inter", "Aptos", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+      --font: "Manrope", "Aptos", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
       --mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
     }
     html[data-theme="dark"] {
@@ -645,6 +646,7 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--ink);
       font-family: var(--font);
       font-size: 17px;
+      font-weight: 700;
       background:
         radial-gradient(circle at 28% -8%, rgba(52, 179, 255, .16), transparent 32%),
         radial-gradient(circle at 95% 0%, rgba(29, 185, 120, .12), transparent 30%),
@@ -1029,7 +1031,7 @@ INDEX_HTML = r"""<!doctype html>
     table {
       width: 100%;
       border-collapse: collapse;
-      font-family: var(--mono);
+      font-family: var(--font);
       font-size: 18px;
       font-weight: 800;
     }
@@ -1099,6 +1101,7 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 7px;
       min-width: 84px;
       padding: 8px 11px;
       border-radius: 9px;
@@ -1109,10 +1112,23 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .city-chip::before {
-      content: "●";
-      color: var(--amber);
-      font-size: 9px;
-      margin-right: 6px;
+      content: none;
+    }
+    .flag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.35em;
+      min-width: 1.35em;
+      font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+      font-size: 1.05em;
+      line-height: 1;
+      filter: saturate(1.12);
+    }
+    .top-city-name {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
     }
     .forecast-chip {
       display: inline-flex;
@@ -1561,6 +1577,22 @@ INDEX_HTML = r"""<!doctype html>
     const lookbackLabel = () => Number(state.lookback) === 0 ? "all closed" : Number(state.lookback) === 168 ? "7d closed" : `${state.lookback}h closed`;
     const lookbackShort = () => Number(state.lookback) === 0 ? "all" : Number(state.lookback) === 168 ? "7d" : `${state.lookback}h`;
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
+    const CITY_FLAGS = {
+      "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
+      "Austin": "🇺🇸", "Denver": "🇺🇸", "Houston": "🇺🇸", "Los Angeles": "🇺🇸", "San Francisco": "🇺🇸",
+      "Tel Aviv": "🇮🇱", "Munich": "🇩🇪", "London": "🇬🇧", "Tokyo": "🇯🇵", "Seoul": "🇰🇷",
+      "Ankara": "🇹🇷", "Lucknow": "🇮🇳", "Wellington": "🇳🇿", "Amsterdam": "🇳🇱", "Beijing": "🇨🇳",
+      "Buenos Aires": "🇦🇷", "Busan": "🇰🇷", "Cape Town": "🇿🇦", "Chengdu": "🇨🇳", "Chongqing": "🇨🇳",
+      "Guangzhou": "🇨🇳", "Helsinki": "🇫🇮", "Hong Kong": "🇭🇰", "Istanbul": "🇹🇷", "Jakarta": "🇮🇩",
+      "Jeddah": "🇸🇦", "Karachi": "🇵🇰", "Kuala Lumpur": "🇲🇾", "Lagos": "🇳🇬", "Madrid": "🇪🇸",
+      "Manila": "🇵🇭", "Mexico City": "🇲🇽", "Milan": "🇮🇹", "Moscow": "🇷🇺", "Panama City": "🇵🇦",
+      "Paris": "🇫🇷", "Qingdao": "🇨🇳", "Sao Paulo": "🇧🇷", "Shanghai": "🇨🇳", "Shenzhen": "🇨🇳",
+      "Singapore": "🇸🇬", "Taipei": "🇹🇼", "Toronto": "🇨🇦", "Warsaw": "🇵🇱", "Wuhan": "🇨🇳",
+      "Unknown": "🌐",
+    };
+    const cityFlag = city => CITY_FLAGS[city] || "🌐";
+    const cityChip = city => `<span class="city-chip"><span class="flag">${cityFlag(city)}</span>${esc(city)}</span>`;
+    const cityName = city => `<span class="top-city-name"><span class="flag">${cityFlag(city)}</span>${esc(city)}</span>`;
 
     function setMetric(id, value) {
       const el = document.getElementById(id);
@@ -1729,7 +1761,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
-          <td class="city-col"><span class="city-chip">${esc(p.city)}</span></td>
+          <td class="city-col">${cityChip(p.city)}</td>
           <td class="market">${esc(p.question)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
@@ -1750,7 +1782,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
-          <td class="city-col"><span class="city-chip">${esc(t.city)}</span></td>
+          <td class="city-col">${cityChip(t.city)}</td>
           <td class="market">${esc(t.question)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
@@ -1760,7 +1792,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderCities(rows) {
       setHTML("cities", rows.length ? rows.map(c => `
-        <div class="stat"><span>${esc(c.city)} · ${c.sells} sells</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
+        <div class="stat"><span>${cityName(c.city)} · ${c.sells} sells</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
       `).join("") : `<div class="empty">No city PnL yet.</div>`);
     }
 
@@ -1822,7 +1854,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
-          <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
+          <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
         </tr>
       `).join("") : `<tr><td colspan="9" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
@@ -1839,7 +1871,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
-          <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
+          <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
         </tr>
       `;
       }).join("") : `<tr><td colspan="8" class="terminal-market">No closed trades for this filter.</td></tr>`;
