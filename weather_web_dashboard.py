@@ -584,7 +584,7 @@ INDEX_HTML = r"""<!doctype html>
       --amber-soft: #fff1d8;
       --nav: #061a2b;
       --nav-2: #09243a;
-      --shadow: 0 22px 60px rgba(28, 45, 74, .10);
+      --shadow: 0 18px 44px rgba(28, 45, 74, .09);
       --font: "Inter", "Aptos", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
       --mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
     }
@@ -594,6 +594,7 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 100vh;
       color: var(--ink);
       font-family: var(--font);
+      font-size: 16px;
       background:
         radial-gradient(circle at 28% -8%, rgba(52, 179, 255, .16), transparent 32%),
         radial-gradient(circle at 95% 0%, rgba(29, 185, 120, .12), transparent 30%),
@@ -602,13 +603,13 @@ INDEX_HTML = r"""<!doctype html>
     .shell {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 272px minmax(0, 1fr);
+      grid-template-columns: 250px minmax(0, 1fr);
     }
     .sidebar {
       position: sticky;
       top: 0;
       height: 100vh;
-      padding: 28px 24px;
+      padding: 28px 22px;
       color: #eff9ff;
       background:
         radial-gradient(circle at 20% 8%, rgba(42, 219, 147, .22), transparent 22%),
@@ -616,38 +617,39 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: inset -1px 0 0 rgba(255,255,255,.06);
       display: flex;
       flex-direction: column;
-      gap: 28px;
+      gap: 26px;
     }
     .logo {
       display: grid;
-      grid-template-columns: 48px 1fr;
+      grid-template-columns: 52px 1fr;
       gap: 14px;
       align-items: center;
     }
     .logo-mark {
-      width: 48px;
-      height: 48px;
-      border-radius: 16px;
+      width: 52px;
+      height: 52px;
+      border-radius: 17px;
       display: grid;
       place-items: center;
       background: rgba(255,255,255,.08);
       color: #38e59b;
-      font-size: 28px;
+      font-size: 30px;
     }
-    .logo strong { display: block; font-size: 17px; }
-    .logo span { color: rgba(239,249,255,.68); font-size: 14px; }
+    .logo strong { display: block; font-size: 18px; line-height: 1.2; }
+    .logo span { color: rgba(239,249,255,.70); font-size: 15px; }
     .nav {
       display: grid;
-      gap: 9px;
+      gap: 10px;
     }
     .nav-item {
       display: flex;
       align-items: center;
-      gap: 13px;
-      padding: 14px 15px;
+      gap: 14px;
+      padding: 15px 16px;
       border-radius: 14px;
       color: rgba(239,249,255,.78);
-      font-weight: 700;
+      font-size: 15px;
+      font-weight: 760;
     }
     .nav-item.active {
       color: #49e5a1;
@@ -655,6 +657,16 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
     }
     .nav-icon { width: 22px; text-align: center; opacity: .92; }
+    .nav-icon svg, .stat-icon svg, .action-icon svg, .metric-icon svg {
+      width: 1em;
+      height: 1em;
+      display: block;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
     .connection {
       margin-top: auto;
       padding: 18px;
@@ -662,7 +674,8 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 16px;
       background: rgba(255,255,255,.04);
       color: rgba(239,249,255,.78);
-      line-height: 1.8;
+      line-height: 1.75;
+      font-size: 15px;
     }
     .dot-live {
       display: inline-block;
@@ -682,24 +695,24 @@ INDEX_HTML = r"""<!doctype html>
       justify-content: space-between;
       gap: 16px;
       align-items: flex-start;
-      margin-bottom: 18px;
+      margin-bottom: 16px;
     }
     .eyebrow {
       color: var(--muted);
       font-family: var(--mono);
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 800;
     }
     .eyebrow b { color: var(--green); }
     h1 {
       margin: 12px 0 8px;
-      font-size: clamp(30px, 3.1vw, 46px);
+      font-size: clamp(38px, 3.15vw, 54px);
       line-height: 1;
       letter-spacing: -.055em;
     }
     .subtitle {
       color: var(--muted);
-      font-size: 17px;
+      font-size: 18px;
       font-weight: 600;
     }
     .top-actions {
@@ -722,6 +735,24 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 800;
     }
     .icon-chip { width: 42px; justify-content: center; padding: 0; }
+    .action-icon { color: #64718d; font-size: 17px; }
+    .lookback-toggle {
+      height: 42px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: 0 8px 30px rgba(28,45,74,.06);
+      display: inline-flex;
+      gap: 4px;
+    }
+    .lookback-toggle button {
+      min-width: 62px;
+      height: 32px;
+      padding: 0 12px;
+      border-radius: 9px;
+      box-shadow: none;
+    }
     .metrics {
       display: grid;
       grid-template-columns: repeat(4, minmax(170px, 1fr));
@@ -735,24 +766,35 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: var(--shadow);
     }
     .metric-card {
-      min-height: 102px;
+      min-height: 104px;
       padding: 18px 20px;
       display: grid;
       grid-template-columns: 1fr 120px;
       gap: 12px;
       align-items: end;
     }
+    .metric-icon {
+      color: var(--green);
+      width: 34px;
+      height: 34px;
+      border-radius: 11px;
+      display: grid;
+      place-items: center;
+      background: var(--green-soft);
+      margin-bottom: 10px;
+      font-size: 18px;
+    }
     .label {
-      color: var(--muted);
+      color: #6c7892;
       font-family: var(--mono);
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 900;
       letter-spacing: .08em;
       text-transform: uppercase;
     }
     .value {
-      margin-top: 12px;
-      font-size: 28px;
+      margin-top: 11px;
+      font-size: 31px;
       font-weight: 900;
       letter-spacing: -.03em;
     }
@@ -760,19 +802,19 @@ INDEX_HTML = r"""<!doctype html>
     .negative { color: var(--red); }
     .neutral { color: var(--ink); }
     .mini-spark {
-      height: 48px;
+      height: 52px;
       border-radius: 12px;
       background: linear-gradient(180deg, rgba(22,185,120,.09), transparent);
     }
     .toolbar {
       display: grid;
       grid-template-columns: 1.1fr 1.25fr 1.5fr .95fr;
-      gap: 12px;
+      gap: 14px;
       margin-bottom: 14px;
     }
     .control {
       min-width: 0;
-      padding: 15px;
+      padding: 17px;
       display: flex;
       flex-wrap: wrap;
       gap: 9px;
@@ -782,20 +824,20 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       color: var(--muted);
       font-family: var(--mono);
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 900;
       text-transform: uppercase;
       letter-spacing: .08em;
       margin-bottom: 3px;
     }
     button {
-      min-width: 96px;
+      min-width: 104px;
       border: 1px solid var(--line);
       background: linear-gradient(180deg, #fff, #f7f9fd);
       color: #21304f;
       border-radius: 9px;
-      padding: 9px 13px;
-      font-size: 12px;
+      padding: 10px 14px;
+      font-size: 13px;
       font-weight: 900;
       cursor: pointer;
       box-shadow: 0 6px 18px rgba(32,48,78,.04);
@@ -813,15 +855,31 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--ink);
       border-radius: 12px;
       padding: 13px 14px;
-      font-size: 14px;
+      font-size: 15px;
       outline: none;
+    }
+    .search-wrap {
+      flex: 1 1 260px;
+      min-width: 0;
+      position: relative;
+    }
+    .search-wrap .action-icon {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      pointer-events: none;
+    }
+    .search-wrap .search {
+      width: 100%;
+      padding-left: 42px;
     }
     .grid {
       display: grid;
-      grid-template-columns: 350px minmax(0, 1fr);
-      gap: 18px;
+      grid-template-columns: 330px minmax(0, 1fr);
+      gap: 16px;
     }
-    .stack { display: grid; gap: 12px; }
+    .stack { display: grid; gap: 14px; align-content: start; }
     .panel {
       min-width: 0;
       padding: 18px 20px;
@@ -831,44 +889,63 @@ INDEX_HTML = r"""<!doctype html>
       justify-content: space-between;
       align-items: baseline;
       gap: 12px;
-      margin-bottom: 14px;
+      margin-bottom: 13px;
     }
     h2 {
       margin: 0;
-      font-size: 17px;
+      font-size: 18px;
       letter-spacing: -.025em;
     }
     .hint {
       color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 800;
     }
-    .stats-list { display: grid; gap: 8px; }
+    .stats-list { display: grid; gap: 9px; }
     .stat {
       display: flex;
       justify-content: space-between;
       gap: 14px;
-      padding: 6px 0;
+      padding: 7px 0;
       color: #2e3c59;
-      font-size: 14px;
-      font-weight: 750;
+      font-size: 15px;
+      font-weight: 780;
     }
+    .stat span:first-child {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .stat-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 8px;
+      display: inline-grid;
+      place-items: center;
+      color: var(--green);
+      background: var(--green-soft);
+      font-size: 14px;
+      flex: 0 0 auto;
+    }
+    .stat:nth-child(4n + 2) .stat-icon { color: var(--blue); background: var(--blue-soft); }
+    .stat:nth-child(4n + 3) .stat-icon { color: var(--red); background: var(--red-soft); }
+    .stat:nth-child(4n + 4) .stat-icon { color: #a56b00; background: var(--amber-soft); }
     .stat strong {
       font-family: var(--mono);
       color: var(--ink);
     }
-    .chart-box { height: 190px; }
+    .chart-box { height: 210px; }
     canvas { width: 100%; height: 100%; display: block; }
     .table-wrap {
       overflow: auto;
-      max-height: 520px;
+      max-height: 560px;
       border-radius: 14px;
     }
     table {
       width: 100%;
       border-collapse: collapse;
       font-family: var(--mono);
-      font-size: 12px;
+      font-size: 14px;
     }
     th {
       position: sticky;
@@ -878,31 +955,32 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: .06em;
-      font-size: 10px;
+      font-size: 11px;
       text-align: left;
-      padding: 11px 10px;
+      padding: 12px 10px;
       border-bottom: 1px solid var(--line);
     }
     td {
-      padding: 11px 10px;
+      padding: 13px 10px;
       border-bottom: 1px solid #edf1f7;
       vertical-align: middle;
     }
     tbody tr:hover { background: #fbfdff; }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
     .market {
-      min-width: 360px;
+      min-width: 420px;
       color: #43516f;
-      line-height: 1.35;
+      line-height: 1.45;
       font-family: var(--font);
-      font-weight: 650;
+      font-size: 14px;
+      font-weight: 700;
     }
     .pill {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 38px;
-      padding: 5px 8px;
+      min-width: 42px;
+      padding: 6px 9px;
       border-radius: 7px;
       font-weight: 900;
     }
@@ -912,28 +990,35 @@ INDEX_HTML = r"""<!doctype html>
     .city-chip {
       display: inline-flex;
       align-items: center;
-      padding: 5px 9px;
+      padding: 6px 10px;
       border-radius: 7px;
       color: #5d3a06;
       background: var(--amber-soft);
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 900;
       margin-right: 8px;
-      margin-bottom: 4px;
+      margin-bottom: 0;
+    }
+    .city-chip::before {
+      content: "●";
+      color: var(--amber);
+      font-size: 8px;
+      margin-right: 6px;
     }
     .forecast-chip {
       display: inline-flex;
-      padding: 5px 8px;
+      padding: 6px 9px;
       border-radius: 7px;
       color: #1162ad;
       background: var(--blue-soft);
       font-weight: 900;
       white-space: nowrap;
+      font-size: 13px;
     }
     .footer {
       text-align: center;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 700;
       padding: 22px 0 6px;
     }
@@ -950,7 +1035,7 @@ INDEX_HTML = r"""<!doctype html>
     .compare-only .standard-view { display: none; }
     .compare-view { display: none; }
     .compare-only .compare-view { display: block; }
-    @media (max-width: 1320px) {
+      @media (max-width: 1320px) {
       .shell { grid-template-columns: 220px minmax(0, 1fr); }
       .toolbar { grid-template-columns: 1fr 1fr; }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -984,7 +1069,7 @@ INDEX_HTML = r"""<!doctype html>
       button { min-width: calc(50% - 6px); }
       .search { flex-basis: 100%; }
       .panel { padding: 14px; }
-      table { font-size: 11px; }
+      table { font-size: 12px; }
     }
   </style>
 </head>
@@ -1017,6 +1102,10 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="top-actions">
           <div class="date-chip">▦ <span id="date-chip">May 14, 2026</span></div>
+          <div class="lookback-toggle">
+            <button id="lookback-24" data-lookback="24">24h</button>
+            <button id="lookback-all" data-lookback="0">All</button>
+          </div>
           <div class="icon-chip">☀</div>
           <div class="icon-chip">☾</div>
         </div>
@@ -1034,7 +1123,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
         <div class="control" id="exit-buttons"><span class="selectlike">Market Regime</span></div>
         <div class="control">
-          <input class="search" id="search" placeholder="Search market/city..." />
+          <div class="search-wrap">
+            <span class="action-icon">⌕</span>
+            <input class="search" id="search" placeholder="Search market/city..." />
+          </div>
           <button id="compare-btn" data-strategy="compare">⌘ Compare</button>
         </div>
       </section>
@@ -1212,6 +1304,7 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === state.view));
       document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
+      document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
     }
 
     async function loadOptions() {
@@ -1225,16 +1318,16 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderStats(s) {
       const rows = [
-        ["Open Trades", s.open_positions],
-        ["Buys", s.buys],
-        ["Sells", s.sells],
-        ["Wins", s.wins],
-        ["Losses", s.losses],
-        ["Winrate", `${s.winrate.toFixed(1)}%`],
-        ["Exposure", money(s.exposure)],
-        ["Stale Prices", s.stale],
+        ["↱", "Open Trades", s.open_positions],
+        ["↗", "Buys", s.buys],
+        ["↘", "Sells", s.sells],
+        ["✣", "Wins", s.wins],
+        ["✕", "Losses", s.losses],
+        ["◎", "Winrate", `${s.winrate.toFixed(1)}%`],
+        ["⌘", "Exposure", money(s.exposure)],
+        ["◷", "Stale Prices", s.stale],
       ];
-      setHTML("stats", rows.map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join(""));
+      setHTML("stats", rows.map(([ic, k, v]) => `<div class="stat"><span><span class="stat-icon">${esc(ic)}</span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join(""));
     }
 
     function setText(id, text) {
@@ -1386,6 +1479,7 @@ INDEX_HTML = r"""<!doctype html>
       if (b.dataset.view) setState({view: b.dataset.view});
       if (b.dataset.exit) setState({exit_mode: b.dataset.exit});
       if (b.dataset.strategy) setState({strategy: b.dataset.strategy});
+      if (b.dataset.lookback) setState({lookback: Number(b.dataset.lookback)});
     });
     document.getElementById("search").addEventListener("input", e => {
       state.search = e.target.value;
