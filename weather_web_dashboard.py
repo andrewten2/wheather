@@ -1053,6 +1053,18 @@ INDEX_HTML = r"""<!doctype html>
       vertical-align: middle;
     }
     tbody tr:hover { background: var(--row-hover); }
+    tbody tr.closed-profit {
+      background: linear-gradient(90deg, rgba(22,185,120,.18), rgba(22,185,120,.05));
+    }
+    tbody tr.closed-loss {
+      background: linear-gradient(90deg, rgba(255,64,92,.17), rgba(255,64,92,.05));
+    }
+    tbody tr.closed-profit:hover {
+      background: linear-gradient(90deg, rgba(22,185,120,.24), rgba(22,185,120,.08));
+    }
+    tbody tr.closed-loss:hover {
+      background: linear-gradient(90deg, rgba(255,64,92,.24), rgba(255,64,92,.08));
+    }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
     td.num {
       color: var(--num-ink);
@@ -1313,6 +1325,18 @@ INDEX_HTML = r"""<!doctype html>
       vertical-align: top;
     }
     .terminal-table tbody tr:hover { background: transparent; }
+    .terminal-table tbody tr.terminal-closed-profit {
+      background: rgba(70, 255, 145, .12);
+    }
+    .terminal-table tbody tr.terminal-closed-loss {
+      background: rgba(255, 72, 92, .14);
+    }
+    .terminal-table tbody tr.terminal-closed-profit td:first-child {
+      box-shadow: inset 3px 0 0 #62ff99;
+    }
+    .terminal-table tbody tr.terminal-closed-loss td:first-child {
+      box-shadow: inset 3px 0 0 #ff5a66;
+    }
     .terminal-market {
       min-width: 430px;
       max-width: 780px;
@@ -1415,6 +1439,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="date-chip">▦ <span id="date-chip">May 14, 2026</span></div>
           <div class="lookback-toggle">
             <button id="lookback-24" data-lookback="24">24h</button>
+            <button id="lookback-7d" data-lookback="168">7d</button>
             <button id="lookback-all" data-lookback="0">All</button>
           </div>
           <div class="layout-toggle">
@@ -1508,7 +1533,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/all · m terminal/web · d dark/light</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light</span>
       </div>
     </main>
   </div>
@@ -1533,6 +1558,9 @@ INDEX_HTML = r"""<!doctype html>
     const pct = v => v === null || v === undefined ? "n/a" : `${(Number(v) * 100).toFixed(1)}%`;
     const cls = v => Number(v || 0) > 0 ? "positive" : Number(v || 0) < 0 ? "negative" : "neutral";
     const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
+    const lookbackLabel = () => Number(state.lookback) === 0 ? "all closed" : Number(state.lookback) === 168 ? "7d closed" : `${state.lookback}h closed`;
+    const lookbackShort = () => Number(state.lookback) === 0 ? "all" : Number(state.lookback) === 168 ? "7d" : `${state.lookback}h`;
+    const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
 
     function setMetric(id, value) {
       const el = document.getElementById(id);
@@ -1712,8 +1740,10 @@ INDEX_HTML = r"""<!doctype html>
       const q = state.search.toLowerCase();
       const filtered = rows.filter(t => !q || `${t.city} ${t.question}`.toLowerCase().includes(q));
       setText("closed-count", `${filtered.length}/${rows.length}`);
-      setHTML("closed", filtered.length ? filtered.slice(0, 36).map(t => `
-        <tr>
+      setHTML("closed", filtered.length ? filtered.slice(0, 36).map(t => {
+        const rowClass = Number(t.pnl || 0) > 0 ? "closed-profit" : Number(t.pnl || 0) < 0 ? "closed-loss" : "";
+        return `
+        <tr class="${rowClass}">
           <td>${esc(t.time)}</td>
           <td><span class="pill ${t.side === "YES" ? "yes" : "no"}">${esc(t.side)}</span></td>
           <td class="regime">${esc(t.regime)}</td>
@@ -1724,7 +1754,8 @@ INDEX_HTML = r"""<!doctype html>
           <td class="market">${esc(t.question)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
-      `).join("") : `<tr><td colspan="9"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      `;
+      }).join("") : `<tr><td colspan="9"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
@@ -1797,8 +1828,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function terminalClosedRows(rows) {
-      return rows.length ? rows.map(t => `
-        <tr>
+      return rows.length ? rows.map(t => {
+        const rowClass = Number(t.pnl || 0) > 0 ? "terminal-closed-profit" : Number(t.pnl || 0) < 0 ? "terminal-closed-loss" : "";
+        return `
+        <tr class="${rowClass}">
           <td>${terminalStatusDot(t.pnl)}</td>
           <td>${esc(t.time)}</td>
           <td class="${t.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(t.side)}</td>
@@ -1808,7 +1841,8 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="8" class="terminal-market">No closed trades for this filter.</td></tr>`;
+      `;
+      }).join("") : `<tr><td colspan="8" class="terminal-market">No closed trades for this filter.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -1840,7 +1874,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="terminal-closed">
           <div class="terminal-panel">
-            <div class="terminal-title">LATEST 20 CLOSED / ${state.lookback > 0 ? state.lookback + "H" : "ALL"}</div>
+            <div class="terminal-title">LATEST 20 CLOSED / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
                 <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
@@ -1899,8 +1933,8 @@ INDEX_HTML = r"""<!doctype html>
       const meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
       setText("subtitle", "Side-by-side strategy health check across the selected city universe.");
-      setText("status-line", `${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: compare`);
-      setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h" : "all history"}`);
+      setText("status-line", `${lookbackLabel()} · effective state: compare`);
+      setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}`);
       setHTML("compare", data.rows.map(r => `
         <tr>
           <td>${esc(r.key)}</td>
@@ -1931,11 +1965,11 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.strategy_label}`);
-      setText("subtitle", `${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", `${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: ${meta.effective_strategy}`);
+      setText("subtitle", `${meta.exit_mode_label} · ${lookbackLabel()} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", `${lookbackLabel()} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
       setText("sidebar-meta", `${meta.view_label} · ${meta.strategy_label}`);
-      setText("lookback-label", state.lookback > 0 ? `${state.lookback}h closed` : "all closed");
+      setText("lookback-label", lookbackLabel());
       setMetric("m-total", s.total);
       setMetric("m-realized", s.realized);
       setMetric("m-unrealized", s.unrealized);
@@ -2008,7 +2042,7 @@ INDEX_HTML = r"""<!doctype html>
       if (key === "5") setState({exit_mode: "tp40"});
       if (key === "6") setState({exit_mode: "tp40_runner"});
       if (key === "x") setState({strategy: "compare"});
-      if (key === "t") setState({lookback: state.lookback > 0 ? 0 : 24});
+      if (key === "t") setState({lookback: nextLookback()});
       if (key === "d") applyTheme(state.theme === "dark" ? "light" : "dark");
       if (key === "m") applyLayout(state.layout === "terminal" ? "modern" : "terminal");
       if ("abcdefghij".includes(key) && state.options) {
