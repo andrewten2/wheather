@@ -625,7 +625,6 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       background: linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,.012)), var(--panel);
       box-shadow: 0 20px 70px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.07);
-      backdrop-filter: blur(16px);
       border-radius: 24px;
     }
     .brand {
@@ -721,9 +720,9 @@ INDEX_HTML = r"""<!doctype html>
       font-family: var(--mono);
       font-size: 12px;
       cursor: pointer;
-      transition: transform .18s ease, background .18s ease, border-color .18s ease;
+      transition: background .18s ease, border-color .18s ease;
     }
-    button:hover { transform: translateY(-1px); border-color: var(--line-hot); }
+    button:hover { border-color: var(--line-hot); }
     button.active {
       color: #15100a;
       background: linear-gradient(135deg, #f8c35d, #6df58a);
@@ -944,6 +943,8 @@ INDEX_HTML = r"""<!doctype html>
       search: "",
       options: null,
       lastData: null,
+      lastPayload: "",
+      lastCurveKey: "",
     };
 
     const money = v => v === null || v === undefined ? "n/a" : `${v < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}`;
@@ -954,11 +955,16 @@ INDEX_HTML = r"""<!doctype html>
 
     function setMetric(id, value) {
       const el = document.getElementById(id);
-      el.textContent = money(value);
-      el.className = `value ${cls(value)}`;
+      const nextText = money(value);
+      const nextClass = `value ${cls(value)}`;
+      if (el.textContent !== nextText) el.textContent = nextText;
+      if (el.className !== nextClass) el.className = nextClass;
     }
 
     function drawCurve(values) {
+      const curveKey = JSON.stringify(values || []);
+      if (curveKey === state.lastCurveKey) return;
+      state.lastCurveKey = curveKey;
       const canvas = document.getElementById("curve");
       const ctx = canvas.getContext("2d");
       const ratio = window.devicePixelRatio || 1;
@@ -1010,13 +1016,19 @@ INDEX_HTML = r"""<!doctype html>
       root.innerHTML = label + rows.map(row => `<button data-${attr}="${row.id}" class="${row.id === activeKey ? "active" : ""}">${row.key ? row.key + " " : ""}${esc(row.label)}</button>`).join("");
     }
 
+    function syncActiveButtons() {
+      document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === state.view));
+      document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
+      document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
+    }
+
     async function loadOptions() {
       const res = await fetch("/api/options", {cache: "no-store"});
       state.options = await res.json();
       buttonGroup("view-buttons", state.options.views, state.view, "view");
       buttonGroup("exit-buttons", state.options.exit_modes, state.exit_mode, "exit");
       buttonGroup("strategy-buttons", state.options.strategies, state.strategy, "strategy");
-      document.getElementById("compare-btn").classList.toggle("active", state.strategy === "compare");
+      syncActiveButtons();
     }
 
     function renderStats(s) {
@@ -1030,14 +1042,25 @@ INDEX_HTML = r"""<!doctype html>
         ["Exposure", money(s.exposure)],
         ["Stale Prices", s.stale],
       ];
-      document.getElementById("stats").innerHTML = rows.map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join("");
+      setHTML("stats", rows.map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join(""));
+    }
+
+    function setText(id, text) {
+      const el = document.getElementById(id);
+      const next = String(text ?? "");
+      if (el.textContent !== next) el.textContent = next;
+    }
+
+    function setHTML(id, html) {
+      const el = document.getElementById(id);
+      if (el.innerHTML !== html) el.innerHTML = html;
     }
 
     function renderPositions(rows) {
       const q = state.search.toLowerCase();
       const filtered = rows.filter(p => !q || `${p.city} ${p.question}`.toLowerCase().includes(q));
-      document.getElementById("open-count").textContent = `${filtered.length}/${rows.length}`;
-      document.getElementById("positions").innerHTML = filtered.length ? filtered.slice(0, 30).map(p => `
+      setText("open-count", `${filtered.length}/${rows.length}`);
+      setHTML("positions", filtered.length ? filtered.slice(0, 30).map(p => `
         <tr>
           <td><span class="pill ${p.side === "YES" ? "yes" : "no"}">${esc(p.side)}</span></td>
           <td class="regime">${esc(p.regime)}</td>
@@ -1049,14 +1072,14 @@ INDEX_HTML = r"""<!doctype html>
           <td class="market"><span class="city-chip">${esc(p.city)}</span><br>${esc(p.question)}</td>
           <td>${esc(p.forecast)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="9"><div class="empty">No open positions for this filter.</div></td></tr>`;
+      `).join("") : `<tr><td colspan="9"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
       const q = state.search.toLowerCase();
       const filtered = rows.filter(t => !q || `${t.city} ${t.question}`.toLowerCase().includes(q));
-      document.getElementById("closed-count").textContent = `${filtered.length}/${rows.length}`;
-      document.getElementById("closed").innerHTML = filtered.length ? filtered.slice(0, 36).map(t => `
+      setText("closed-count", `${filtered.length}/${rows.length}`);
+      setHTML("closed", filtered.length ? filtered.slice(0, 36).map(t => `
         <tr>
           <td>${esc(t.time)}</td>
           <td><span class="pill ${t.side === "YES" ? "yes" : "no"}">${esc(t.side)}</span></td>
@@ -1067,22 +1090,22 @@ INDEX_HTML = r"""<!doctype html>
           <td class="market"><span class="city-chip">${esc(t.city)}</span><br>${esc(t.question)}</td>
           <td>${esc(t.forecast)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="8"><div class="empty">No closed trades for this filter.</div></td></tr>`;
+      `).join("") : `<tr><td colspan="8"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
-      document.getElementById("cities").innerHTML = rows.length ? rows.map(c => `
+      setHTML("cities", rows.length ? rows.map(c => `
         <div class="stat"><span>${esc(c.city)} · ${c.sells} sells</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
-      `).join("") : `<div class="empty">No city PnL yet.</div>`;
+      `).join("") : `<div class="empty">No city PnL yet.</div>`);
     }
 
     function renderCompare(data) {
       document.body.classList.add("compare-only");
       const meta = data.meta;
-      document.getElementById("title").textContent = `${meta.view_label} / ${meta.exit_mode_label}`;
-      document.getElementById("subtitle").textContent = "Side-by-side strategy health check across the selected city universe.";
-      document.getElementById("compare-subtitle").textContent = `${meta.view_label} · ${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h" : "all history"}`;
-      document.getElementById("compare").innerHTML = data.rows.map(r => `
+      setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
+      setText("subtitle", "Side-by-side strategy health check across the selected city universe.");
+      setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h" : "all history"}`);
+      setHTML("compare", data.rows.map(r => `
         <tr>
           <td>${esc(r.key)}</td>
           <td>${esc(r.label)}</td>
@@ -1095,26 +1118,26 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${r.winrate.toFixed(1)}%</td>
           <td>${r.state_exists ? "ready" : "missing"}</td>
         </tr>
-      `).join("");
+      `).join(""));
       setMetric("m-total", 0);
       setMetric("m-realized", 0);
       setMetric("m-unrealized", 0);
-      document.getElementById("m-winrate").textContent = "scan";
-      document.getElementById("state-path").textContent = `state root: ${meta.state_path}`;
+      setText("m-winrate", "scan");
+      setText("state-path", `state root: ${meta.state_path}`);
     }
 
     function renderStandard(data) {
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
-      document.getElementById("title").textContent = `${meta.view_label} / ${meta.strategy_label}`;
-      document.getElementById("subtitle").textContent = `${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: ${meta.effective_strategy}`;
-      document.getElementById("lookback-label").textContent = state.lookback > 0 ? `${state.lookback}h closed` : "all closed";
+      setText("title", `${meta.view_label} / ${meta.strategy_label}`);
+      setText("subtitle", `${meta.exit_mode_label} · ${state.lookback > 0 ? state.lookback + "h closed" : "all closed"} · effective state: ${meta.effective_strategy}`);
+      setText("lookback-label", state.lookback > 0 ? `${state.lookback}h closed` : "all closed");
       setMetric("m-total", s.total);
       setMetric("m-realized", s.realized);
       setMetric("m-unrealized", s.unrealized);
-      document.getElementById("m-winrate").textContent = `${s.winrate.toFixed(1)}%`;
+      setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      document.getElementById("state-path").textContent = `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}`;
+      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}`);
       renderStats(s);
       renderPositions(data.positions);
       renderClosed(data.closed_trades);
@@ -1132,23 +1155,24 @@ INDEX_HTML = r"""<!doctype html>
       });
       const res = await fetch(`/api/state?${params}`, {cache: "no-store"});
       const data = await res.json();
+      const payload = JSON.stringify(data);
+      if (payload === state.lastPayload) return;
+      state.lastPayload = payload;
       state.lastData = data;
       if (state.strategy === "compare") renderCompare(data);
       else renderStandard(data);
-      if (state.options) {
-        buttonGroup("view-buttons", state.options.views, state.view, "view");
-        buttonGroup("exit-buttons", state.options.exit_modes, state.exit_mode, "exit");
-        buttonGroup("strategy-buttons", state.options.strategies, state.strategy, "strategy");
-        document.getElementById("compare-btn").classList.toggle("active", state.strategy === "compare");
-      }
+      syncActiveButtons();
     }
 
     function setState(patch) {
       Object.assign(state, patch);
+      state.lastPayload = "";
+      state.lastCurveKey = "";
       localStorage.weatherView = state.view;
       localStorage.weatherExitMode = state.exit_mode;
       localStorage.weatherStrategy = state.strategy;
       localStorage.weatherLookback = state.lookback;
+      syncActiveButtons();
       refresh();
     }
 
@@ -1161,6 +1185,7 @@ INDEX_HTML = r"""<!doctype html>
     });
     document.getElementById("search").addEventListener("input", e => {
       state.search = e.target.value;
+      state.lastCurveKey = "";
       if (state.lastData && state.strategy !== "compare") renderStandard(state.lastData);
     });
     document.addEventListener("keydown", e => {
@@ -1179,7 +1204,7 @@ INDEX_HTML = r"""<!doctype html>
     window.addEventListener("resize", () => state.lastData && state.strategy !== "compare" && drawCurve(state.lastData.pnl_curve));
 
     loadOptions().then(refresh);
-    setInterval(refresh, 15000);
+    setInterval(refresh, 30000);
   </script>
 </body>
 </html>
