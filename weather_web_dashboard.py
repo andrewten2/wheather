@@ -566,14 +566,31 @@ INDEX_HTML = r"""<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Weather Bot Control</title>
+  <script>
+    document.documentElement.dataset.theme = localStorage.weatherTheme === "dark" ? "dark" : "light";
+  </script>
   <style>
     :root {
+      color-scheme: light;
       --bg: #f6f8fc;
       --ink: #0c1834;
       --muted: #73809a;
       --soft: #eef3f9;
       --card: #ffffff;
+      --panel-bg: rgba(255,255,255,.86);
       --line: #dde5f0;
+      --thead-bg: #fbfcff;
+      --row-line: #edf1f7;
+      --row-hover: #fbfdff;
+      --stat-ink: #2e3c59;
+      --market-ink: #24324f;
+      --num-ink: #0d1833;
+      --empty-bg: #fbfcff;
+      --input-bg: #eef3f9;
+      --date-ink: #20304e;
+      --button-bg: linear-gradient(180deg, #fff, #f7f9fd);
+      --city-bg: #ffe2ad;
+      --city-ink: #533603;
       --green: #16b978;
       --green-soft: #dff8eb;
       --red: #ff405c;
@@ -588,17 +605,56 @@ INDEX_HTML = r"""<!doctype html>
       --font: "Inter", "Aptos", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
       --mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
     }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #08111d;
+      --ink: #edf5ff;
+      --muted: #9ba9c0;
+      --soft: #111f33;
+      --card: #0d1828;
+      --panel-bg: rgba(13,24,40,.94);
+      --line: #203149;
+      --thead-bg: #0f1b2c;
+      --row-line: #1b2a40;
+      --row-hover: #102039;
+      --stat-ink: #d9e6f8;
+      --market-ink: #e7eefb;
+      --num-ink: #f6f9ff;
+      --empty-bg: #0b1728;
+      --input-bg: #13233a;
+      --date-ink: #e8f0fb;
+      --button-bg: linear-gradient(180deg, #162842, #101d31);
+      --city-bg: #3a2a12;
+      --city-ink: #ffd48a;
+      --green: #38df9a;
+      --green-soft: rgba(56,223,154,.16);
+      --red: #ff6177;
+      --red-soft: rgba(255,97,119,.15);
+      --blue: #55adff;
+      --blue-soft: rgba(85,173,255,.16);
+      --amber: #ffc463;
+      --amber-soft: rgba(255,196,99,.17);
+      --nav: #020a12;
+      --nav-2: #061827;
+      --shadow: 0 18px 44px rgba(0, 0, 0, .28);
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
       color: var(--ink);
       font-family: var(--font);
-      font-size: 16px;
+      font-size: 17px;
       background:
         radial-gradient(circle at 28% -8%, rgba(52, 179, 255, .16), transparent 32%),
         radial-gradient(circle at 95% 0%, rgba(29, 185, 120, .12), transparent 30%),
         linear-gradient(180deg, #fbfcff 0%, var(--bg) 100%);
+    }
+    html[data-theme="dark"] body {
+      background:
+        radial-gradient(circle at 20% -10%, rgba(48, 139, 255, .18), transparent 30%),
+        radial-gradient(circle at 95% 0%, rgba(56, 223, 154, .13), transparent 28%),
+        linear-gradient(180deg, #0b1624 0%, var(--bg) 100%);
     }
     .shell {
       min-height: 100vh;
@@ -732,9 +788,19 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
       padding: 0 14px;
       color: #20304e;
+      color: var(--date-ink);
       font-weight: 800;
     }
     .icon-chip { width: 42px; justify-content: center; padding: 0; }
+    button.icon-chip {
+      min-width: 42px;
+      cursor: pointer;
+    }
+    button.icon-chip.active {
+      color: #0f5b3b;
+      background: var(--green-soft);
+      border-color: rgba(22,185,120,.34);
+    }
     .action-icon { color: #64718d; font-size: 17px; }
     .lookback-toggle {
       height: 42px;
@@ -760,7 +826,7 @@ INDEX_HTML = r"""<!doctype html>
       margin-bottom: 18px;
     }
     .metric-card, .panel, .control {
-      background: rgba(255,255,255,.86);
+      background: var(--panel-bg);
       border: 1px solid var(--line);
       border-radius: 18px;
       box-shadow: var(--shadow);
@@ -833,8 +899,8 @@ INDEX_HTML = r"""<!doctype html>
     button {
       min-width: 104px;
       border: 1px solid var(--line);
-      background: linear-gradient(180deg, #fff, #f7f9fd);
-      color: #21304f;
+      background: var(--button-bg);
+      color: var(--date-ink);
       border-radius: 9px;
       padding: 10px 14px;
       font-size: 13px;
@@ -851,7 +917,7 @@ INDEX_HTML = r"""<!doctype html>
       flex: 1 1 210px;
       min-width: 0;
       border: 0;
-      background: var(--soft);
+      background: var(--input-bg);
       color: var(--ink);
       border-radius: 12px;
       padding: 13px 14px;
@@ -893,13 +959,14 @@ INDEX_HTML = r"""<!doctype html>
     }
     h2 {
       margin: 0;
-      font-size: 18px;
+      font-size: 20px;
+      font-weight: 900;
       letter-spacing: -.025em;
     }
     .hint {
       color: var(--muted);
-      font-size: 13px;
-      font-weight: 800;
+      font-size: 14px;
+      font-weight: 900;
     }
     .stats-list { display: grid; gap: 9px; }
     .stat {
@@ -907,9 +974,9 @@ INDEX_HTML = r"""<!doctype html>
       justify-content: space-between;
       gap: 14px;
       padding: 7px 0;
-      color: #2e3c59;
-      font-size: 15px;
-      font-weight: 780;
+      color: var(--stat-ink);
+      font-size: 17px;
+      font-weight: 850;
     }
     .stat span:first-child {
       display: inline-flex;
@@ -933,6 +1000,7 @@ INDEX_HTML = r"""<!doctype html>
     .stat strong {
       font-family: var(--mono);
       color: var(--ink);
+      font-weight: 950;
     }
     .chart-box { height: 210px; }
     canvas { width: 100%; height: 100%; display: block; }
@@ -945,43 +1013,54 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       border-collapse: collapse;
       font-family: var(--mono);
-      font-size: 14px;
+      font-size: 18px;
+      font-weight: 800;
     }
     th {
       position: sticky;
       top: 0;
       z-index: 1;
-      background: #fbfcff;
+      background: var(--thead-bg);
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: .06em;
-      font-size: 11px;
+      font-size: 13px;
+      font-weight: 950;
       text-align: left;
-      padding: 12px 10px;
+      padding: 15px 13px;
       border-bottom: 1px solid var(--line);
     }
     td {
-      padding: 13px 10px;
-      border-bottom: 1px solid #edf1f7;
+      padding: 19px 13px;
+      border-bottom: 1px solid var(--row-line);
       vertical-align: middle;
     }
-    tbody tr:hover { background: #fbfdff; }
+    tbody tr:hover { background: var(--row-hover); }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.num {
+      color: var(--num-ink);
+      font-weight: 900;
+    }
+    .city-col {
+      width: 118px;
+      min-width: 108px;
+    }
     .market {
-      min-width: 420px;
-      color: #43516f;
+      min-width: 520px;
+      color: var(--market-ink);
       line-height: 1.45;
       font-family: var(--font);
-      font-size: 14px;
-      font-weight: 700;
+      font-size: 18px;
+      font-weight: 850;
     }
     .pill {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       min-width: 42px;
-      padding: 6px 9px;
+      padding: 7px 10px;
       border-radius: 7px;
+      font-size: 16px;
       font-weight: 900;
     }
     .yes { color: #0f8e58; background: var(--green-soft); }
@@ -990,19 +1069,20 @@ INDEX_HTML = r"""<!doctype html>
     .city-chip {
       display: inline-flex;
       align-items: center;
-      padding: 6px 10px;
-      border-radius: 7px;
-      color: #5d3a06;
-      background: var(--amber-soft);
-      font-size: 12px;
+      justify-content: center;
+      min-width: 84px;
+      padding: 8px 11px;
+      border-radius: 9px;
+      color: var(--city-ink);
+      background: var(--city-bg);
+      font-size: 16px;
       font-weight: 900;
-      margin-right: 8px;
-      margin-bottom: 0;
+      white-space: nowrap;
     }
     .city-chip::before {
       content: "●";
       color: var(--amber);
-      font-size: 8px;
+      font-size: 9px;
       margin-right: 6px;
     }
     .forecast-chip {
@@ -1013,7 +1093,8 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--blue-soft);
       font-weight: 900;
       white-space: nowrap;
-      font-size: 13px;
+      font-size: 16px;
+      font-weight: 950;
     }
     .footer {
       text-align: center;
@@ -1025,7 +1106,7 @@ INDEX_HTML = r"""<!doctype html>
     .footer span:first-child { display: block; margin-bottom: 6px; }
     .empty {
       color: var(--muted);
-      background: #fbfcff;
+      background: var(--empty-bg);
       border: 1px dashed var(--line);
       border-radius: 14px;
       padding: 22px;
@@ -1106,8 +1187,8 @@ INDEX_HTML = r"""<!doctype html>
             <button id="lookback-24" data-lookback="24">24h</button>
             <button id="lookback-all" data-lookback="0">All</button>
           </div>
-          <div class="icon-chip">☀</div>
-          <div class="icon-chip">☾</div>
+          <button class="icon-chip" id="theme-light" data-theme-choice="light" title="Light theme">☀</button>
+          <button class="icon-chip" id="theme-dark" data-theme-choice="dark" title="Dark theme">☾</button>
         </div>
       </section>
 
@@ -1152,7 +1233,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL %</th><th>Held</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
@@ -1161,7 +1242,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -1192,6 +1273,7 @@ INDEX_HTML = r"""<!doctype html>
       exit_mode: localStorage.weatherExitMode || "tp40",
       strategy: localStorage.weatherStrategy || "baseline",
       lookback: Number(localStorage.weatherLookback || 24),
+      theme: localStorage.weatherTheme || "light",
       search: "",
       options: null,
       lastData: null,
@@ -1305,6 +1387,16 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
+      document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
+    }
+
+    function applyTheme(theme) {
+      state.theme = theme === "dark" ? "dark" : "light";
+      document.documentElement.dataset.theme = state.theme;
+      localStorage.weatherTheme = state.theme;
+      syncActiveButtons();
+      state.lastCurveKey = "";
+      if (state.lastData && state.strategy !== "compare") drawCurve(state.lastData.pnl_curve);
     }
 
     async function loadOptions() {
@@ -1354,10 +1446,11 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
-          <td class="market"><span class="city-chip">${esc(p.city)}</span><br>${esc(p.question)}</td>
+          <td class="city-col"><span class="city-chip">${esc(p.city)}</span></td>
+          <td class="market">${esc(p.question)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
-      `).join("") : `<tr><td colspan="9"><div class="empty">No open positions for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="10"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -1372,10 +1465,11 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
-          <td class="market"><span class="city-chip">${esc(t.city)}</span><br>${esc(t.question)}</td>
+          <td class="city-col"><span class="city-chip">${esc(t.city)}</span></td>
+          <td class="market">${esc(t.question)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
-      `).join("") : `<tr><td colspan="8"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="9"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
@@ -1480,6 +1574,7 @@ INDEX_HTML = r"""<!doctype html>
       if (b.dataset.exit) setState({exit_mode: b.dataset.exit});
       if (b.dataset.strategy) setState({strategy: b.dataset.strategy});
       if (b.dataset.lookback) setState({lookback: Number(b.dataset.lookback)});
+      if (b.dataset.themeChoice) applyTheme(b.dataset.themeChoice);
     });
     document.getElementById("search").addEventListener("input", e => {
       state.search = e.target.value;
@@ -1494,6 +1589,7 @@ INDEX_HTML = r"""<!doctype html>
       if (key === "6") setState({exit_mode: "tp40_runner"});
       if (key === "x") setState({strategy: "compare"});
       if (key === "t") setState({lookback: state.lookback > 0 ? 0 : 24});
+      if (key === "d") applyTheme(state.theme === "dark" ? "light" : "dark");
       if ("abcdefghij".includes(key) && state.options) {
         const found = state.options.strategies.find(s => s.key === key);
         if (found) setState({strategy: found.id});
@@ -1501,6 +1597,7 @@ INDEX_HTML = r"""<!doctype html>
     });
     window.addEventListener("resize", () => state.lastData && state.strategy !== "compare" && drawCurve(state.lastData.pnl_curve));
 
+    applyTheme(state.theme);
     loadOptions().then(refresh);
     setInterval(refresh, 30000);
   </script>
