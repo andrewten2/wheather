@@ -976,6 +976,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .stake-control {
       align-content: flex-start;
+      grid-template-columns: 1fr;
     }
     .stake-control .stake-sim {
       width: 100%;
@@ -1047,47 +1048,97 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar {
       display: grid;
-      grid-template-columns: 1.05fr 1.25fr 1.25fr .95fr 1fr;
+      grid-template-columns: minmax(250px, .9fr) minmax(390px, 1.45fr) minmax(300px, 1fr) minmax(260px, .82fr) minmax(320px, 1fr);
       gap: 14px;
       margin-bottom: 14px;
+      align-items: stretch;
     }
     .control {
       min-width: 0;
-      padding: 17px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 9px;
+      padding: 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+      gap: 10px;
+      align-items: start;
+      align-content: start;
+    }
+    .control.strategy-control {
+      grid-template-columns: repeat(2, minmax(138px, 1fr));
+    }
+    .control.exit-control {
+      grid-template-columns: repeat(2, minmax(132px, 1fr));
+    }
+    .control.search-control {
+      grid-template-columns: 1fr auto;
       align-items: center;
+      align-content: center;
+    }
+    .control.search-control .selectlike {
+      display: none;
     }
     .selectlike {
-      width: 100%;
+      grid-column: 1 / -1;
       color: var(--muted);
       font-family: var(--mono);
       font-size: 12px;
       font-weight: 900;
       text-transform: uppercase;
       letter-spacing: .08em;
-      margin-bottom: 3px;
+      margin-bottom: 2px;
     }
     button {
-      min-width: 104px;
+      min-width: 0;
+      width: 100%;
       border: 1px solid var(--line);
       background: var(--button-bg);
       color: var(--date-ink);
-      border-radius: 9px;
-      padding: 10px 14px;
+      border-radius: 11px;
+      padding: 11px 12px;
       font-size: 13px;
       font-weight: 900;
       cursor: pointer;
       box-shadow: 0 6px 18px rgba(32,48,78,.04);
+      white-space: nowrap;
+      text-align: center;
+      transition: transform .12s ease, border-color .12s ease, background .12s ease, box-shadow .12s ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(22,185,120,.28);
+      box-shadow: 0 10px 24px rgba(32,48,78,.08);
+    }
+    .toolbar button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-height: 40px;
+      line-height: 1.1;
+    }
+    .keycap {
+      min-width: 18px;
+      height: 18px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 6px;
+      background: rgba(15,34,65,.06);
+      color: #53617c;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 950;
+      text-transform: uppercase;
     }
     button.active {
       color: #0f5b3b;
       background: linear-gradient(180deg, #dff8eb, #c7f0d9);
       border-color: #a8e5c4;
     }
+    button.active .keycap {
+      color: #0f5b3b;
+      background: rgba(15,91,59,.10);
+    }
     .search {
-      flex: 1 1 210px;
+      width: 100%;
       min-width: 0;
       border: 0;
       background: var(--input-bg);
@@ -1098,7 +1149,6 @@ INDEX_HTML = r"""<!doctype html>
       outline: none;
     }
     .search-wrap {
-      flex: 1 1 260px;
       min-width: 0;
       position: relative;
     }
@@ -1646,9 +1696,9 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="toolbar">
-        <div class="control" id="view-buttons"><span class="selectlike">Cities</span></div>
-        <div class="control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
-        <div class="control" id="exit-buttons"><span class="selectlike">Market Regime</span></div>
+        <div class="control city-control" id="view-buttons"><span class="selectlike">Cities</span></div>
+        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
+        <div class="control exit-control" id="exit-buttons"><span class="selectlike">Market Regime</span></div>
         <div class="control stake-control">
           <span class="selectlike">Stake Simulator</span>
           <div class="stake-sim" title="Empty = real historical stake. Fill values to recalculate PnL as if every YES/NO trade used that stake.">
@@ -1656,7 +1706,7 @@ INDEX_HTML = r"""<!doctype html>
             <label>NO $<input id="no-stake" data-stake-side="no" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
           </div>
         </div>
-        <div class="control">
+        <div class="control search-control">
           <div class="search-wrap">
             <span class="action-icon">⌕</span>
             <input class="search" id="search" placeholder="Search market/city..." />
@@ -1867,7 +1917,12 @@ INDEX_HTML = r"""<!doctype html>
     function buttonGroup(id, rows, activeKey, attr) {
       const root = document.getElementById(id);
       const label = root.querySelector(".selectlike")?.outerHTML || "";
-      root.innerHTML = label + rows.map(row => `<button data-${attr}="${row.id}" class="${row.id === activeKey ? "active" : ""}">${row.key ? row.key + " " : ""}${esc(row.label)}</button>`).join("");
+      root.innerHTML = label + rows.map(row => `
+        <button data-${attr}="${row.id}" class="${row.id === activeKey ? "active" : ""}">
+          ${row.key ? `<span class="keycap">${esc(row.key)}</span>` : ""}
+          <span>${esc(row.label)}</span>
+        </button>
+      `).join("");
     }
 
     function syncActiveButtons() {
