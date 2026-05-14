@@ -1161,6 +1161,10 @@ INDEX_HTML = r"""<!doctype html>
     .compare-only .standard-view { display: none; }
     .compare-view { display: none; }
     .compare-only .compare-view { display: block; }
+    .compare-view .table-wrap {
+      max-height: none;
+      overflow: visible;
+    }
     .terminal-view { display: none; }
     body.terminal-layout {
       background: #000;
