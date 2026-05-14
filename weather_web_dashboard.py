@@ -971,6 +971,27 @@ INDEX_HTML = r"""<!doctype html>
       border-color: rgba(22,185,120,.55);
       box-shadow: 0 0 0 3px rgba(22,185,120,.12);
     }
+    .top-actions > .stake-sim {
+      display: none;
+    }
+    .stake-control {
+      align-content: flex-start;
+    }
+    .stake-control .stake-sim {
+      width: 100%;
+      justify-content: space-between;
+      padding: 9px 10px;
+    }
+    .stake-control .stake-sim label {
+      flex: 1;
+      justify-content: space-between;
+      font-size: 12px;
+    }
+    .stake-control .stake-sim input {
+      width: 86px;
+      height: 34px;
+      font-size: 15px;
+    }
     .metrics {
       display: grid;
       grid-template-columns: repeat(4, minmax(170px, 1fr));
@@ -1026,7 +1047,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar {
       display: grid;
-      grid-template-columns: 1.1fr 1.25fr 1.5fr .95fr;
+      grid-template-columns: 1.05fr 1.25fr 1.25fr .95fr 1fr;
       gap: 14px;
       margin-bottom: 14px;
     }
@@ -1333,6 +1354,9 @@ INDEX_HTML = r"""<!doctype html>
     body.terminal-layout .eyebrow {
       display: none;
     }
+    body.terminal-layout .top-actions > .stake-sim {
+      display: inline-flex;
+    }
     body.terminal-layout .date-chip,
     body.terminal-layout .lookback-toggle,
     body.terminal-layout .layout-toggle,
@@ -1597,8 +1621,8 @@ INDEX_HTML = r"""<!doctype html>
         <div class="top-actions">
           <div class="date-chip">▦ <span id="date-chip">May 14, 2026</span></div>
           <div class="stake-sim" title="Recalculate dashboard as if every new position used these stake sizes. Empty = real size from state.">
-            <label>YES $<input id="yes-stake" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
-            <label>NO $<input id="no-stake" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
+            <label>YES $<input data-stake-side="yes" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
+            <label>NO $<input data-stake-side="no" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
           </div>
           <div class="lookback-toggle">
             <button id="lookback-24" data-lookback="24">24h</button>
@@ -1625,6 +1649,13 @@ INDEX_HTML = r"""<!doctype html>
         <div class="control" id="view-buttons"><span class="selectlike">Cities</span></div>
         <div class="control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
         <div class="control" id="exit-buttons"><span class="selectlike">Market Regime</span></div>
+        <div class="control stake-control">
+          <span class="selectlike">Stake Simulator</span>
+          <div class="stake-sim" title="Empty = real historical stake. Fill values to recalculate PnL as if every YES/NO trade used that stake.">
+            <label>YES $<input id="yes-stake" data-stake-side="yes" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
+            <label>NO $<input id="no-stake" data-stake-side="no" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
+          </div>
+        </div>
         <div class="control">
           <div class="search-wrap">
             <span class="action-icon">⌕</span>
@@ -1846,10 +1877,12 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
       document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
       document.querySelectorAll("[data-layout]").forEach(btn => btn.classList.toggle("active", btn.dataset.layout === state.layout));
-      const yesInput = document.getElementById("yes-stake");
-      const noInput = document.getElementById("no-stake");
-      if (yesInput && yesInput.value !== state.yesStake) yesInput.value = state.yesStake;
-      if (noInput && noInput.value !== state.noStake) noInput.value = state.noStake;
+      document.querySelectorAll('[data-stake-side="yes"]').forEach(input => {
+        if (input.value !== state.yesStake) input.value = state.yesStake;
+      });
+      document.querySelectorAll('[data-stake-side="no"]').forEach(input => {
+        if (input.value !== state.noStake) input.value = state.noStake;
+      });
     }
 
     function applyTheme(theme) {
@@ -2240,8 +2273,9 @@ INDEX_HTML = r"""<!doctype html>
       window.clearTimeout(stakeTimer);
       stakeTimer = window.setTimeout(refresh, 350);
     }
-    document.getElementById("yes-stake").addEventListener("input", e => updateStake("yes", e.target.value));
-    document.getElementById("no-stake").addEventListener("input", e => updateStake("no", e.target.value));
+    document.querySelectorAll("[data-stake-side]").forEach(input => {
+      input.addEventListener("input", e => updateStake(e.target.dataset.stakeSide, e.target.value));
+    });
     document.addEventListener("keydown", e => {
       if (e.target.tagName === "INPUT") return;
       const key = e.key.toLowerCase();
