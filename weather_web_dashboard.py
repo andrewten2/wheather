@@ -192,6 +192,18 @@ def to_float(value):
         return None
 
 
+def parse_optional_float(value) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = to_float(text)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
 def parse_dt(value):
     if not value:
         return None
@@ -309,6 +321,36 @@ def forecast_label(item: dict) -> str:
     return f"{source_mark}:{value}°{unit}" if unit else f"{source_mark}:{value}"
 
 
+def trade_cost(trade: dict, entry_price: float | None = None) -> float | None:
+    for field in ("cost_usd", "position_cost_usd", "notional_usd"):
+        value = to_float(trade.get(field))
+        if value is not None and value > 0:
+            return value
+    price = entry_price if entry_price is not None else trade_price(
+        trade,
+        ("simulated_fill_price", "entry_price", "price", "market_price", "avg_price", "avg_cost"),
+    )
+    shares = to_float(trade.get("filled_shares")) or to_float(trade.get("requested_shares"))
+    if price is not None and shares is not None and shares > 0:
+        return price * shares
+    return None
+
+
+def stake_for_side(side: str | None, yes_stake: float | None, no_stake: float | None) -> float | None:
+    side = (side or "").lower()
+    if side == "yes":
+        return yes_stake
+    if side == "no":
+        return no_stake
+    return None
+
+
+def scaled_value(value: float | None, original_cost: float | None, target_stake: float | None) -> float | None:
+    if value is None or target_stake is None or original_cost is None or original_cost <= 0:
+        return value
+    return value * target_stake / original_cost
+
+
 def build_buy_history(trades: list[dict]) -> dict:
     history = {}
     for trade in trades:
@@ -327,6 +369,7 @@ def build_buy_history(trades: list[dict]) -> dict:
                     entry,
                     trade.get("entry_regime"),
                     forecast_label(trade),
+                    trade_cost(trade, entry),
                 )
             )
     for items in history.values():
@@ -334,10 +377,11 @@ def build_buy_history(trades: list[dict]) -> dict:
     return history
 
 
-def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str | None, str]:
+def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str | None, str, float | None]:
     entry = trade_price(trade, ("entry_price", "avg_price", "avg_cost", "buy_price", "entry_fill_price"))
     regime = trade.get("entry_regime")
     forecast = forecast_label(trade)
+    original_cost = trade_cost(trade, entry)
     market_key = trade.get("market_id") or clean_text(trade.get("question"))
     side = (trade.get("side") or "?").upper()
     sell_time = parse_dt(trade.get("timestamp"))
@@ -353,10 +397,19 @@ def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str
             regime = last[2]
         if forecast == "-":
             forecast = last[3]
-    return entry, regime, forecast
+        if not original_cost:
+            original_cost = last[4]
+    return entry, regime, forecast, original_cost
 
 
-def position_pnl(position: dict):
+def adjusted_trade_pnl(trade: dict, buy_history: dict, yes_stake: float | None = None, no_stake: float | None = None) -> float | None:
+    realized = to_float(trade.get("realized_pnl"))
+    entry, _, _, original_cost = closed_entry_info(trade, buy_history)
+    target_stake = stake_for_side(trade.get("side"), yes_stake, no_stake)
+    return scaled_value(realized, original_cost or trade_cost(trade, entry), target_stake)
+
+
+def position_pnl(position: dict, yes_stake: float | None = None, no_stake: float | None = None):
     pnl = to_float(position.get("unrealized_pnl"))
     current_price = to_float(position.get("current_price"))
     shares = to_float(position.get("shares")) or 0.0
@@ -366,7 +419,17 @@ def position_pnl(position: dict):
     pnl_pct = to_float(position.get("unrealized_pnl_pct"))
     if pnl_pct is None and pnl is not None and cost_basis > 0:
         pnl_pct = pnl / cost_basis
+    target_stake = stake_for_side(position.get("side"), yes_stake, no_stake)
+    pnl = scaled_value(pnl, cost_basis, target_stake)
     return pnl, pnl_pct
+
+
+def position_exposure(position: dict, yes_stake: float | None = None, no_stake: float | None = None) -> float:
+    cost_basis = to_float(position.get("cost_basis")) or 0.0
+    target_stake = stake_for_side(position.get("side"), yes_stake, no_stake)
+    if target_stake is not None and cost_basis > 0:
+        return target_stake
+    return cost_basis
 
 
 def age_label(value: str | None) -> str:
@@ -388,14 +451,22 @@ def format_time(value: str | None) -> str:
     return parsed.strftime("%m-%d %H:%M") if parsed else ""
 
 
-def summarize(positions: list[dict], trades: list[dict]) -> dict:
+def summarize(
+    positions: list[dict],
+    trades: list[dict],
+    buy_history: dict | None = None,
+    yes_stake: float | None = None,
+    no_stake: float | None = None,
+) -> dict:
+    buy_history = buy_history or {}
     buys = [trade for trade in trades if trade.get("action") == "buy"]
     sells = [trade for trade in trades if trade.get("action") == "sell"]
-    wins = [trade for trade in sells if (to_float(trade.get("realized_pnl")) or 0.0) > 0]
-    losses = [trade for trade in sells if (to_float(trade.get("realized_pnl")) or 0.0) < 0]
-    realized = sum(to_float(trade.get("realized_pnl")) or 0.0 for trade in sells)
-    unrealized = sum(position_pnl(position)[0] or 0.0 for position in positions)
-    exposure = sum(to_float(position.get("cost_basis")) or 0.0 for position in positions)
+    sell_pnls = [adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake) or 0.0 for trade in sells]
+    wins = [pnl for pnl in sell_pnls if pnl > 0]
+    losses = [pnl for pnl in sell_pnls if pnl < 0]
+    realized = sum(sell_pnls)
+    unrealized = sum(position_pnl(position, yes_stake, no_stake)[0] or 0.0 for position in positions)
+    exposure = sum(position_exposure(position, yes_stake, no_stake) for position in positions)
     total = realized + unrealized
     stale = sum(1 for position in positions if to_float(position.get("current_price")) is None)
     return {
@@ -423,18 +494,25 @@ def cumulative(values_: list[float]) -> list[float]:
     return out
 
 
-def normalize_state(strategy: str, view: str, exit_mode: str, lookback_hours: float) -> dict:
+def normalize_state(
+    strategy: str,
+    view: str,
+    exit_mode: str,
+    lookback_hours: float,
+    yes_stake: float | None = None,
+    no_stake: float | None = None,
+) -> dict:
     effective = effective_strategy(strategy, exit_mode)
     state = load_state(effective)
     raw_positions = filter_by_view(state.get("positions"), view)
     raw_trades = filter_by_view(state.get("trades") or [], view)
     trades = filter_recent_trades(raw_trades, lookback_hours)
-    summary = summarize(raw_positions, trades)
     buy_history = build_buy_history(raw_trades)
+    summary = summarize(raw_positions, trades, buy_history, yes_stake, no_stake)
 
     positions = []
     for position in raw_positions:
-        pnl, pnl_pct = position_pnl(position)
+        pnl, pnl_pct = position_pnl(position, yes_stake, no_stake)
         question = clean_text(position.get("question") or position.get("market_id"))
         positions.append(
             {
@@ -449,7 +527,7 @@ def normalize_state(strategy: str, view: str, exit_mode: str, lookback_hours: fl
                 "pnl_pct": pnl_pct,
                 "age": age_label(position.get("opened_at")),
                 "opened_at": position.get("opened_at"),
-                "cost_basis": to_float(position.get("cost_basis")),
+                "cost_basis": position_exposure(position, yes_stake, no_stake),
                 "shares": to_float(position.get("shares")),
                 "forecast": forecast_label(position),
                 "stale": to_float(position.get("current_price")) is None,
@@ -461,18 +539,20 @@ def normalize_state(strategy: str, view: str, exit_mode: str, lookback_hours: fl
     sells.sort(key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ), reverse=True)
     closed_trades = []
     for trade in sells[:80]:
-        entry, regime, forecast = closed_entry_info(trade, buy_history)
+        entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
+        side = (trade.get("side") or "?").upper()
         question = clean_text(trade.get("question") or trade.get("market_id"))
         closed_trades.append(
             {
                 "timestamp": trade.get("timestamp"),
                 "time": format_time(trade.get("timestamp")),
                 "city": city_for_question(question),
-                "side": (trade.get("side") or "?").upper(),
+                "side": side,
                 "regime": (regime or "?").upper(),
                 "entry_price": entry,
                 "exit_price": to_float(trade.get("simulated_fill_price")),
-                "pnl": to_float(trade.get("realized_pnl")),
+                "pnl": adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake),
+                "stake": stake_for_side(side, yes_stake, no_stake) or original_cost,
                 "forecast": forecast,
                 "question": question,
             }
@@ -484,9 +564,12 @@ def normalize_state(strategy: str, view: str, exit_mode: str, lookback_hours: fl
         city = city_for_question(question)
         city_pnl.setdefault(city, {"city": city, "sells": 0, "pnl": 0.0})
         city_pnl[city]["sells"] += 1
-        city_pnl[city]["pnl"] += to_float(trade.get("realized_pnl")) or 0.0
+        city_pnl[city]["pnl"] += adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake) or 0.0
 
-    pnl_values = [to_float(trade.get("realized_pnl")) or 0.0 for trade in sorted(sells, key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ))]
+    pnl_values = [
+        adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake) or 0.0
+        for trade in sorted(sells, key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ))
+    ]
 
     return {
         "meta": {
@@ -500,6 +583,8 @@ def normalize_state(strategy: str, view: str, exit_mode: str, lookback_hours: fl
             "view": view,
             "view_label": VIEW_LABELS.get(view, view),
             "lookback_hours": lookback_hours,
+            "yes_stake": yes_stake,
+            "no_stake": no_stake,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_updated_at": state.get("updated_at"),
         },
@@ -511,14 +596,21 @@ def normalize_state(strategy: str, view: str, exit_mode: str, lookback_hours: fl
     }
 
 
-def compare_state(view: str, exit_mode: str, lookback_hours: float) -> dict:
+def compare_state(
+    view: str,
+    exit_mode: str,
+    lookback_hours: float,
+    yes_stake: float | None = None,
+    no_stake: float | None = None,
+) -> dict:
     rows = []
     for key, strategy in STRATEGY_KEYS.items():
         effective = effective_strategy(strategy, exit_mode)
         state = load_state(effective)
         positions = filter_by_view(state.get("positions"), view)
         trades = filter_recent_trades(filter_by_view(state.get("trades") or [], view), lookback_hours)
-        summary = summarize(positions, trades)
+        buy_history = build_buy_history(filter_by_view(state.get("trades") or [], view))
+        summary = summarize(positions, trades, buy_history, yes_stake, no_stake)
         rows.append(
             {
                 "key": key,
@@ -538,6 +630,8 @@ def compare_state(view: str, exit_mode: str, lookback_hours: float) -> dict:
             "view": view,
             "view_label": VIEW_LABELS.get(view, view),
             "lookback_hours": lookback_hours,
+            "yes_stake": yes_stake,
+            "no_stake": no_stake,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_path": str(STATE_ROOT),
         },
@@ -837,6 +931,45 @@ INDEX_HTML = r"""<!doctype html>
       padding: 0 12px;
       border-radius: 9px;
       box-shadow: none;
+    }
+    .stake-sim {
+      min-height: 42px;
+      padding: 5px 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: 0 8px 30px rgba(28,45,74,.06);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .stake-sim label {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .stake-sim input {
+      width: 68px;
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--input-bg);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 900;
+      outline: none;
+      padding: 0 8px;
+    }
+    .stake-sim input:focus {
+      border-color: rgba(22,185,120,.55);
+      box-shadow: 0 0 0 3px rgba(22,185,120,.12);
     }
     .metrics {
       display: grid;
@@ -1203,11 +1336,17 @@ INDEX_HTML = r"""<!doctype html>
     body.terminal-layout .date-chip,
     body.terminal-layout .lookback-toggle,
     body.terminal-layout .layout-toggle,
+    body.terminal-layout .stake-sim,
     body.terminal-layout .icon-chip {
       background: #050707;
       border-color: #00b7d8;
       color: #e9fff6;
       box-shadow: none;
+    }
+    body.terminal-layout .stake-sim input {
+      background: #000;
+      border-color: #00b7d8;
+      color: #62ff99;
     }
     body.terminal-layout button {
       background: #050707;
@@ -1457,6 +1596,10 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="top-actions">
           <div class="date-chip">▦ <span id="date-chip">May 14, 2026</span></div>
+          <div class="stake-sim" title="Recalculate dashboard as if every new position used these stake sizes. Empty = real size from state.">
+            <label>YES $<input id="yes-stake" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
+            <label>NO $<input id="no-stake" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
+          </div>
           <div class="lookback-toggle">
             <button id="lookback-24" data-lookback="24">24h</button>
             <button id="lookback-7d" data-lookback="168">7d</button>
@@ -1512,7 +1655,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
@@ -1521,7 +1664,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -1566,6 +1709,8 @@ INDEX_HTML = r"""<!doctype html>
       lookback: Number(localStorage.weatherLookback || 24),
       theme: localStorage.weatherTheme || "light",
       layout: localStorage.weatherLayout || "modern",
+      yesStake: localStorage.weatherYesStake || "",
+      noStake: localStorage.weatherNoStake || "",
       search: "",
       options: null,
       lastData: null,
@@ -1581,6 +1726,7 @@ INDEX_HTML = r"""<!doctype html>
     const lookbackLabel = () => Number(state.lookback) === 0 ? "all closed" : Number(state.lookback) === 168 ? "7d closed" : `${state.lookback}h closed`;
     const lookbackShort = () => Number(state.lookback) === 0 ? "all" : Number(state.lookback) === 168 ? "7d" : `${state.lookback}h`;
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
+    const stakeLabel = () => state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
     const CITY_FLAGS = {
       "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
       "Austin": "🇺🇸", "Denver": "🇺🇸", "Houston": "🇺🇸", "Los Angeles": "🇺🇸", "San Francisco": "🇺🇸",
@@ -1700,6 +1846,10 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
       document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
       document.querySelectorAll("[data-layout]").forEach(btn => btn.classList.toggle("active", btn.dataset.layout === state.layout));
+      const yesInput = document.getElementById("yes-stake");
+      const noInput = document.getElementById("no-stake");
+      if (yesInput && yesInput.value !== state.yesStake) yesInput.value = state.yesStake;
+      if (noInput && noInput.value !== state.noStake) noInput.value = state.noStake;
     }
 
     function applyTheme(theme) {
@@ -1760,6 +1910,7 @@ INDEX_HTML = r"""<!doctype html>
         <tr>
           <td><span class="pill ${p.side === "YES" ? "yes" : "no"}">${esc(p.side)}</span></td>
           <td class="regime">${esc(p.regime)}</td>
+          <td class="num">${money(p.cost_basis)}</td>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
@@ -1769,7 +1920,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="market">${esc(p.question)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
-      `).join("") : `<tr><td colspan="10"><div class="empty">No open positions for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="11"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -1783,6 +1934,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(t.time)}</td>
           <td><span class="pill ${t.side === "YES" ? "yes" : "no"}">${esc(t.side)}</span></td>
           <td class="regime">${esc(t.regime)}</td>
+          <td class="num">${money(t.stake)}</td>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
@@ -1791,7 +1943,7 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="9"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="10"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
@@ -1853,6 +2005,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${terminalStatusDot(p.pnl)}</td>
           <td class="${p.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(p.side)}</td>
           <td class="terminal-regime">${esc(p.regime)}</td>
+          <td class="num">${money(p.cost_basis)}</td>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
@@ -1860,7 +2013,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(p.age)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="9" class="terminal-market">No open positions for this filter.</td></tr>`;
+      `).join("") : `<tr><td colspan="10" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
 
     function terminalClosedRows(rows) {
@@ -1872,13 +2025,14 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(t.time)}</td>
           <td class="${t.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(t.side)}</td>
           <td class="terminal-regime">${esc(t.regime)}</td>
+          <td class="num">${money(t.stake)}</td>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="8" class="terminal-market">No closed trades for this filter.</td></tr>`;
+      }).join("") : `<tr><td colspan="9" class="terminal-market">No closed trades for this filter.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -1902,7 +2056,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
                 <tbody>${terminalOpenRows(data.positions)}</tbody>
               </table>
             </div>
@@ -1913,7 +2067,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">LATEST 20 CLOSED / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
                 <tbody>${terminalClosedRows(left)}</tbody>
               </table>
             </div>
@@ -1922,7 +2076,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">NEXT 20</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
                 <tbody>${terminalClosedRows(right)}</tbody>
               </table>
             </div>
@@ -1969,8 +2123,8 @@ INDEX_HTML = r"""<!doctype html>
       const meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
       setText("subtitle", "Side-by-side strategy health check across the selected city universe.");
-      setText("status-line", `${lookbackLabel()} · effective state: compare`);
-      setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}`);
+      setText("status-line", `${lookbackLabel()}${stakeLabel()} · effective state: compare`);
+      setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
       setHTML("compare", data.rows.map(r => `
         <tr>
           <td>${esc(r.key)}</td>
@@ -2001,8 +2155,8 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.strategy_label}`);
-      setText("subtitle", `${meta.exit_mode_label} · ${lookbackLabel()} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", `${lookbackLabel()} · effective state: ${meta.effective_strategy}`);
+      setText("subtitle", `${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", `${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
       setText("sidebar-meta", `${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", lookbackLabel());
@@ -2032,6 +2186,8 @@ INDEX_HTML = r"""<!doctype html>
         lookback: state.lookback,
         ts: Date.now(),
       });
+      if (state.yesStake) params.set("yes_stake", state.yesStake);
+      if (state.noStake) params.set("no_stake", state.noStake);
       const res = await fetch(`/api/state?${params}`, {cache: "no-store"});
       const data = await res.json();
       const payload = JSON.stringify(data);
@@ -2052,6 +2208,8 @@ INDEX_HTML = r"""<!doctype html>
       localStorage.weatherStrategy = state.strategy;
       localStorage.weatherLookback = state.lookback;
       localStorage.weatherLayout = state.layout;
+      localStorage.weatherYesStake = state.yesStake;
+      localStorage.weatherNoStake = state.noStake;
       syncActiveButtons();
       refresh();
     }
@@ -2071,6 +2229,19 @@ INDEX_HTML = r"""<!doctype html>
       state.lastCurveKey = "";
       if (state.lastData && state.strategy !== "compare") renderStandard(state.lastData);
     });
+    let stakeTimer = null;
+    function updateStake(side, value) {
+      const clean = String(value || "").trim();
+      if (side === "yes") state.yesStake = clean;
+      else state.noStake = clean;
+      localStorage.weatherYesStake = state.yesStake;
+      localStorage.weatherNoStake = state.noStake;
+      state.lastPayload = "";
+      window.clearTimeout(stakeTimer);
+      stakeTimer = window.setTimeout(refresh, 350);
+    }
+    document.getElementById("yes-stake").addEventListener("input", e => updateStake("yes", e.target.value));
+    document.getElementById("no-stake").addEventListener("input", e => updateStake("no", e.target.value));
     document.addEventListener("keydown", e => {
       if (e.target.tagName === "INPUT") return;
       const key = e.key.toLowerCase();
@@ -2126,13 +2297,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 lookback = float(qs.get("lookback", [str(DEFAULT_LOOKBACK_HOURS)])[0])
             except (TypeError, ValueError):
                 lookback = DEFAULT_LOOKBACK_HOURS
+            yes_stake = parse_optional_float(qs.get("yes_stake", [""])[0])
+            no_stake = parse_optional_float(qs.get("no_stake", [""])[0])
             if strategy not in STRATEGY_ORDER and strategy != "compare":
                 strategy = "baseline"
             if view not in VIEW_ORDER:
                 view = "watchlist"
             if exit_mode not in EXIT_MODE_ORDER:
                 exit_mode = "tp40"
-            body = compare_state(view, exit_mode, lookback) if strategy == "compare" else normalize_state(strategy, view, exit_mode, lookback)
+            body = (
+                compare_state(view, exit_mode, lookback, yes_stake, no_stake)
+                if strategy == "compare"
+                else normalize_state(strategy, view, exit_mode, lookback, yes_stake, no_stake)
+            )
             return self.send_bytes(json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         if path == "/healthz":
             return self.send_bytes(b"ok", "text/plain; charset=utf-8")
