@@ -798,26 +798,31 @@ INDEX_HTML = r"""<!doctype html>
     .shell {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 250px minmax(0, 1fr);
+      grid-template-columns: 92px minmax(0, 1fr);
     }
     .sidebar {
       position: sticky;
       top: 0;
       height: 100vh;
-      padding: 28px 22px;
+      padding: 22px 14px;
       color: #eff9ff;
       background:
-        radial-gradient(circle at 20% 8%, rgba(42, 219, 147, .22), transparent 22%),
-        linear-gradient(180deg, var(--nav) 0%, #03111f 100%);
-      box-shadow: inset -1px 0 0 rgba(255,255,255,.06);
+        radial-gradient(circle at 50% 7%, rgba(42, 219, 147, .24), transparent 20%),
+        linear-gradient(180deg, rgba(255,255,255,.82) 0%, rgba(255,255,255,.62) 100%);
+      box-shadow: inset -1px 0 0 rgba(15,34,65,.08), 18px 0 44px rgba(51,73,104,.08);
       display: flex;
       flex-direction: column;
       gap: 26px;
     }
+    html[data-theme="dark"] .sidebar {
+      background:
+        radial-gradient(circle at 50% 7%, rgba(56,223,154,.18), transparent 20%),
+        linear-gradient(180deg, var(--nav) 0%, #03111f 100%);
+      box-shadow: inset -1px 0 0 rgba(255,255,255,.06);
+    }
     .logo {
-      display: grid;
-      grid-template-columns: 52px 1fr;
-      gap: 14px;
+      display: flex;
+      justify-content: center;
       align-items: center;
     }
     .logo-mark {
@@ -830,30 +835,48 @@ INDEX_HTML = r"""<!doctype html>
       color: #38e59b;
       font-size: 30px;
     }
-    .logo strong { display: block; font-size: 18px; line-height: 1.2; }
-    .logo span { color: rgba(239,249,255,.70); font-size: 15px; }
+    .logo strong,
+    .logo span {
+      display: none;
+    }
     .nav {
       display: grid;
-      gap: 10px;
+      gap: 12px;
+      justify-items: center;
     }
     .nav-item {
       display: flex;
       align-items: center;
-      gap: 14px;
-      padding: 15px 16px;
-      border-radius: 14px;
-      color: rgba(239,249,255,.78);
-      font-size: 15px;
+      justify-content: center;
+      width: 52px;
+      height: 52px;
+      padding: 0;
+      border-radius: 16px;
+      color: #74809a;
+      font-size: 0;
       font-weight: 760;
       cursor: pointer;
       user-select: none;
+      transition: transform .14s ease, background .14s ease, color .14s ease, box-shadow .14s ease;
+    }
+    html[data-theme="dark"] .nav-item { color: rgba(239,249,255,.72); }
+    .nav-item:hover {
+      transform: translateY(-1px);
+      color: #22b772;
+      background: rgba(22,185,120,.08);
     }
     .nav-item.active {
-      color: #49e5a1;
-      background: rgba(255,255,255,.10);
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
+      color: #17b978;
+      background: var(--green-soft);
+      box-shadow: inset 0 0 0 1px rgba(22,185,120,.16), 0 14px 28px rgba(22,185,120,.12);
     }
-    .nav-icon { width: 22px; text-align: center; opacity: .92; }
+    .nav-icon {
+      width: auto;
+      text-align: center;
+      opacity: .96;
+      font-size: 24px;
+      line-height: 1;
+    }
     .nav-icon svg, .stat-icon svg, .action-icon svg, .metric-icon svg {
       width: 1em;
       height: 1em;
@@ -866,13 +889,27 @@ INDEX_HTML = r"""<!doctype html>
     }
     .connection {
       margin-top: auto;
-      padding: 18px;
-      border: 1px solid rgba(255,255,255,.16);
+      padding: 12px 6px;
+      border: 1px solid rgba(15,34,65,.10);
       border-radius: 16px;
+      background: rgba(255,255,255,.58);
+      color: #67728a;
+      line-height: 1.45;
+      font-size: 0;
+      text-align: center;
+    }
+    .connection::after {
+      content: "Live";
+      display: block;
+      margin-top: 5px;
+      font-size: 11px;
+      font-weight: 900;
+      color: #17a86d;
+    }
+    html[data-theme="dark"] .connection {
+      border-color: rgba(255,255,255,.14);
       background: rgba(255,255,255,.04);
-      color: rgba(239,249,255,.78);
-      line-height: 1.75;
-      font-size: 15px;
+      color: rgba(239,249,255,.70);
     }
     .dot-live {
       display: inline-block;
@@ -885,7 +922,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .page {
       min-width: 0;
-      padding: 24px 28px 28px;
+      padding: 24px 28px 28px 32px;
     }
     .topbar {
       display: flex;
@@ -960,6 +997,40 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 9px;
       box-shadow: none;
     }
+    .custom-lookback {
+      height: 42px;
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: 0 8px 30px rgba(28,45,74,.06);
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .custom-lookback input {
+      width: 70px;
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--input-bg);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 900;
+      outline: none;
+      padding: 0 8px;
+    }
+    .custom-lookback input:focus {
+      border-color: rgba(22,185,120,.55);
+      box-shadow: 0 0 0 3px rgba(22,185,120,.12);
+    }
     .layout-toggle {
       height: 42px;
       padding: 4px;
@@ -1021,12 +1092,19 @@ INDEX_HTML = r"""<!doctype html>
     }
     .stake-control {
       align-content: flex-start;
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr) 96px;
     }
     .stake-control .stake-sim {
       width: 100%;
       justify-content: space-between;
       padding: 9px 10px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      min-height: 112px;
+      box-shadow: none;
+      position: relative;
+      z-index: 1;
     }
     .stake-control .stake-sim label {
       flex: 1;
@@ -1037,6 +1115,34 @@ INDEX_HTML = r"""<!doctype html>
       width: 86px;
       height: 34px;
       font-size: 15px;
+    }
+    .stake-total-card {
+      min-height: 112px;
+      padding: 14px 12px;
+      border-radius: 16px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: #0f8e58;
+      background: linear-gradient(180deg, rgba(22,185,120,.12), rgba(22,185,120,.06));
+      border: 1px solid rgba(22,185,120,.16);
+      position: relative;
+      z-index: 1;
+    }
+    .stake-total-card span {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 950;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .stake-total-card strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 24px;
+      font-weight: 950;
+      letter-spacing: -.03em;
     }
     .metrics {
       display: grid;
@@ -1093,19 +1199,39 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(250px, .9fr) minmax(390px, 1.45fr) minmax(300px, 1fr) minmax(260px, .82fr) minmax(320px, 1fr);
+      grid-template-columns: minmax(250px, 1fr) minmax(430px, 1.75fr) minmax(250px, .9fr) minmax(270px, .9fr) minmax(300px, .95fr);
       gap: 14px;
       margin-bottom: 14px;
       align-items: stretch;
     }
     .control {
       min-width: 0;
-      padding: 16px;
+      padding: 20px;
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
-      gap: 10px;
+      gap: 12px;
       align-items: start;
       align-content: start;
+      min-height: 168px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.82), rgba(255,255,255,.68)),
+        var(--panel-bg);
+      position: relative;
+      overflow: hidden;
+    }
+    html[data-theme="dark"] .control {
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.015)),
+        var(--panel-bg);
+    }
+    .control::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 94% 18%, rgba(22,185,120,.09), transparent 26%),
+        linear-gradient(180deg, transparent 42px, rgba(15,34,65,.05) 43px, transparent 44px);
     }
     .control.strategy-control {
       grid-template-columns: repeat(2, minmax(138px, 1fr));
@@ -1114,12 +1240,9 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: repeat(2, minmax(132px, 1fr));
     }
     .control.search-control {
-      grid-template-columns: 1fr auto;
-      align-items: center;
-      align-content: center;
-    }
-    .control.search-control .selectlike {
-      display: none;
+      grid-template-columns: 1fr;
+      align-items: stretch;
+      align-content: start;
     }
     .selectlike {
       grid-column: 1 / -1;
@@ -1129,7 +1252,22 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 900;
       text-transform: uppercase;
       letter-spacing: .08em;
-      margin-bottom: 2px;
+      margin-bottom: 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      position: relative;
+      z-index: 1;
+    }
+    .control-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 9px;
+      display: inline-grid;
+      place-items: center;
+      color: #17b978;
+      background: var(--green-soft);
+      font-size: 17px;
     }
     button {
       min-width: 0;
@@ -1146,6 +1284,8 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
       text-align: center;
       transition: transform .12s ease, border-color .12s ease, background .12s ease, box-shadow .12s ease;
+      position: relative;
+      z-index: 1;
     }
     button:hover {
       transform: translateY(-1px);
@@ -1157,8 +1297,9 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       gap: 7px;
-      min-height: 40px;
+      min-height: 48px;
       line-height: 1.1;
+      border-radius: 13px;
     }
     .keycap {
       min-width: 18px;
@@ -1175,8 +1316,9 @@ INDEX_HTML = r"""<!doctype html>
     }
     button.active {
       color: #0f5b3b;
-      background: linear-gradient(180deg, #dff8eb, #c7f0d9);
+      background: linear-gradient(180deg, #e4f9ee, #c9f1da);
       border-color: #a8e5c4;
+      box-shadow: 0 10px 24px rgba(22,185,120,.13), inset 0 0 0 1px rgba(255,255,255,.45);
     }
     button.active .keycap {
       color: #0f5b3b;
@@ -1192,10 +1334,14 @@ INDEX_HTML = r"""<!doctype html>
       padding: 13px 14px;
       font-size: 15px;
       outline: none;
+      min-height: 52px;
+      position: relative;
+      z-index: 1;
     }
     .search-wrap {
       min-width: 0;
       position: relative;
+      z-index: 1;
     }
     .search-wrap .action-icon {
       position: absolute;
@@ -1486,6 +1632,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     body.terminal-layout .date-chip,
     body.terminal-layout .lookback-toggle,
+    body.terminal-layout .custom-lookback,
     body.terminal-layout .layout-toggle,
     body.terminal-layout .stake-sim,
     body.terminal-layout .icon-chip {
@@ -1495,6 +1642,11 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: none;
     }
     body.terminal-layout .stake-sim input {
+      background: #000;
+      border-color: #00b7d8;
+      color: #62ff99;
+    }
+    body.terminal-layout .custom-lookback input {
       background: #000;
       border-color: #00b7d8;
       color: #62ff99;
@@ -1681,7 +1833,7 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
       @media (max-width: 1320px) {
-      .shell { grid-template-columns: 220px minmax(0, 1fr); }
+      .shell { grid-template-columns: 92px minmax(0, 1fr); }
       .toolbar { grid-template-columns: 1fr 1fr; }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
@@ -1698,7 +1850,10 @@ INDEX_HTML = r"""<!doctype html>
         overflow-x: auto;
         padding-bottom: 4px;
       }
-      .nav-item { min-width: max-content; }
+      .nav-item {
+        min-width: 52px;
+        flex: 0 0 52px;
+      }
       .connection { display: none; }
       .page { padding: 18px; }
       .topbar, .grid { grid-template-columns: 1fr; display: grid; }
@@ -1727,15 +1882,15 @@ INDEX_HTML = r"""<!doctype html>
         <div><strong>Weather Bot</strong><span>Web Control</span></div>
       </div>
       <nav class="nav">
-        <div class="nav-item active" data-page="dashboard"><span class="nav-icon">⌂</span>Dashboard</div>
-        <div class="nav-item"><span class="nav-icon">◷</span>Portfolio Pulse</div>
-        <div class="nav-item"><span class="nav-icon">▣</span>Open Positions</div>
-        <div class="nav-item"><span class="nav-icon">▤</span>Closed Trades</div>
-        <div class="nav-item"><span class="nav-icon">⌁</span>Realized Curve</div>
-        <div class="nav-item" data-page="charts"><span class="nav-icon">▥</span>Графики</div>
-        <div class="nav-item"><span class="nav-icon">◎</span>Top Cities</div>
-        <div class="nav-item"><span class="nav-icon">✣</span>Strategies</div>
-        <div class="nav-item"><span class="nav-icon">☆</span>Watchlist</div>
+        <div class="nav-item active" data-page="dashboard" title="Dashboard"><span class="nav-icon">⌂</span>Dashboard</div>
+        <div class="nav-item" title="Portfolio Pulse"><span class="nav-icon">◷</span>Portfolio Pulse</div>
+        <div class="nav-item" title="Open Positions"><span class="nav-icon">▣</span>Open Positions</div>
+        <div class="nav-item" title="Closed Trades"><span class="nav-icon">▤</span>Closed Trades</div>
+        <div class="nav-item" title="Realized Curve"><span class="nav-icon">⌁</span>Realized Curve</div>
+        <div class="nav-item" data-page="charts" title="Графики"><span class="nav-icon">▥</span>Графики</div>
+        <div class="nav-item" title="Top Cities"><span class="nav-icon">◎</span>Top Cities</div>
+        <div class="nav-item" title="Strategies"><span class="nav-icon">✣</span>Strategies</div>
+        <div class="nav-item" title="Watchlist"><span class="nav-icon">☆</span>Watchlist</div>
       </nav>
       <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
     </aside>
@@ -1758,6 +1913,10 @@ INDEX_HTML = r"""<!doctype html>
             <button id="lookback-7d" data-lookback="168">7d</button>
             <button id="lookback-all" data-lookback="0">All</button>
           </div>
+          <label class="custom-lookback" title="Custom lookback window in days">
+            Days
+            <input id="lookback-days" type="number" min="1" step="1" placeholder="1-30" inputmode="numeric">
+          </label>
           <div class="layout-toggle">
             <button data-layout="modern">Web</button>
             <button data-layout="terminal">Terminal</button>
@@ -1775,17 +1934,19 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="toolbar">
-        <div class="control city-control" id="view-buttons"><span class="selectlike">Cities</span></div>
-        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike">Strategies</span></div>
-        <div class="control exit-control" id="exit-buttons"><span class="selectlike">Market Regime</span></div>
+        <div class="control city-control" id="view-buttons"><span class="selectlike"><span class="control-icon">▥</span>Cities</span></div>
+        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike"><span class="control-icon">⌁</span>Strategies</span></div>
+        <div class="control exit-control" id="exit-buttons"><span class="selectlike"><span class="control-icon">◷</span>Market Regime</span></div>
         <div class="control stake-control">
-          <span class="selectlike">Stake Simulator</span>
+          <span class="selectlike"><span class="control-icon">$</span>Stake Simulator</span>
           <div class="stake-sim" title="Empty = real historical stake. Fill values to recalculate PnL as if every YES/NO trade used that stake.">
             <label>YES $<input id="yes-stake" data-stake-side="yes" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
             <label>NO $<input id="no-stake" data-stake-side="no" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
           </div>
+          <div class="stake-total-card"><span>Total stake</span><strong id="stake-total">real</strong></div>
         </div>
         <div class="control search-control">
+          <span class="selectlike"><span class="control-icon">⌕</span>Search / Compare</span>
           <div class="search-wrap">
             <span class="action-icon">⌕</span>
             <input class="search" id="search" placeholder="Search market/city..." />
@@ -1910,8 +2071,21 @@ INDEX_HTML = r"""<!doctype html>
     const pct = v => v === null || v === undefined ? "n/a" : `${(Number(v) * 100).toFixed(1)}%`;
     const cls = v => Number(v || 0) > 0 ? "positive" : Number(v || 0) < 0 ? "negative" : "neutral";
     const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
-    const lookbackLabel = () => Number(state.lookback) === 0 ? "all closed" : Number(state.lookback) === 168 ? "7d closed" : `${state.lookback}h closed`;
-    const lookbackShort = () => Number(state.lookback) === 0 ? "all" : Number(state.lookback) === 168 ? "7d" : `${state.lookback}h`;
+    const lookbackDays = () => Number(state.lookback) > 0 && Number(state.lookback) % 24 === 0 ? Number(state.lookback) / 24 : null;
+    const lookbackLabel = () => {
+      const days = lookbackDays();
+      if (Number(state.lookback) === 0) return "all closed";
+      if (Number(state.lookback) === 24) return "24h closed";
+      if (days) return `${days}d closed`;
+      return `${state.lookback}h closed`;
+    };
+    const lookbackShort = () => {
+      const days = lookbackDays();
+      if (Number(state.lookback) === 0) return "all";
+      if (Number(state.lookback) === 24) return "24h";
+      if (days) return `${days}d`;
+      return `${state.lookback}h`;
+    };
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
     const stakeLabel = () => state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
     const CITY_FLAGS = {
@@ -2132,6 +2306,19 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll('[data-stake-side="no"]').forEach(input => {
         if (input.value !== state.noStake) input.value = state.noStake;
       });
+      const stakeTotal = document.getElementById("stake-total");
+      if (stakeTotal) {
+        const yes = Number(state.yesStake || 0);
+        const no = Number(state.noStake || 0);
+        const hasStake = state.yesStake || state.noStake;
+        stakeTotal.textContent = hasStake ? money(yes + no) : "real";
+      }
+      const daysInput = document.getElementById("lookback-days");
+      if (daysInput) {
+        const days = lookbackDays();
+        const next = days ? String(days) : "";
+        if (daysInput.value !== next && document.activeElement !== daysInput) daysInput.value = next;
+      }
     }
 
     function applyTheme(theme) {
@@ -2586,6 +2773,15 @@ INDEX_HTML = r"""<!doctype html>
     }
     document.querySelectorAll("[data-stake-side]").forEach(input => {
       input.addEventListener("input", e => updateStake(e.target.dataset.stakeSide, e.target.value));
+    });
+    let lookbackTimer = null;
+    document.getElementById("lookback-days").addEventListener("input", e => {
+      const value = Number(e.target.value);
+      if (!Number.isFinite(value) || value <= 0) return;
+      window.clearTimeout(lookbackTimer);
+      lookbackTimer = window.setTimeout(() => {
+        setState({lookback: Math.round(value) * 24});
+      }, 250);
     });
     document.addEventListener("keydown", e => {
       if (e.target.tagName === "INPUT") return;
