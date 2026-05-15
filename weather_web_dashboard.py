@@ -351,6 +351,12 @@ def scaled_value(value: float | None, original_cost: float | None, target_stake:
     return value * target_stake / original_cost
 
 
+def simulated_price_pnl(entry_price: float | None, exit_price: float | None, target_stake: float | None) -> float | None:
+    if target_stake is None or entry_price is None or exit_price is None or entry_price <= 0:
+        return None
+    return target_stake * (exit_price / entry_price - 1.0)
+
+
 def build_buy_history(trades: list[dict]) -> dict:
     history = {}
     for trade in trades:
@@ -406,12 +412,16 @@ def adjusted_trade_pnl(trade: dict, buy_history: dict, yes_stake: float | None =
     realized = to_float(trade.get("realized_pnl"))
     entry, _, _, original_cost = closed_entry_info(trade, buy_history)
     target_stake = stake_for_side(trade.get("side"), yes_stake, no_stake)
+    simulated = simulated_price_pnl(entry, to_float(trade.get("simulated_fill_price")), target_stake)
+    if simulated is not None:
+        return simulated
     return scaled_value(realized, original_cost or trade_cost(trade, entry), target_stake)
 
 
 def position_pnl(position: dict, yes_stake: float | None = None, no_stake: float | None = None):
     pnl = to_float(position.get("unrealized_pnl"))
     current_price = to_float(position.get("current_price"))
+    entry_price = to_float(position.get("entry_price")) or to_float(position.get("avg_cost"))
     shares = to_float(position.get("shares")) or 0.0
     cost_basis = to_float(position.get("cost_basis")) or 0.0
     if pnl is None and current_price is not None:
@@ -420,6 +430,11 @@ def position_pnl(position: dict, yes_stake: float | None = None, no_stake: float
     if pnl_pct is None and pnl is not None and cost_basis > 0:
         pnl_pct = pnl / cost_basis
     target_stake = stake_for_side(position.get("side"), yes_stake, no_stake)
+    simulated = simulated_price_pnl(entry_price, current_price, target_stake)
+    if simulated is not None:
+        pnl = simulated
+        pnl_pct = simulated / target_stake if target_stake else pnl_pct
+        return pnl, pnl_pct
     pnl = scaled_value(pnl, cost_basis, target_stake)
     return pnl, pnl_pct
 
