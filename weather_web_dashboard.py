@@ -1199,7 +1199,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(250px, 1fr) minmax(430px, 1.75fr) minmax(250px, .9fr) minmax(270px, .9fr) minmax(300px, .95fr);
+      grid-template-columns: minmax(250px, .9fr) minmax(720px, 1.9fr) minmax(250px, .82fr) minmax(270px, .86fr) minmax(300px, .9fr);
       gap: 14px;
       margin-bottom: 14px;
       align-items: stretch;
@@ -1234,7 +1234,8 @@ INDEX_HTML = r"""<!doctype html>
         linear-gradient(180deg, transparent 42px, rgba(15,34,65,.05) 43px, transparent 44px);
     }
     .control.strategy-control {
-      grid-template-columns: repeat(2, minmax(138px, 1fr));
+      grid-template-columns: repeat(5, minmax(104px, 1fr));
+      grid-auto-rows: minmax(48px, auto);
     }
     .control.exit-control {
       grid-template-columns: repeat(2, minmax(132px, 1fr));
@@ -1835,6 +1836,7 @@ INDEX_HTML = r"""<!doctype html>
       @media (max-width: 1320px) {
       .shell { grid-template-columns: 92px minmax(0, 1fr); }
       .toolbar { grid-template-columns: 1fr 1fr; }
+      .control.strategy-control { grid-template-columns: repeat(2, minmax(138px, 1fr)); }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 980px) {
@@ -1859,6 +1861,7 @@ INDEX_HTML = r"""<!doctype html>
       .topbar, .grid { grid-template-columns: 1fr; display: grid; }
       .top-actions { justify-content: start; }
       .toolbar, .metrics { grid-template-columns: 1fr; }
+      .control.strategy-control { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
       .charts-grid { grid-template-columns: 1fr; }
       .market { min-width: 280px; }
     }
