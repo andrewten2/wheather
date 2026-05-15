@@ -845,6 +845,8 @@ INDEX_HTML = r"""<!doctype html>
       color: rgba(239,249,255,.78);
       font-size: 15px;
       font-weight: 760;
+      cursor: pointer;
+      user-select: none;
     }
     .nav-item.active {
       color: #49e5a1;
@@ -1408,9 +1410,40 @@ INDEX_HTML = r"""<!doctype html>
     .compare-only .standard-view { display: none; }
     .compare-view { display: none; }
     .compare-only .compare-view { display: block; }
+    .charts-only .standard-view,
+    .charts-only .compare-view {
+      display: none;
+    }
+    .charts-view {
+      display: none;
+    }
+    .charts-only .charts-view {
+      display: block;
+    }
     .compare-view .table-wrap {
       max-height: none;
       overflow: visible;
+    }
+    .charts-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .strategy-chart {
+      min-height: 390px;
+    }
+    .strategy-chart canvas {
+      height: 300px;
+    }
+    .chart-note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .chart-leader {
+      color: var(--green);
+      font-weight: 950;
     }
     .terminal-view { display: none; }
     body.terminal-layout {
@@ -1426,6 +1459,7 @@ INDEX_HTML = r"""<!doctype html>
     body.terminal-layout .toolbar,
     body.terminal-layout .standard-view,
     body.terminal-layout .compare-view,
+    body.terminal-layout .charts-view,
     body.terminal-layout .footer {
       display: none !important;
     }
@@ -1670,6 +1704,7 @@ INDEX_HTML = r"""<!doctype html>
       .topbar, .grid { grid-template-columns: 1fr; display: grid; }
       .top-actions { justify-content: start; }
       .toolbar, .metrics { grid-template-columns: 1fr; }
+      .charts-grid { grid-template-columns: 1fr; }
       .market { min-width: 280px; }
     }
     @media (max-width: 560px) {
@@ -1692,11 +1727,12 @@ INDEX_HTML = r"""<!doctype html>
         <div><strong>Weather Bot</strong><span>Web Control</span></div>
       </div>
       <nav class="nav">
-        <div class="nav-item active"><span class="nav-icon">⌂</span>Dashboard</div>
+        <div class="nav-item active" data-page="dashboard"><span class="nav-icon">⌂</span>Dashboard</div>
         <div class="nav-item"><span class="nav-icon">◷</span>Portfolio Pulse</div>
         <div class="nav-item"><span class="nav-icon">▣</span>Open Positions</div>
         <div class="nav-item"><span class="nav-icon">▤</span>Closed Trades</div>
         <div class="nav-item"><span class="nav-icon">⌁</span>Realized Curve</div>
+        <div class="nav-item" data-page="charts"><span class="nav-icon">▥</span>Графики</div>
         <div class="nav-item"><span class="nav-icon">◎</span>Top Cities</div>
         <div class="nav-item"><span class="nav-icon">✣</span>Strategies</div>
         <div class="nav-item"><span class="nav-icon">☆</span>Watchlist</div>
@@ -1806,6 +1842,32 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="charts-view">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Strategy Metric Plots</h2>
+            <span class="hint" id="charts-subtitle"></span>
+          </div>
+          <div class="charts-grid">
+            <div class="panel strategy-chart">
+              <div class="panel-head"><h2>Realized PnL</h2><span class="hint" id="chart-realized-leader"></span></div>
+              <canvas id="chart-realized"></canvas>
+              <div class="chart-note">Closed-trade PnL by tested strategy.</div>
+            </div>
+            <div class="panel strategy-chart">
+              <div class="panel-head"><h2>Unrealized PnL</h2><span class="hint" id="chart-unrealized-leader"></span></div>
+              <canvas id="chart-unrealized"></canvas>
+              <div class="chart-note">Open-position mark-to-market PnL.</div>
+            </div>
+            <div class="panel strategy-chart">
+              <div class="panel-head"><h2>Winrate</h2><span class="hint" id="chart-winrate-leader"></span></div>
+              <canvas id="chart-winrate"></canvas>
+              <div class="chart-note">Winning closed trades as a share of all sells.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="terminal-view" id="terminal-view">
         <div class="terminal-header">
           <div class="terminal-brand" id="terminal-brand">ALL CITIES / BASELINE</div>
@@ -1828,6 +1890,7 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     const state = {
       view: localStorage.weatherView || "watchlist",
+      page: localStorage.weatherPage || "dashboard",
       exit_mode: localStorage.weatherExitMode || "tp40",
       strategy: localStorage.weatherStrategy || "baseline",
       lookback: Number(localStorage.weatherLookback || 24),
@@ -1957,6 +2020,93 @@ INDEX_HTML = r"""<!doctype html>
       ctx.stroke();
     }
 
+    function drawMetricBars(id, rows, metric, {suffix = "", moneyAxis = false} = {}) {
+      const canvas = document.getElementById(id);
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, rect.width * ratio);
+      canvas.height = Math.max(1, rect.height * ratio);
+      ctx.scale(ratio, ratio);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      const series = rows.map(row => ({
+        key: row.key,
+        label: row.label,
+        value: Number(row[metric] || 0),
+      }));
+      if (!series.length) return;
+
+      const values = series.map(item => item.value);
+      const minValue = Math.min(0, ...values);
+      const maxValue = Math.max(0, ...values);
+      const span = maxValue - minValue || 1;
+      const left = 56;
+      const right = 14;
+      const top = 16;
+      const bottom = 46;
+      const plotW = Math.max(1, rect.width - left - right);
+      const plotH = Math.max(1, rect.height - top - bottom);
+      const y = value => top + plotH - ((value - minValue) / span) * plotH;
+      const zeroY = y(0);
+      const barGap = 8;
+      const barW = Math.max(12, (plotW - barGap * (series.length - 1)) / series.length);
+
+      ctx.strokeStyle = "rgba(111,123,150,.18)";
+      ctx.lineWidth = 1;
+      ctx.font = "800 12px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted") || "#6c7892";
+      for (let i = 0; i <= 4; i++) {
+        const value = minValue + span * i / 4;
+        const yy = y(value);
+        ctx.beginPath();
+        ctx.moveTo(left, yy);
+        ctx.lineTo(rect.width - right, yy);
+        ctx.stroke();
+        const label = moneyAxis ? money(value) : `${value.toFixed(0)}${suffix}`;
+        ctx.fillText(label, 8, yy + 4);
+      }
+      ctx.strokeStyle = "rgba(15,34,65,.34)";
+      ctx.beginPath();
+      ctx.moveTo(left, zeroY);
+      ctx.lineTo(rect.width - right, zeroY);
+      ctx.stroke();
+
+      series.forEach((item, index) => {
+        const x = left + index * (barW + barGap);
+        const barY = item.value >= 0 ? y(item.value) : zeroY;
+        const h = Math.max(2, Math.abs(y(item.value) - zeroY));
+        const color = item.value >= 0 ? "#16b978" : "#ff405c";
+        const grad = ctx.createLinearGradient(0, barY, 0, barY + h);
+        grad.addColorStop(0, color);
+        grad.addColorStop(1, item.value >= 0 ? "rgba(22,185,120,.24)" : "rgba(255,64,92,.24)");
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        if (ctx.roundRect) {
+          ctx.roundRect(x, barY, barW, h, 8);
+        } else {
+          ctx.rect(x, barY, barW, h);
+        }
+        ctx.fill();
+
+        ctx.save();
+        ctx.translate(x + barW / 2, rect.height - 18);
+        ctx.rotate(-Math.PI / 7);
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--ink") || "#071431";
+        ctx.font = "950 12px ui-monospace, SFMono-Regular, Menlo, monospace";
+        ctx.textAlign = "right";
+        ctx.fillText(item.key.toUpperCase(), 0, 0);
+        ctx.restore();
+      });
+    }
+
+    function metricLeader(rows, metric, formatter) {
+      if (!rows.length) return "";
+      const best = rows.reduce((acc, row) => Number(row[metric] || 0) > Number(acc[metric] || 0) ? row : acc, rows[0]);
+      return `<span class="chart-leader">${esc(best.label)} · ${esc(formatter(best[metric]))}</span>`;
+    }
+
     function buttonGroup(id, rows, activeKey, attr) {
       const root = document.getElementById(id);
       const label = root.querySelector(".selectlike")?.outerHTML || "";
@@ -1973,6 +2123,7 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
+      document.querySelectorAll("[data-page]").forEach(item => item.classList.toggle("active", item.dataset.page === state.page));
       document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
       document.querySelectorAll("[data-layout]").forEach(btn => btn.classList.toggle("active", btn.dataset.layout === state.layout));
       document.querySelectorAll('[data-stake-side="yes"]').forEach(input => {
@@ -1989,13 +2140,22 @@ INDEX_HTML = r"""<!doctype html>
       localStorage.weatherTheme = state.theme;
       syncActiveButtons();
       state.lastCurveKey = "";
-      if (state.lastData && state.strategy !== "compare") drawCurve(state.lastData.pnl_curve);
+      if (state.lastData && state.page === "charts") renderCharts(state.lastData);
+      else if (state.lastData && state.strategy !== "compare") drawCurve(state.lastData.pnl_curve);
     }
 
     function applyLayout(layout) {
       state.layout = layout === "terminal" ? "terminal" : "modern";
       document.body.classList.toggle("terminal-layout", state.layout === "terminal");
       localStorage.weatherLayout = state.layout;
+      document.body.classList.toggle("charts-only", state.page === "charts" && state.layout !== "terminal");
+      syncActiveButtons();
+    }
+
+    function applyPage(page) {
+      state.page = page === "charts" ? "charts" : "dashboard";
+      document.body.classList.toggle("charts-only", state.page === "charts" && state.layout !== "terminal");
+      localStorage.weatherPage = state.page;
       syncActiveButtons();
     }
 
@@ -2254,6 +2414,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderCompare(data) {
+      document.body.classList.remove("charts-only");
       document.body.classList.add("compare-only");
       const meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
@@ -2286,7 +2447,44 @@ INDEX_HTML = r"""<!doctype html>
       renderTerminalCompare(data);
     }
 
+    function renderCharts(data) {
+      document.body.classList.remove("compare-only");
+      document.body.classList.toggle("charts-only", state.layout !== "terminal");
+      const meta = data.meta;
+      const rows = [...data.rows].sort((a, b) => b.total - a.total);
+      const bestTotal = rows[0] || {};
+      const bestRealized = [...data.rows].sort((a, b) => b.realized - a.realized)[0] || {};
+      const bestUnrealized = [...data.rows].sort((a, b) => b.unrealized - a.unrealized)[0] || {};
+      const bestWinrate = [...data.rows].filter(r => r.sells > 0).sort((a, b) => b.winrate - a.winrate)[0] || {};
+
+      setText("title", `${meta.view_label} / Strategy Graphs`);
+      setText("subtitle", "Realized, unrealized and winrate across tested strategies.");
+      setText("status-line", `${lookbackLabel()}${stakeLabel()} · chart state: compare`);
+      setText("charts-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
+      setText("sidebar-meta", `${meta.view_label} · Graphs`);
+      setText("state-path", `state root: ${meta.state_path}`);
+
+      setMetric("m-total", bestTotal.total || 0);
+      setMetric("m-realized", bestRealized.realized || 0);
+      setMetric("m-unrealized", bestUnrealized.unrealized || 0);
+      setText("m-winrate", bestWinrate.winrate === undefined ? "n/a" : `${bestWinrate.winrate.toFixed(1)}%`);
+      document.getElementById("m-winrate").className = "value neutral";
+
+      setHTML("chart-realized-leader", metricLeader(data.rows, "realized", money));
+      setHTML("chart-unrealized-leader", metricLeader(data.rows, "unrealized", money));
+      setHTML("chart-winrate-leader", metricLeader(data.rows.filter(r => r.sells > 0), "winrate", v => `${Number(v || 0).toFixed(1)}%`));
+      drawMetricBars("chart-realized", data.rows, "realized", {moneyAxis: true});
+      drawMetricBars("chart-unrealized", data.rows, "unrealized", {moneyAxis: true});
+      drawMetricBars("chart-winrate", data.rows, "winrate", {suffix: "%"});
+      drawSpark("spark-total", data.rows.map(r => r.total), "#16b978");
+      drawSpark("spark-realized", data.rows.map(r => r.realized), "#16b978");
+      drawSpark("spark-unrealized", data.rows.map(r => r.unrealized), "#2292ff");
+      drawSpark("spark-winrate", data.rows.map(r => r.winrate), "#16b978");
+      renderTerminalCompare(data);
+    }
+
     function renderStandard(data) {
+      document.body.classList.remove("charts-only");
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
       setText("title", `${meta.view_label} / ${meta.strategy_label}`);
@@ -2314,8 +2512,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function refresh() {
+      const requestStrategy = state.page === "charts" ? "compare" : state.strategy;
       const params = new URLSearchParams({
-        strategy: state.strategy,
+        strategy: requestStrategy,
         view: state.view,
         exit_mode: state.exit_mode,
         lookback: state.lookback,
@@ -2329,7 +2528,8 @@ INDEX_HTML = r"""<!doctype html>
       if (payload === state.lastPayload) return;
       state.lastPayload = payload;
       state.lastData = data;
-      if (state.strategy === "compare") renderCompare(data);
+      if (state.page === "charts") renderCharts(data);
+      else if (state.strategy === "compare") renderCompare(data);
       else renderStandard(data);
       syncActiveButtons();
     }
@@ -2339,6 +2539,7 @@ INDEX_HTML = r"""<!doctype html>
       state.lastPayload = "";
       state.lastCurveKey = "";
       localStorage.weatherView = state.view;
+      localStorage.weatherPage = state.page;
       localStorage.weatherExitMode = state.exit_mode;
       localStorage.weatherStrategy = state.strategy;
       localStorage.weatherLookback = state.lookback;
@@ -2350,6 +2551,13 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     document.addEventListener("click", e => {
+      const pageItem = e.target.closest("[data-page]");
+      if (pageItem) {
+        applyPage(pageItem.dataset.page);
+        state.lastPayload = "";
+        refresh();
+        return;
+      }
       const b = e.target.closest("button");
       if (!b) return;
       if (b.dataset.view) setState({view: b.dataset.view});
@@ -2362,7 +2570,8 @@ INDEX_HTML = r"""<!doctype html>
     document.getElementById("search").addEventListener("input", e => {
       state.search = e.target.value;
       state.lastCurveKey = "";
-      if (state.lastData && state.strategy !== "compare") renderStandard(state.lastData);
+      if (state.lastData && state.page === "charts") renderCharts(state.lastData);
+      else if (state.lastData && state.strategy !== "compare") renderStandard(state.lastData);
     });
     let stakeTimer = null;
     function updateStake(side, value) {
@@ -2393,7 +2602,11 @@ INDEX_HTML = r"""<!doctype html>
         if (found) setState({strategy: found.id});
       }
     });
-    window.addEventListener("resize", () => state.lastData && state.strategy !== "compare" && drawCurve(state.lastData.pnl_curve));
+    window.addEventListener("resize", () => {
+      if (!state.lastData) return;
+      if (state.page === "charts") renderCharts(state.lastData);
+      else if (state.strategy !== "compare") drawCurve(state.lastData.pnl_curve);
+    });
 
     applyTheme(state.theme);
     applyLayout(state.layout);
