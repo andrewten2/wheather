@@ -357,6 +357,26 @@ def simulated_price_pnl(entry_price: float | None, exit_price: float | None, tar
     return target_stake * (exit_price / entry_price - 1.0)
 
 
+def trade_entry_cost(trade: dict, entry_price: float | None) -> float | None:
+    shares = to_float(trade.get("filled_shares")) or to_float(trade.get("requested_shares"))
+    if entry_price is not None and entry_price > 0 and shares is not None and shares > 0:
+        return entry_price * shares
+
+    exit_price = to_float(trade.get("simulated_fill_price"))
+    realized = to_float(trade.get("realized_pnl"))
+    if (
+        entry_price is not None
+        and exit_price is not None
+        and realized is not None
+        and entry_price > 0
+        and abs(exit_price - entry_price) > 1e-9
+    ):
+        inferred = realized * entry_price / (exit_price - entry_price)
+        if inferred > 0:
+            return inferred
+    return None
+
+
 def build_buy_history(trades: list[dict]) -> dict:
     history = {}
     for trade in trades:
@@ -387,7 +407,7 @@ def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str
     entry = trade_price(trade, ("entry_price", "avg_price", "avg_cost", "buy_price", "entry_fill_price"))
     regime = trade.get("entry_regime")
     forecast = forecast_label(trade)
-    original_cost = trade_cost(trade, entry)
+    original_cost = None
     market_key = trade.get("market_id") or clean_text(trade.get("question"))
     side = (trade.get("side") or "?").upper()
     sell_time = parse_dt(trade.get("timestamp"))
@@ -405,6 +425,9 @@ def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str
             forecast = last[3]
         if not original_cost:
             original_cost = last[4]
+    entry_cost = trade_entry_cost(trade, entry)
+    if entry_cost:
+        original_cost = entry_cost
     return entry, regime, forecast, original_cost
 
 
@@ -528,6 +551,7 @@ def normalize_state(
     positions = []
     for position in raw_positions:
         pnl, pnl_pct = position_pnl(position, yes_stake, no_stake)
+        stake = position_exposure(position, yes_stake, no_stake)
         question = clean_text(position.get("question") or position.get("market_id"))
         positions.append(
             {
@@ -539,10 +563,11 @@ def normalize_state(
                 "entry_price": to_float(position.get("entry_price")) or to_float(position.get("avg_cost")),
                 "current_price": to_float(position.get("current_price")),
                 "pnl": pnl,
+                "final_value": stake + pnl if pnl is not None else None,
                 "pnl_pct": pnl_pct,
                 "age": age_label(position.get("opened_at")),
                 "opened_at": position.get("opened_at"),
-                "cost_basis": position_exposure(position, yes_stake, no_stake),
+                "cost_basis": stake,
                 "shares": to_float(position.get("shares")),
                 "forecast": forecast_label(position),
                 "stale": to_float(position.get("current_price")) is None,
@@ -556,6 +581,8 @@ def normalize_state(
     for trade in sells[:80]:
         entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
+        stake = stake_for_side(side, yes_stake, no_stake) or original_cost
+        pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake)
         question = clean_text(trade.get("question") or trade.get("market_id"))
         closed_trades.append(
             {
@@ -566,8 +593,9 @@ def normalize_state(
                 "regime": (regime or "?").upper(),
                 "entry_price": entry,
                 "exit_price": to_float(trade.get("simulated_fill_price")),
-                "pnl": adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake),
-                "stake": stake_for_side(side, yes_stake, no_stake) or original_cost,
+                "pnl": pnl,
+                "final_value": stake + pnl if stake is not None and pnl is not None else None,
+                "stake": stake,
                 "forecast": forecast,
                 "question": question,
             }
@@ -1751,7 +1779,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
@@ -1760,7 +1788,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th class="num">Final</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -2017,13 +2045,14 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
+          <td class="num ${p.stale ? "neutral" : cls(p.final_value)}">${p.stale ? "stale" : money(p.final_value)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
           <td class="city-col">${cityChip(p.city)}</td>
           <td class="market">${esc(p.question)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
-      `).join("") : `<tr><td colspan="11"><div class="empty">No open positions for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="12"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -2041,12 +2070,13 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
+          <td class="num ${cls(t.final_value)}">${money(t.final_value)}</td>
           <td class="city-col">${cityChip(t.city)}</td>
           <td class="market">${esc(t.question)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="10"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="11"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
@@ -2112,11 +2142,12 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : money(p.pnl)}</td>
+          <td class="num ${p.stale ? "neutral" : cls(p.final_value)}">${p.stale ? "stale" : money(p.final_value)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="10" class="terminal-market">No open positions for this filter.</td></tr>`;
+      `).join("") : `<tr><td colspan="11" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
 
     function terminalClosedRows(rows) {
@@ -2132,10 +2163,11 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
+          <td class="num ${cls(t.final_value)}">${money(t.final_value)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="9" class="terminal-market">No closed trades for this filter.</td></tr>`;
+      }).join("") : `<tr><td colspan="10" class="terminal-market">No closed trades for this filter.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -2159,7 +2191,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
                 <tbody>${terminalOpenRows(data.positions)}</tbody>
               </table>
             </div>
@@ -2170,7 +2202,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">LATEST 20 CLOSED / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
                 <tbody>${terminalClosedRows(left)}</tbody>
               </table>
             </div>
@@ -2179,7 +2211,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">NEXT 20</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
                 <tbody>${terminalClosedRows(right)}</tbody>
               </table>
             </div>
