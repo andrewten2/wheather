@@ -1445,6 +1445,33 @@ INDEX_HTML = r"""<!doctype html>
       padding: 15px 13px;
       border-bottom: 1px solid var(--line);
     }
+    .sortable {
+      cursor: pointer;
+      user-select: none;
+      transition: color .15s ease, background .15s ease;
+    }
+    .sortable:hover {
+      color: var(--ink);
+      background: color-mix(in srgb, var(--thead-bg) 82%, var(--green) 18%);
+    }
+    .sortable::after {
+      content: "↕";
+      display: inline-block;
+      margin-left: 7px;
+      color: var(--muted);
+      font-size: .82em;
+      opacity: .55;
+    }
+    .sortable.sort-asc::after {
+      content: "↑";
+      color: var(--green);
+      opacity: 1;
+    }
+    .sortable.sort-desc::after {
+      content: "↓";
+      color: var(--green);
+      opacity: 1;
+    }
     td {
       padding: 19px 13px;
       border-bottom: 1px solid var(--row-line);
@@ -2000,7 +2027,18 @@ INDEX_HTML = r"""<!doctype html>
         <div class="panel-head"><h2>Strategy Comparison</h2><span class="hint" id="compare-subtitle"></span></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Key</th><th>Strategy</th><th class="num">Open</th><th class="num">Buys</th><th class="num">Sells</th><th class="num">Total</th><th class="num">Realized</th><th class="num">Unrealized</th><th class="num">Winrate</th><th>State</th></tr></thead>
+            <thead><tr>
+              <th class="sortable" data-compare-sort="key">Key</th>
+              <th class="sortable" data-compare-sort="label">Strategy</th>
+              <th class="num sortable" data-compare-sort="open_positions">Open</th>
+              <th class="num sortable" data-compare-sort="buys">Buys</th>
+              <th class="num sortable" data-compare-sort="sells">Sells</th>
+              <th class="num sortable" data-compare-sort="total">Total</th>
+              <th class="num sortable" data-compare-sort="realized">Realized</th>
+              <th class="num sortable" data-compare-sort="unrealized">Unrealized</th>
+              <th class="num sortable" data-compare-sort="winrate">Winrate</th>
+              <th class="sortable" data-compare-sort="state_exists">State</th>
+            </tr></thead>
             <tbody id="compare"></tbody>
           </table>
         </div>
@@ -2067,6 +2105,7 @@ INDEX_HTML = r"""<!doctype html>
       lastData: null,
       lastPayload: "",
       lastCurveKey: "",
+      compareSort: {key: "", dir: "asc"},
     };
 
     const money = v => v === null || v === undefined ? "n/a" : `${v < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}`;
@@ -2282,6 +2321,35 @@ INDEX_HTML = r"""<!doctype html>
       if (!rows.length) return "";
       const best = rows.reduce((acc, row) => Number(row[metric] || 0) > Number(acc[metric] || 0) ? row : acc, rows[0]);
       return `<span class="chart-leader">${esc(best.label)} · ${esc(formatter(best[metric]))}</span>`;
+    }
+
+    function sortedCompareRows(rows) {
+      const {key, dir} = state.compareSort || {key: "", dir: "asc"};
+      if (!key) return [...rows];
+      const numeric = new Set(["open_positions", "buys", "sells", "total", "realized", "unrealized", "winrate"]);
+      const factor = dir === "desc" ? -1 : 1;
+      return [...rows].sort((a, b) => {
+        let result = 0;
+        if (numeric.has(key)) {
+          result = Number(a[key] || 0) - Number(b[key] || 0);
+        } else if (key === "state_exists") {
+          result = Number(Boolean(a[key])) - Number(Boolean(b[key]));
+        } else {
+          result = String(a[key] ?? "").localeCompare(String(b[key] ?? ""), undefined, {numeric: true, sensitivity: "base"});
+        }
+        if (result === 0) {
+          result = String(a.key ?? "").localeCompare(String(b.key ?? ""), undefined, {numeric: true, sensitivity: "base"});
+        }
+        return result * factor;
+      });
+    }
+
+    function syncCompareSortHeaders() {
+      document.querySelectorAll("[data-compare-sort]").forEach(th => {
+        const active = th.dataset.compareSort === state.compareSort.key;
+        th.classList.toggle("sort-asc", active && state.compareSort.dir === "asc");
+        th.classList.toggle("sort-desc", active && state.compareSort.dir === "desc");
+      });
     }
 
     function buttonGroup(id, rows, activeKey, attr) {
@@ -2572,6 +2640,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderTerminalCompare(data) {
       const meta = data.meta;
+      const rows = sortedCompareRows(data.rows);
       renderTerminalTabs(meta);
       setText("terminal-total", "$0.00");
       setText("terminal-realized", "$0.00");
@@ -2583,7 +2652,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="terminal-table-wrap">
             <table class="terminal-table">
               <thead><tr><th>Key</th><th>Strategy</th><th class="num">Open</th><th class="num">Buys</th><th class="num">Sells</th><th class="num">Total</th><th class="num">Realized</th><th class="num">Unrealized</th><th class="num">Winrate</th><th>State</th></tr></thead>
-              <tbody>${data.rows.map(r => `
+              <tbody>${rows.map(r => `
                 <tr>
                   <td>${esc(r.key)}</td>
                   <td>${esc(r.label)}</td>
@@ -2607,11 +2676,12 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.remove("charts-only");
       document.body.classList.add("compare-only");
       const meta = data.meta;
+      const rows = sortedCompareRows(data.rows);
       setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
       setText("subtitle", "Side-by-side strategy health check across the selected city universe.");
       setText("status-line", `${lookbackLabel()}${stakeLabel()} · effective state: compare`);
       setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
-      setHTML("compare", data.rows.map(r => `
+      setHTML("compare", rows.map(r => `
         <tr>
           <td>${esc(r.key)}</td>
           <td>${esc(r.label)}</td>
@@ -2625,6 +2695,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${r.state_exists ? "ready" : "missing"}</td>
         </tr>
       `).join(""));
+      syncCompareSortHeaders();
       setMetric("m-total", 0);
       setMetric("m-realized", 0);
       setMetric("m-unrealized", 0);
@@ -2746,6 +2817,17 @@ INDEX_HTML = r"""<!doctype html>
         applyPage(pageItem.dataset.page);
         state.lastPayload = "";
         refresh();
+        return;
+      }
+      const sortHeader = e.target.closest("[data-compare-sort]");
+      if (sortHeader) {
+        const key = sortHeader.dataset.compareSort;
+        const current = state.compareSort || {key: "key", dir: "asc"};
+        state.compareSort = {
+          key,
+          dir: current.key === key && current.dir === "asc" ? "desc" : "asc",
+        };
+        if (state.lastData && state.strategy === "compare") renderCompare(state.lastData);
         return;
       }
       const b = e.target.closest("button");
