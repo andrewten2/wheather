@@ -351,6 +351,30 @@ def scaled_value(value: float | None, original_cost: float | None, target_stake:
     return value * target_stake / original_cost
 
 
+def runner_target_stake(item: dict, target_stake: float | None) -> float | None:
+    if target_stake is None or not item.get("runner_after_partial_exit"):
+        return target_stake
+    original_cost = to_float(item.get("runner_original_cost_usd")) or to_float(item.get("original_cost_usd"))
+    remaining_cost = to_float(item.get("cost_basis")) or to_float(item.get("position_cost_usd"))
+    if original_cost and remaining_cost and original_cost > 0:
+        return target_stake * remaining_cost / original_cost
+    partial_fraction = to_float(item.get("partial_take_profit_fraction"))
+    if partial_fraction is None:
+        partial_shares = to_float(item.get("partial_take_profit_shares"))
+        remaining_shares = to_float(item.get("shares"))
+        if partial_shares is not None and remaining_shares is not None and partial_shares + remaining_shares > 0:
+            partial_fraction = partial_shares / (partial_shares + remaining_shares)
+    if partial_fraction is not None:
+        return target_stake * max(0.0, 1.0 - min(1.0, partial_fraction))
+    return target_stake * 0.5
+
+
+def partial_trade_target_stake(trade: dict, target_stake: float | None) -> float | None:
+    if target_stake is None or not bool(trade.get("partial_exit") or nested_signal(trade).get("partial_exit")):
+        return target_stake
+    return target_stake * 0.5
+
+
 def simulated_price_pnl(entry_price: float | None, exit_price: float | None, target_stake: float | None) -> float | None:
     if target_stake is None or entry_price is None or exit_price is None or entry_price <= 0:
         return None
@@ -434,7 +458,7 @@ def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str
 def adjusted_trade_pnl(trade: dict, buy_history: dict, yes_stake: float | None = None, no_stake: float | None = None) -> float | None:
     realized = to_float(trade.get("realized_pnl"))
     entry, _, _, original_cost = closed_entry_info(trade, buy_history)
-    target_stake = stake_for_side(trade.get("side"), yes_stake, no_stake)
+    target_stake = partial_trade_target_stake(trade, stake_for_side(trade.get("side"), yes_stake, no_stake))
     simulated = simulated_price_pnl(entry, to_float(trade.get("simulated_fill_price")), target_stake)
     if simulated is not None:
         return simulated
@@ -452,7 +476,7 @@ def position_pnl(position: dict, yes_stake: float | None = None, no_stake: float
     pnl_pct = to_float(position.get("unrealized_pnl_pct"))
     if pnl_pct is None and pnl is not None and cost_basis > 0:
         pnl_pct = pnl / cost_basis
-    target_stake = stake_for_side(position.get("side"), yes_stake, no_stake)
+    target_stake = runner_target_stake(position, stake_for_side(position.get("side"), yes_stake, no_stake))
     simulated = simulated_price_pnl(entry_price, current_price, target_stake)
     if simulated is not None:
         pnl = simulated
@@ -464,7 +488,7 @@ def position_pnl(position: dict, yes_stake: float | None = None, no_stake: float
 
 def position_exposure(position: dict, yes_stake: float | None = None, no_stake: float | None = None) -> float:
     cost_basis = to_float(position.get("cost_basis")) or 0.0
-    target_stake = stake_for_side(position.get("side"), yes_stake, no_stake)
+    target_stake = runner_target_stake(position, stake_for_side(position.get("side"), yes_stake, no_stake))
     if target_stake is not None and cost_basis > 0:
         return target_stake
     return cost_basis
@@ -571,6 +595,11 @@ def normalize_state(
                 "shares": to_float(position.get("shares")),
                 "forecast": forecast_label(position),
                 "stale": to_float(position.get("current_price")) is None,
+                "runner": bool(position.get("runner_after_partial_exit")),
+                "partial_done": bool(position.get("partial_take_profit_done")),
+                "partial_price": to_float(position.get("partial_take_profit_price")),
+                "partial_pnl": to_float(position.get("partial_take_profit_realized_pnl")),
+                "partial_shares": to_float(position.get("partial_take_profit_shares")),
             }
         )
     positions.sort(key=lambda item: (item["stale"], -(abs(item["pnl"] or 0.0)), item["city"]))
@@ -581,7 +610,7 @@ def normalize_state(
     for trade in sells[:80]:
         entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
-        stake = stake_for_side(side, yes_stake, no_stake) or original_cost
+        stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
         pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake)
         question = clean_text(trade.get("question") or trade.get("market_id"))
         closed_trades.append(
@@ -598,6 +627,11 @@ def normalize_state(
                 "stake": stake,
                 "forecast": forecast,
                 "question": question,
+                "exit_reason": trade.get("exit_reason") or nested_signal(trade).get("exit_reason"),
+                "partial_exit": bool(trade.get("partial_exit") or nested_signal(trade).get("partial_exit")),
+                "runner_after_partial_exit": bool(
+                    trade.get("runner_after_partial_exit") or nested_signal(trade).get("runner_after_partial_exit")
+                ),
             }
         )
 
@@ -1519,6 +1553,43 @@ INDEX_HTML = r"""<!doctype html>
     }
     .yes { color: #0f8e58; background: var(--green-soft); }
     .no { color: var(--red); background: var(--red-soft); }
+    .mode-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 78px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 950;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .mode-chip.runner {
+      color: #0b7d52;
+      background: rgba(22,185,120,.18);
+      border-color: rgba(22,185,120,.34);
+    }
+    .mode-chip.partial {
+      color: #1162ad;
+      background: rgba(34,146,255,.15);
+      border-color: rgba(34,146,255,.26);
+    }
+    .mode-chip.settlement {
+      color: #8a5c00;
+      background: rgba(255,188,68,.18);
+      border-color: rgba(255,188,68,.32);
+    }
+    .mode-chip.stop {
+      color: #c91f3f;
+      background: rgba(255,64,92,.14);
+      border-color: rgba(255,64,92,.28);
+    }
+    .runner-col {
+      min-width: 92px;
+    }
     .regime { color: var(--blue); font-weight: 900; }
     .city-chip {
       display: inline-flex;
@@ -2006,7 +2077,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Side</th><th>Regime</th><th class="runner-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
@@ -2015,7 +2086,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th class="num">Final</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -2146,6 +2217,23 @@ INDEX_HTML = r"""<!doctype html>
     const cityFlag = city => CITY_FLAGS[city] || "🌐";
     const cityChip = city => `<span class="city-chip"><span class="flag">${cityFlag(city)}</span>${esc(city)}</span>`;
     const cityName = city => `<span class="top-city-name"><span class="flag">${cityFlag(city)}</span>${esc(city)}</span>`;
+    function isRunnerMode() {
+      return state.exit_mode === "tp40_runner";
+    }
+    function openModeChip(position) {
+      if (!isRunnerMode()) return `<span class="neutral">-</span>`;
+      if (position.runner) return `<span class="mode-chip runner">Runner</span>`;
+      return `<span class="mode-chip partial">Pre TP40</span>`;
+    }
+    function closedModeChip(trade) {
+      if (!isRunnerMode()) return `<span class="neutral">-</span>`;
+      if (trade.partial_exit) return `<span class="mode-chip partial">TP40 half</span>`;
+      const reason = String(trade.exit_reason || "").toLowerCase();
+      if (reason === "market_settlement") return `<span class="mode-chip settlement">Settlement</span>`;
+      if (reason === "stop_loss") return `<span class="mode-chip stop">Stop</span>`;
+      if (reason === "take_profit") return `<span class="mode-chip runner">TP</span>`;
+      return reason ? `<span class="mode-chip">${esc(reason)}</span>` : `<span class="neutral">-</span>`;
+    }
 
     function setMetric(id, value) {
       const el = document.getElementById(id);
@@ -2459,6 +2547,7 @@ INDEX_HTML = r"""<!doctype html>
         <tr>
           <td><span class="pill ${p.side === "YES" ? "yes" : "no"}">${esc(p.side)}</span></td>
           <td class="regime">${esc(p.regime)}</td>
+          <td>${openModeChip(p)}</td>
           <td class="num">${money(p.cost_basis)}</td>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
@@ -2470,7 +2559,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="market">${esc(p.question)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
-      `).join("") : `<tr><td colspan="12"><div class="empty">No open positions for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="13"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -2484,6 +2573,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(t.time)}</td>
           <td><span class="pill ${t.side === "YES" ? "yes" : "no"}">${esc(t.side)}</span></td>
           <td class="regime">${esc(t.regime)}</td>
+          <td>${closedModeChip(t)}</td>
           <td class="num">${money(t.stake)}</td>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
@@ -2494,7 +2584,7 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="11"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="12"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
@@ -2556,6 +2646,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${terminalStatusDot(p.pnl)}</td>
           <td class="${p.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(p.side)}</td>
           <td class="terminal-regime">${esc(p.regime)}</td>
+          <td>${openModeChip(p)}</td>
           <td class="num">${money(p.cost_basis)}</td>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
@@ -2565,7 +2656,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(p.age)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="11" class="terminal-market">No open positions for this filter.</td></tr>`;
+      `).join("") : `<tr><td colspan="12" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
 
     function terminalClosedRows(rows) {
@@ -2577,6 +2668,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(t.time)}</td>
           <td class="${t.side === "YES" ? "terminal-side-yes" : "terminal-side-no"}">${esc(t.side)}</td>
           <td class="terminal-regime">${esc(t.regime)}</td>
+          <td>${closedModeChip(t)}</td>
           <td class="num">${money(t.stake)}</td>
           <td class="num">${price(t.entry_price)}</td>
           <td class="num">${price(t.exit_price)}</td>
@@ -2585,7 +2677,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="10" class="terminal-market">No closed trades for this filter.</td></tr>`;
+      }).join("") : `<tr><td colspan="11" class="terminal-market">No closed trades for this filter.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -2609,7 +2701,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Side</th><th>Regime</th><th>Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
                 <tbody>${terminalOpenRows(data.positions)}</tbody>
               </table>
             </div>
@@ -2620,7 +2712,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">LATEST 20 CLOSED / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th>Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
                 <tbody>${terminalClosedRows(left)}</tbody>
               </table>
             </div>
@@ -2629,7 +2721,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">NEXT 20</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th>Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
                 <tbody>${terminalClosedRows(right)}</tbody>
               </table>
             </div>
