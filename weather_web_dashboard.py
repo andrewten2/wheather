@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +27,10 @@ STATE_CANDIDATES = [
 
 DISPLAY_TZ = timezone(timedelta(hours=3))
 DEFAULT_LOOKBACK_HOURS = float(os.environ.get("WEATHER_WEB_DASHBOARD_LOOKBACK_HOURS", "24"))
+AUTH_PASSWORD = os.environ.get("WEATHER_DASHBOARD_PASSWORD") or os.environ.get("WEATHER_WEB_DASHBOARD_PASSWORD")
+AUTH_SECRET = os.environ.get("WEATHER_DASHBOARD_AUTH_SECRET") or AUTH_PASSWORD or "weather-dashboard-dev-secret"
+AUTH_COOKIE = "weather_dashboard_session"
+AUTH_TTL_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_AUTH_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 
 VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
@@ -2991,9 +2998,227 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+LOGIN_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Weather Bot Login</title>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800;900&display=swap");
+    :root {
+      --ink: #071431;
+      --muted: #7c89a6;
+      --line: rgba(116, 134, 170, .24);
+      --blue: #3152df;
+      --green: #35d483;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      font-family: "Manrope", ui-sans-serif, system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 18% 72%, rgba(49,82,223,.14), transparent 31%),
+        radial-gradient(circle at 77% 55%, rgba(53,212,131,.16), transparent 30%),
+        linear-gradient(135deg, #f8fbff 0%, #eef5ff 44%, #f9fffb 100%);
+      overflow: hidden;
+    }
+    .orb {
+      position: fixed;
+      width: 520px;
+      height: 520px;
+      border-radius: 999px;
+      filter: blur(28px);
+      opacity: .42;
+      pointer-events: none;
+    }
+    .orb.one { left: -160px; bottom: -130px; background: #dfe8ff; }
+    .orb.two { right: -120px; top: 18%; background: #d9ffe9; }
+    .card {
+      position: relative;
+      width: min(620px, calc(100vw - 42px));
+      padding: 74px 58px 58px;
+      border: 1px solid rgba(255,255,255,.72);
+      border-radius: 30px;
+      background: rgba(255,255,255,.72);
+      box-shadow: 0 34px 90px rgba(40, 62, 105, .16);
+      backdrop-filter: blur(22px);
+      text-align: center;
+    }
+    .logo {
+      width: 78px;
+      height: 78px;
+      margin: 0 auto 22px;
+      display: grid;
+      place-items: center;
+    }
+    .bars {
+      display: flex;
+      align-items: end;
+      gap: 7px;
+      height: 56px;
+    }
+    .bars span {
+      width: 10px;
+      border-radius: 999px;
+      background: linear-gradient(180deg, #39d488, #3152df);
+      box-shadow: 0 10px 22px rgba(49,82,223,.18);
+    }
+    .bars span:nth-child(1) { height: 22px; opacity: .88; }
+    .bars span:nth-child(2) { height: 38px; opacity: .92; }
+    .bars span:nth-child(3) { height: 58px; }
+    .bars span:nth-child(4) { height: 44px; }
+    .bars span:nth-child(5) { height: 30px; }
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 5vw, 44px);
+      letter-spacing: -.05em;
+      line-height: 1.05;
+    }
+    p {
+      margin: 22px 0 40px;
+      color: var(--muted);
+      font-size: 19px;
+      font-weight: 700;
+    }
+    form { display: grid; gap: 26px; }
+    .field {
+      height: 86px;
+      display: grid;
+      grid-template-columns: 36px 1fr 36px;
+      align-items: center;
+      gap: 16px;
+      padding: 0 28px;
+      border: 2px solid rgba(87, 134, 255, .48);
+      border-radius: 17px;
+      background: rgba(255,255,255,.66);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.78);
+    }
+    .field:focus-within {
+      border-color: rgba(49,82,223,.76);
+      box-shadow: 0 0 0 5px rgba(49,82,223,.08);
+    }
+    input {
+      width: 100%;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--ink);
+      font: 800 21px "Manrope", ui-sans-serif, system-ui, sans-serif;
+    }
+    input::placeholder { color: #7f8aa5; }
+    .icon {
+      color: #667491;
+      font-size: 25px;
+      line-height: 1;
+    }
+    .eye {
+      border: 0;
+      background: transparent;
+      color: #667491;
+      cursor: pointer;
+      font-size: 25px;
+      padding: 0;
+    }
+    .submit {
+      height: 84px;
+      border: 0;
+      border-radius: 17px;
+      cursor: pointer;
+      color: white;
+      font: 900 22px "Manrope", ui-sans-serif, system-ui, sans-serif;
+      background: linear-gradient(115deg, #3152df 0%, #188fda 48%, #35d483 100%);
+      box-shadow: 0 22px 38px rgba(49,82,223,.18), 0 16px 28px rgba(53,212,131,.18);
+      transition: transform .16s ease, box-shadow .16s ease;
+    }
+    .submit:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 26px 46px rgba(49,82,223,.22), 0 20px 34px rgba(53,212,131,.2);
+    }
+    .error {
+      min-height: 24px;
+      margin-top: 8px;
+      color: #ff405c;
+      font-weight: 900;
+    }
+    @media (max-width: 560px) {
+      .card { padding: 52px 24px 30px; border-radius: 24px; }
+      .field, .submit { height: 70px; }
+      p { font-size: 16px; margin-bottom: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="orb one"></div>
+  <div class="orb two"></div>
+  <main class="card">
+    <div class="logo" aria-hidden="true">
+      <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
+    </div>
+    <h1>Enter your password</h1>
+    <p>Please enter your password to continue</p>
+    <form method="post" action="/login">
+      <label class="field">
+        <span class="icon">⌘</span>
+        <input id="password" name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus />
+        <button class="eye" type="button" aria-label="Show password" onclick="const p=document.getElementById('password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'◉':'◎';">◉</button>
+      </label>
+      <button class="submit" type="submit">Continue&nbsp;&nbsp;→</button>
+      <div class="error">{error}</div>
+    </form>
+  </main>
+</body>
+</html>
+"""
+
+
+def auth_enabled() -> bool:
+    return bool(AUTH_PASSWORD)
+
+
+def make_auth_token(now: int | None = None) -> str:
+    issued_at = int(now or time.time())
+    payload = str(issued_at)
+    signature = hmac.new(AUTH_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def verify_auth_token(token: str | None) -> bool:
+    if not token:
+        return False
+    try:
+        issued_raw, signature = token.split(".", 1)
+        issued_at = int(issued_raw)
+    except (TypeError, ValueError):
+        return False
+    if issued_at < int(time.time()) - AUTH_TTL_SECONDS:
+        return False
+    expected = hmac.new(AUTH_SECRET.encode("utf-8"), issued_raw.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
+def cookie_value(header: str | None, name: str) -> str | None:
+    for part in (header or "").split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.strip().split("=", 1)
+        if key == name:
+            return value
+    return None
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
+
+    def is_authenticated(self) -> bool:
+        if not auth_enabled():
+            return True
+        return verify_auth_token(cookie_value(self.headers.get("Cookie"), AUTH_COOKIE))
 
     def send_bytes(self, body: bytes, content_type: str, status: int = 200):
         self.send_response(status)
@@ -3003,9 +3228,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_redirect(self, location: str, cookie: str | None = None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+
+    def send_login(self, error: str = "", status: int = 200):
+        body = LOGIN_HTML.replace("{error}", error).encode("utf-8")
+        return self.send_bytes(body, "text/html; charset=utf-8", status=status)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/healthz":
+            return self.send_bytes(b"ok", "text/plain; charset=utf-8")
+        if auth_enabled() and path == "/login":
+            if self.is_authenticated():
+                return self.send_redirect("/")
+            return self.send_login()
+        if auth_enabled() and path == "/logout":
+            return self.send_redirect(
+                "/login",
+                f"{AUTH_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+            )
+        if auth_enabled() and not self.is_authenticated():
+            if path.startswith("/api/"):
+                return self.send_bytes(b'{"error":"unauthorized"}', "application/json; charset=utf-8", status=401)
+            return self.send_login(status=401)
         if path == "/":
             return self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         if path == "/api/options":
@@ -3033,9 +3285,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else normalize_state(strategy, view, exit_mode, lookback, yes_stake, no_stake)
             )
             return self.send_bytes(json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
-        if path == "/healthz":
-            return self.send_bytes(b"ok", "text/plain; charset=utf-8")
         return self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/login":
+            return self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
+        if not auth_enabled():
+            return self.send_redirect("/")
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(min(length, 4096)).decode("utf-8", errors="replace")
+        password = parse_qs(raw_body).get("password", [""])[0]
+        if hmac.compare_digest(password, AUTH_PASSWORD or ""):
+            cookie = f"{AUTH_COOKIE}={make_auth_token()}; Path=/; Max-Age={AUTH_TTL_SECONDS}; HttpOnly; SameSite=Lax"
+            return self.send_redirect("/", cookie)
+        return self.send_login("Wrong password. Try again.", status=401)
 
 
 def main():
