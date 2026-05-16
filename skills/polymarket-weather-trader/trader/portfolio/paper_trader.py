@@ -448,6 +448,7 @@ class PaperTrader:
         }
         if partial_exit:
             order_entry["partial_exit"] = True
+        if runner_after_partial_exit:
             order_entry["runner_after_partial_exit"] = runner_after_partial_exit
         order_entry.update(signal_forecast_fields)
         self.state["orders"].append(order_entry)
@@ -646,6 +647,7 @@ class PaperTrader:
         }
         if partial_exit:
             trade_entry["partial_exit"] = True
+        if runner_after_partial_exit:
             trade_entry["runner_after_partial_exit"] = runner_after_partial_exit
         trade_entry.update(signal_forecast_fields or self._entry_forecast_fields(position))
         self.state["trades"].append(trade_entry)

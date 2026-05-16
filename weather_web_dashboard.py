@@ -300,6 +300,47 @@ def nested_signal(item: dict) -> dict:
     return signal if isinstance(signal, dict) else {}
 
 
+def trade_market_key(trade: dict) -> tuple[str, str]:
+    market_key = str(trade.get("market_id") or clean_text(trade.get("question")) or "")
+    side = str(trade.get("side") or "?").upper()
+    return market_key, side
+
+
+def trade_exit_reason(trade: dict) -> str:
+    return str(trade.get("exit_reason") or nested_signal(trade).get("exit_reason") or "")
+
+
+def is_partial_exit_trade(trade: dict) -> bool:
+    signal = nested_signal(trade)
+    return bool(trade.get("partial_exit") or signal.get("partial_exit"))
+
+
+def is_runner_trade(trade: dict) -> bool:
+    signal = nested_signal(trade)
+    return bool(trade.get("runner_after_partial_exit") or signal.get("runner_after_partial_exit"))
+
+
+def annotate_runner_closes(trades: list[dict]) -> list[dict]:
+    """Mark historical runner settlement sells that were written before the flag existed."""
+    annotated = [dict(trade) for trade in trades]
+    runner_keys: set[tuple[str, str]] = set()
+    order = sorted(
+        range(len(annotated)),
+        key=lambda idx: parse_dt(annotated[idx].get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
+    )
+    for idx in order:
+        trade = annotated[idx]
+        if trade.get("action") != "sell":
+            continue
+        key = trade_market_key(trade)
+        if is_partial_exit_trade(trade) or is_runner_trade(trade):
+            runner_keys.add(key)
+            continue
+        if trade_exit_reason(trade) == "market_settlement" and key in runner_keys:
+            trade["runner_after_partial_exit"] = True
+    return annotated
+
+
 def forecast_label(item: dict) -> str:
     signal = nested_signal(item)
     value = item.get("entry_forecast_value")
@@ -377,7 +418,12 @@ def runner_target_stake(item: dict, target_stake: float | None) -> float | None:
 
 
 def partial_trade_target_stake(trade: dict, target_stake: float | None) -> float | None:
-    if target_stake is None or not bool(trade.get("partial_exit") or nested_signal(trade).get("partial_exit")):
+    if target_stake is None:
+        return target_stake
+    signal = nested_signal(trade)
+    is_partial = bool(trade.get("partial_exit") or signal.get("partial_exit"))
+    is_runner_close = bool(trade.get("runner_after_partial_exit") or signal.get("runner_after_partial_exit"))
+    if not (is_partial or is_runner_close):
         return target_stake
     return target_stake * 0.5
 
@@ -574,7 +620,7 @@ def normalize_state(
     effective = effective_strategy(strategy, exit_mode)
     state = load_state(effective)
     raw_positions = filter_by_view(state.get("positions"), view)
-    raw_trades = filter_by_view(state.get("trades") or [], view)
+    raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
     trades = filter_recent_trades(raw_trades, lookback_hours)
     buy_history = build_buy_history(raw_trades)
     summary = summarize(raw_positions, trades, buy_history, yes_stake, no_stake)
@@ -692,8 +738,9 @@ def compare_state(
         effective = effective_strategy(strategy, exit_mode)
         state = load_state(effective)
         positions = filter_by_view(state.get("positions"), view)
-        trades = filter_recent_trades(filter_by_view(state.get("trades") or [], view), lookback_hours)
-        buy_history = build_buy_history(filter_by_view(state.get("trades") or [], view))
+        raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
+        trades = filter_recent_trades(raw_trades, lookback_hours)
+        buy_history = build_buy_history(raw_trades)
         summary = summarize(positions, trades, buy_history, yes_stake, no_stake)
         rows.append(
             {

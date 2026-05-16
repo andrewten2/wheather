@@ -3135,6 +3135,7 @@ def check_exit_opportunities(
                 shares_to_sell = max(0.0, shares * min(1.0, max(0.0, partial_tp_fraction)))
                 if shares_to_sell <= 0:
                     continue
+            runner_after_partial_exit = bool(partial_exit or hold_runner_to_settlement)
             print(f"  📤 {question}...")
             exit_label = "take_profit_partial" if partial_exit else exit_reason
             print(
@@ -3187,7 +3188,7 @@ def check_exit_opportunities(
                     "exit_reason": exit_reason,
                     "strategy_id": ACTIVE_STRATEGY_ID,
                     "partial_exit": partial_exit,
-                    "runner_after_partial_exit": partial_exit,
+                    "runner_after_partial_exit": runner_after_partial_exit,
                 },
                 execution_mode=execution_mode,
             )
@@ -3210,7 +3211,7 @@ def check_exit_opportunities(
                         realized_pnl=result.get("realized_pnl"),
                         reason_for_exit=exit_reason,
                         partial_exit=partial_exit,
-                        runner_after_partial_exit=partial_exit,
+                        runner_after_partial_exit=runner_after_partial_exit,
                     )
 
                 # Log sell trade context for journal (skip for paper trades)
