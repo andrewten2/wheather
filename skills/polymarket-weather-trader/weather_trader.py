@@ -326,6 +326,7 @@ def _register_tp40_runner_strategies() -> None:
                 "partial_take_profit_enabled": True,
                 "partial_take_profit_fraction": 0.50,
                 "runner_exit_mode": "settlement",
+                "edge_invalidated_exit_enabled": False,
             }
         )
         STRATEGY_VARIANTS[tp40_runner_strategy_id(base_strategy_id)] = runner_config
@@ -3406,7 +3407,10 @@ def check_exit_opportunities(
             if exit_edge is not None:
                 current_edge = exit_edge.get("edge_no") if position_side == "no" else exit_edge.get("edge_yes")
                 if current_edge is not None and current_edge < 0:
-                    if execution_mode == ExecutionMode.PAPER:
+                    if (
+                        execution_mode == ExecutionMode.PAPER
+                        or not strategy_config.get("edge_invalidated_exit_enabled", True)
+                    ):
                         ignored_edge_invalidated = True
                     else:
                         exit_reason = "edge_invalidated"
