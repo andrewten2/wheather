@@ -16,8 +16,11 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 ENV_STATE_PATH = os.environ.get("WEATHER_DASHBOARD_STATE")
+ENV_LIVE_STATE_ROOT = os.environ.get("WEATHER_DASHBOARD_LIVE_STATE_ROOT")
 DEFAULT_STATE = ROOT / "skills" / "polymarket-weather-trader" / "data" / "paper_trading" / "state.json"
 SERVER_STATE = Path("/root/wheather/skills/polymarket-weather-trader/data/paper_trading/state.json")
+DEFAULT_LIVE_STATE_ROOT = ROOT / "skills" / "polymarket-weather-trader" / "data" / "live_trading"
+SERVER_LIVE_STATE_ROOT = Path("/root/wheather/skills/polymarket-weather-trader/data/live_trading")
 
 STATE_CANDIDATES = [
     Path(ENV_STATE_PATH) if ENV_STATE_PATH else None,
@@ -38,6 +41,12 @@ VIEW_LABELS = {
     "new": "New Cities",
     "all": "All Cities",
     "watchlist": "Watchlist",
+}
+
+SOURCE_ORDER = ("paper", "live")
+SOURCE_LABELS = {
+    "paper": "Paper",
+    "live": "Live",
 }
 
 EXIT_MODE_ORDER = ("tp40", "tp40_runner")
@@ -158,6 +167,21 @@ STATE_PATH = resolve_state_path()
 STATE_ROOT = STATE_PATH.parent
 
 
+def resolve_live_state_root() -> Path:
+    candidates = [
+        Path(ENV_LIVE_STATE_ROOT) if ENV_LIVE_STATE_ROOT else None,
+        SERVER_LIVE_STATE_ROOT,
+        DEFAULT_LIVE_STATE_ROOT,
+    ]
+    for path in candidates:
+        if path and path.exists():
+            return path
+    return DEFAULT_LIVE_STATE_ROOT
+
+
+LIVE_STATE_ROOT = resolve_live_state_root()
+
+
 def tp40_runner_strategy_id(strategy: str) -> str:
     return "tp40_runner" if strategy == "baseline" else f"{strategy}_tp40_runner"
 
@@ -170,14 +194,21 @@ def effective_strategy(strategy: str, exit_mode: str) -> str:
     return strategy
 
 
-def state_path_for_strategy(strategy: str) -> Path:
+def state_root_for_source(source: str = "paper") -> Path:
+    return LIVE_STATE_ROOT if source == "live" else STATE_ROOT
+
+
+def state_path_for_strategy(strategy: str, source: str = "paper") -> Path:
+    if source == "live":
+        root = LIVE_STATE_ROOT
+        return root / "state.json" if strategy == "baseline" else root / "strategies" / strategy / "state.json"
     if strategy == "baseline":
         return STATE_PATH
     return STATE_ROOT / "strategies" / strategy / "state.json"
 
 
-def load_state(strategy: str = "baseline") -> dict:
-    path = state_path_for_strategy(strategy)
+def load_state(strategy: str = "baseline", source: str = "paper") -> dict:
+    path = state_path_for_strategy(strategy, source)
     try:
         return json.loads(path.read_text())
     except Exception:
@@ -616,9 +647,10 @@ def normalize_state(
     lookback_hours: float,
     yes_stake: float | None = None,
     no_stake: float | None = None,
+    source: str = "paper",
 ) -> dict:
     effective = effective_strategy(strategy, exit_mode)
-    state = load_state(effective)
+    state = load_state(effective, source)
     raw_positions = filter_by_view(state.get("positions"), view)
     raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
     trades = filter_recent_trades(raw_trades, lookback_hours)
@@ -758,8 +790,11 @@ def normalize_state(
 
     return {
         "meta": {
-            "state_path": str(state_path_for_strategy(effective)),
-            "state_exists": state_path_for_strategy(effective).is_file(),
+            "state_path": str(state_path_for_strategy(effective, source)),
+            "state_exists": state_path_for_strategy(effective, source).is_file(),
+            "state_root": str(state_root_for_source(source)),
+            "source": source,
+            "source_label": SOURCE_LABELS.get(source, source),
             "strategy": strategy,
             "effective_strategy": effective,
             "strategy_label": STRATEGY_LABELS.get(strategy, strategy),
@@ -787,11 +822,12 @@ def compare_state(
     lookback_hours: float,
     yes_stake: float | None = None,
     no_stake: float | None = None,
+    source: str = "paper",
 ) -> dict:
     rows = []
     for key, strategy in STRATEGY_KEYS.items():
         effective = effective_strategy(strategy, exit_mode)
-        state = load_state(effective)
+        state = load_state(effective, source)
         positions = filter_by_view(state.get("positions"), view)
         raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
         trades = filter_recent_trades(raw_trades, lookback_hours)
@@ -803,7 +839,7 @@ def compare_state(
                 "strategy": strategy,
                 "effective_strategy": effective,
                 "label": STRATEGY_LABELS.get(strategy, strategy),
-                "state_exists": state_path_for_strategy(effective).is_file(),
+                "state_exists": state_path_for_strategy(effective, source).is_file(),
                 **summary,
             }
         )
@@ -811,6 +847,8 @@ def compare_state(
         "meta": {
             "strategy": "compare",
             "strategy_label": "Compare All",
+            "source": source,
+            "source_label": SOURCE_LABELS.get(source, source),
             "exit_mode": exit_mode,
             "exit_mode_label": EXIT_MODE_LABELS.get(exit_mode, exit_mode),
             "view": view,
@@ -819,7 +857,7 @@ def compare_state(
             "yes_stake": yes_stake,
             "no_stake": no_stake,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
-            "state_path": str(STATE_ROOT),
+            "state_path": str(state_root_for_source(source)),
         },
         "rows": rows,
         "stats": summarize([], []),
@@ -828,6 +866,7 @@ def compare_state(
 
 def options_payload() -> dict:
     return {
+        "sources": [{"id": source, "label": SOURCE_LABELS[source]} for source in SOURCE_ORDER],
         "views": [{"id": view, "label": VIEW_LABELS[view], "key": str(idx + 1)} for idx, view in enumerate(VIEW_ORDER)],
         "exit_modes": [
             {"id": mode, "label": EXIT_MODE_LABELS[mode], "key": str(idx + 5)}
@@ -941,13 +980,13 @@ INDEX_HTML = r"""<!doctype html>
     .shell {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 92px minmax(0, 1fr);
+      grid-template-columns: 178px minmax(0, 1fr);
     }
     .sidebar {
       position: sticky;
       top: 0;
       height: 100vh;
-      padding: 22px 14px;
+      padding: 22px 16px;
       color: #eff9ff;
       background:
         radial-gradient(circle at 50% 7%, rgba(42, 219, 147, .24), transparent 20%),
@@ -955,7 +994,7 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: inset -1px 0 0 rgba(15,34,65,.08), 18px 0 44px rgba(51,73,104,.08);
       display: flex;
       flex-direction: column;
-      gap: 26px;
+      gap: 24px;
     }
     html[data-theme="dark"] .sidebar {
       background:
@@ -965,38 +1004,57 @@ INDEX_HTML = r"""<!doctype html>
     }
     .logo {
       display: flex;
-      justify-content: center;
+      justify-content: flex-start;
       align-items: center;
+      gap: 11px;
     }
     .logo-mark {
-      width: 52px;
-      height: 52px;
-      border-radius: 17px;
+      width: 44px;
+      height: 44px;
+      border-radius: 15px;
       display: grid;
       place-items: center;
       background: rgba(255,255,255,.08);
       color: #38e59b;
-      font-size: 30px;
+      font-size: 26px;
     }
     .logo strong,
     .logo span {
-      display: none;
+      display: block;
+    }
+    .logo strong {
+      color: #071431;
+      font-size: 15px;
+      line-height: 1.1;
+      font-weight: 950;
+    }
+    .logo span {
+      color: #687692;
+      font-size: 12px;
+      margin-top: 2px;
+      font-weight: 800;
+    }
+    html[data-theme="dark"] .logo strong { color: #f5fbff; }
+    html[data-theme="dark"] .logo span { color: rgba(239,249,255,.68); }
+    html[data-theme="dark"] .logo-mark {
+      background: rgba(255,255,255,.08);
     }
     .nav {
       display: grid;
       gap: 12px;
-      justify-items: center;
+      justify-items: stretch;
     }
     .nav-item {
       display: flex;
       align-items: center;
-      justify-content: center;
-      width: 52px;
-      height: 52px;
-      padding: 0;
+      justify-content: flex-start;
+      gap: 10px;
+      width: 100%;
+      height: 48px;
+      padding: 0 12px;
       border-radius: 16px;
       color: #74809a;
-      font-size: 0;
+      font-size: 14px;
       font-weight: 760;
       cursor: pointer;
       user-select: none;
@@ -1014,10 +1072,10 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: inset 0 0 0 1px rgba(22,185,120,.16), 0 14px 28px rgba(22,185,120,.12);
     }
     .nav-icon {
-      width: auto;
+      width: 24px;
       text-align: center;
       opacity: .96;
-      font-size: 24px;
+      font-size: 19px;
       line-height: 1;
     }
     .nav-icon svg, .stat-icon svg, .action-icon svg, .metric-icon svg {
@@ -1038,16 +1096,13 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(255,255,255,.58);
       color: #67728a;
       line-height: 1.45;
-      font-size: 0;
-      text-align: center;
+      font-size: 12px;
+      text-align: left;
+      font-weight: 850;
     }
     .connection::after {
-      content: "Live";
-      display: block;
-      margin-top: 5px;
-      font-size: 11px;
-      font-weight: 900;
-      color: #17a86d;
+      content: "";
+      display: none;
     }
     html[data-theme="dark"] .connection {
       border-color: rgba(255,255,255,.14);
@@ -2096,7 +2151,7 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
       @media (max-width: 1320px) {
-      .shell { grid-template-columns: 92px minmax(0, 1fr); }
+      .shell { grid-template-columns: 160px minmax(0, 1fr); }
       .toolbar { grid-template-columns: 1fr 1fr; }
       .control.strategy-control { grid-template-columns: repeat(2, minmax(138px, 1fr)); }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2115,8 +2170,8 @@ INDEX_HTML = r"""<!doctype html>
         padding-bottom: 4px;
       }
       .nav-item {
-        min-width: 52px;
-        flex: 0 0 52px;
+        min-width: 122px;
+        flex: 0 0 122px;
       }
       .connection { display: none; }
       .page { padding: 18px; }
@@ -2147,15 +2202,9 @@ INDEX_HTML = r"""<!doctype html>
         <div><strong>Weather Bot</strong><span>Web Control</span></div>
       </div>
       <nav class="nav">
-        <div class="nav-item active" data-page="dashboard" title="Dashboard"><span class="nav-icon">⌂</span>Dashboard</div>
-        <div class="nav-item" title="Portfolio Pulse"><span class="nav-icon">◷</span>Portfolio Pulse</div>
-        <div class="nav-item" title="Open Positions"><span class="nav-icon">▣</span>Open Positions</div>
-        <div class="nav-item" title="Closed Trades"><span class="nav-icon">▤</span>Closed Trades</div>
-        <div class="nav-item" title="Realized Curve"><span class="nav-icon">⌁</span>Realized Curve</div>
-        <div class="nav-item" data-page="charts" title="Графики"><span class="nav-icon">▥</span>Графики</div>
-        <div class="nav-item" title="Top Cities"><span class="nav-icon">◎</span>Top Cities</div>
-        <div class="nav-item" title="Strategies"><span class="nav-icon">✣</span>Strategies</div>
-        <div class="nav-item" title="Watchlist"><span class="nav-icon">☆</span>Watchlist</div>
+        <div class="nav-item active" data-mode="paper" title="Paper mode"><span class="nav-icon">▣</span>Paper</div>
+        <div class="nav-item" data-mode="charts" title="Strategy graphs"><span class="nav-icon">▥</span>Graphs</div>
+        <div class="nav-item" data-mode="live" title="Live trading ledger"><span class="nav-icon">●</span>Live</div>
       </nav>
       <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
     </aside>
@@ -2319,13 +2368,14 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light · p paper · l live</span>
       </div>
     </main>
   </div>
 
   <script>
     const state = {
+      source: localStorage.weatherSource || "paper",
       view: localStorage.weatherView || "watchlist",
       page: localStorage.weatherPage || "dashboard",
       exit_mode: localStorage.weatherExitMode || "tp40",
@@ -2342,6 +2392,7 @@ INDEX_HTML = r"""<!doctype html>
       lastCurveKey: "",
       compareSort: {key: "", dir: "asc"},
     };
+    if (state.page === "charts") state.source = "paper";
 
     const money = v => v === null || v === undefined ? "n/a" : `${v < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}`;
     const price = v => v === null || v === undefined ? "n/a" : Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
@@ -2365,6 +2416,7 @@ INDEX_HTML = r"""<!doctype html>
     };
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
     const stakeLabel = () => state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
+    const sourceLabel = () => state.source === "live" ? "Live" : "Paper";
     const CITY_FLAGS = {
       "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
       "Austin": "🇺🇸", "Denver": "🇺🇸", "Houston": "🇺🇸", "Los Angeles": "🇺🇸", "San Francisco": "🇺🇸",
@@ -2657,7 +2709,11 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
-      document.querySelectorAll("[data-page]").forEach(item => item.classList.toggle("active", item.dataset.page === state.page));
+      document.querySelectorAll("[data-mode]").forEach(item => {
+        const mode = item.dataset.mode;
+        const active = mode === "charts" ? state.page === "charts" : state.page !== "charts" && state.source === mode;
+        item.classList.toggle("active", active);
+      });
       document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
       document.querySelectorAll("[data-layout]").forEach(btn => btn.classList.toggle("active", btn.dataset.layout === state.layout));
       document.querySelectorAll('[data-stake-side="yes"]').forEach(input => {
@@ -2704,6 +2760,24 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.toggle("charts-only", state.page === "charts" && state.layout !== "terminal");
       localStorage.weatherPage = state.page;
       syncActiveButtons();
+    }
+
+    function applyMode(mode) {
+      if (mode === "charts") {
+        setState({source: "paper", page: "charts"});
+        return;
+      }
+      if (mode === "live") {
+        setState({
+          source: "live",
+          page: "dashboard",
+          view: "watchlist",
+          exit_mode: "tp40_runner",
+          strategy: "watchlist_no_reentry",
+        });
+        return;
+      }
+      setState({source: "paper", page: "dashboard"});
     }
 
     async function loadOptions() {
@@ -2812,7 +2886,7 @@ INDEX_HTML = r"""<!doctype html>
       const exitTabs = state.options.exit_modes.map(e => `<span class="${e.id === state.exit_mode ? "active" : ""}">${e.key} ${esc(e.label).toUpperCase()}</span>`);
       const compare = `<span class="${state.strategy === "compare" ? "active" : ""}">x COMPARE</span>`;
       setHTML("terminal-tabs", [...viewTabs, ...exitTabs, ...strategyTabs, compare].join(""));
-      setText("terminal-brand", `${meta.view_label} / ${meta.strategy_label || meta.exit_mode_label}`);
+      setText("terminal-brand", `${meta.source_label} / ${meta.view_label} / ${meta.strategy_label || meta.exit_mode_label}`);
     }
 
     function renderTerminalStats(s) {
@@ -2974,10 +3048,10 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.add("compare-only");
       const meta = data.meta;
       const rows = sortedCompareRows(data.rows);
-      setText("title", `${meta.view_label} / ${meta.exit_mode_label}`);
+      setText("title", `${meta.source_label} / ${meta.view_label} / ${meta.exit_mode_label}`);
       setText("subtitle", "Side-by-side strategy health check across the selected city universe.");
-      setText("status-line", `${lookbackLabel()}${stakeLabel()} · effective state: compare`);
-      setText("compare-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
+      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()} · effective state: compare`);
+      setText("compare-subtitle", `${meta.source_label} · ${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
       setHTML("compare", rows.map(r => `
         <tr>
           <td>${esc(r.key)}</td>
@@ -3015,11 +3089,11 @@ INDEX_HTML = r"""<!doctype html>
       const bestUnrealized = [...data.rows].sort((a, b) => b.unrealized - a.unrealized)[0] || {};
       const bestWinrate = [...data.rows].filter(r => r.sells > 0).sort((a, b) => b.winrate - a.winrate)[0] || {};
 
-      setText("title", `${meta.view_label} / Strategy Graphs`);
+      setText("title", `${meta.source_label} / Strategy Graphs`);
       setText("subtitle", "Realized, unrealized and winrate across tested strategies.");
-      setText("status-line", `${lookbackLabel()}${stakeLabel()} · chart state: compare`);
-      setText("charts-subtitle", `${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
-      setText("sidebar-meta", `${meta.view_label} · Graphs`);
+      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()} · chart state: compare`);
+      setText("charts-subtitle", `${meta.source_label} · ${meta.view_label} · ${meta.exit_mode_label} · ${Number(state.lookback) === 0 ? "all history" : lookbackShort()}${stakeLabel()}`);
+      setText("sidebar-meta", `${meta.source_label} · Graphs`);
       setText("state-path", `state root: ${meta.state_path}`);
 
       setMetric("m-total", bestTotal.total || 0);
@@ -3045,11 +3119,12 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.remove("charts-only");
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
-      setText("title", `${meta.view_label} / ${meta.strategy_label}`);
-      setText("subtitle", `${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", `${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
+      const titleSource = meta.source === "live" ? "Live" : meta.view_label;
+      setText("title", `${titleSource} / ${meta.strategy_label}`);
+      setText("subtitle", `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
-      setText("sidebar-meta", `${meta.view_label} · ${meta.strategy_label}`);
+      setText("sidebar-meta", `${meta.source_label} · ${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", lookbackLabel());
       setMetric("m-total", s.total);
       setMetric("m-realized", s.realized);
@@ -3073,6 +3148,7 @@ INDEX_HTML = r"""<!doctype html>
       const requestStrategy = state.page === "charts" ? "compare" : state.strategy;
       const params = new URLSearchParams({
         strategy: requestStrategy,
+        source: state.source,
         view: state.view,
         exit_mode: state.exit_mode,
         lookback: state.lookback,
@@ -3096,6 +3172,7 @@ INDEX_HTML = r"""<!doctype html>
       Object.assign(state, patch);
       state.lastPayload = "";
       state.lastCurveKey = "";
+      localStorage.weatherSource = state.source;
       localStorage.weatherView = state.view;
       localStorage.weatherPage = state.page;
       localStorage.weatherExitMode = state.exit_mode;
@@ -3109,11 +3186,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     document.addEventListener("click", e => {
-      const pageItem = e.target.closest("[data-page]");
-      if (pageItem) {
-        applyPage(pageItem.dataset.page);
-        state.lastPayload = "";
-        refresh();
+      const modeItem = e.target.closest("[data-mode]");
+      if (modeItem) {
+        applyMode(modeItem.dataset.mode);
         return;
       }
       const sortHeader = e.target.closest("[data-compare-sort]");
@@ -3175,6 +3250,8 @@ INDEX_HTML = r"""<!doctype html>
       if (key === "t") setState({lookback: nextLookback()});
       if (key === "d") applyTheme(state.theme === "dark" ? "light" : "dark");
       if (key === "m") applyLayout(state.layout === "terminal" ? "modern" : "terminal");
+      if (key === "p") applyMode("paper");
+      if (key === "l") applyMode("live");
       if ("abcdefghij".includes(key) && state.options) {
         const found = state.options.strategies.find(s => s.key === key);
         if (found) setState({strategy: found.id});
@@ -3465,6 +3542,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             strategy = qs.get("strategy", ["baseline"])[0]
             view = qs.get("view", ["watchlist"])[0]
             exit_mode = qs.get("exit_mode", ["tp40"])[0]
+            source = qs.get("source", ["paper"])[0]
             try:
                 lookback = float(qs.get("lookback", [str(DEFAULT_LOOKBACK_HOURS)])[0])
             except (TypeError, ValueError):
@@ -3477,10 +3555,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 view = "watchlist"
             if exit_mode not in EXIT_MODE_ORDER:
                 exit_mode = "tp40"
+            if source not in SOURCE_ORDER:
+                source = "paper"
             body = (
-                compare_state(view, exit_mode, lookback, yes_stake, no_stake)
+                compare_state(view, exit_mode, lookback, yes_stake, no_stake, source)
                 if strategy == "compare"
-                else normalize_state(strategy, view, exit_mode, lookback, yes_stake, no_stake)
+                else normalize_state(strategy, view, exit_mode, lookback, yes_stake, no_stake, source)
             )
             return self.send_bytes(json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         return self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)

@@ -169,6 +169,16 @@ def _get_positive_int_env(name: str, default: int) -> int:
     return default
 
 
+def _get_non_negative_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+        if value >= 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
 WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
 WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_SECONDS", 30)
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
@@ -347,6 +357,250 @@ def get_strategy_state_dir(strategy_id: str = None) -> Path:
     return base_dir / "strategies" / strategy_id
 
 
+def get_live_strategy_state_dir(strategy_id: str = None) -> Path:
+    strategy_id = strategy_id or ACTIVE_STRATEGY_ID
+    base_dir = Path(__file__).resolve().parent / "data" / "live_trading"
+    if strategy_id == BASELINE_STRATEGY_ID:
+        return base_dir
+    return base_dir / "strategies" / strategy_id
+
+
+def get_live_strategy_state_path(strategy_id: str = None) -> Path:
+    return get_live_strategy_state_dir(strategy_id) / "state.json"
+
+
+def _empty_live_strategy_state() -> dict:
+    return {
+        "version": 1,
+        "strategy_id": ACTIVE_STRATEGY_ID,
+        "positions": {},
+        "last_exits": {},
+        "trades": [],
+        "updated_at": None,
+    }
+
+
+def load_live_strategy_state(strategy_id: str = None) -> dict:
+    path = get_live_strategy_state_path(strategy_id)
+    if not path.exists():
+        return _empty_live_strategy_state()
+    try:
+        state = json.loads(path.read_text())
+    except Exception:
+        return _empty_live_strategy_state()
+    state.setdefault("version", 1)
+    state.setdefault("strategy_id", strategy_id or ACTIVE_STRATEGY_ID)
+    state.setdefault("positions", {})
+    state.setdefault("last_exits", {})
+    state.setdefault("trades", [])
+    return state
+
+
+def save_live_strategy_state(state: dict, strategy_id: str = None) -> None:
+    path = get_live_strategy_state_path(strategy_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state["strategy_id"] = strategy_id or ACTIVE_STRATEGY_ID
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp_path.replace(path)
+
+
+def get_live_position_state(market_id: str) -> Optional[dict]:
+    return load_live_strategy_state().get("positions", {}).get(market_id)
+
+
+def live_last_exit_reason(market_id: str) -> Optional[str]:
+    last_exit = load_live_strategy_state().get("last_exits", {}).get(market_id) or {}
+    return last_exit.get("reason")
+
+
+def live_last_exit_time(market_id: str) -> Optional[str]:
+    last_exit = load_live_strategy_state().get("last_exits", {}).get(market_id) or {}
+    return last_exit.get("timestamp")
+
+
+def record_live_buy(
+    *,
+    market_id: str,
+    side: str,
+    amount: float,
+    shares: float,
+    entry_price: float,
+    question: str,
+    signal_data: dict,
+    trade_id: str = None,
+    order_status: str = None,
+) -> None:
+    if shares <= 0:
+        return
+    state = load_live_strategy_state()
+    now = datetime.now(timezone.utc).isoformat()
+    position = state["positions"].get(market_id) or {
+        "market_id": market_id,
+        "side": side,
+        "shares": 0.0,
+        "cost_basis": 0.0,
+        "question": question,
+        "opened_at": now,
+        "buy_count": 0,
+    }
+    existing_shares = float(position.get("shares", 0.0) or 0.0)
+    existing_cost = float(position.get("cost_basis", 0.0) or 0.0)
+    next_shares = existing_shares + float(shares)
+    next_cost = existing_cost + float(amount or 0.0)
+    signal_data = signal_data or {}
+    position.update(
+        {
+            "side": side,
+            "shares": next_shares,
+            "cost_basis": next_cost,
+            "entry_price": (next_cost / next_shares if next_shares > 0 else entry_price),
+            "current_price": entry_price,
+            "unrealized_pnl": 0.0,
+            "unrealized_pnl_pct": 0.0,
+            "last_price_at": now,
+            "question": question,
+            "last_buy_at": now,
+            "last_buy_price": entry_price,
+            "buy_count": int(position.get("buy_count", 0) or 0) + 1,
+            "entry_regime": signal_data.get("entry_regime"),
+            "entry_bucket_relation": signal_data.get("entry_bucket_relation"),
+            "entry_forecast_value": signal_data.get("entry_forecast_value"),
+            "entry_forecast_unit": signal_data.get("entry_forecast_unit"),
+            "entry_forecast_source": signal_data.get("entry_forecast_source"),
+            "runner_after_partial_exit": bool(position.get("runner_after_partial_exit", False)),
+        }
+    )
+    state["positions"][market_id] = position
+    state["trades"].append(
+        {
+            "timestamp": now,
+            "action": "buy",
+            "market_id": market_id,
+            "side": side,
+            "amount_usd": amount,
+            "filled_shares": shares,
+            "simulated_fill_price": entry_price,
+            "question": question,
+            "strategy_id": ACTIVE_STRATEGY_ID,
+            "trade_id": trade_id,
+            "order_status": order_status,
+            "entry_regime": position.get("entry_regime"),
+            "entry_bucket_relation": position.get("entry_bucket_relation"),
+            "entry_forecast_value": position.get("entry_forecast_value"),
+            "entry_forecast_unit": position.get("entry_forecast_unit"),
+            "entry_forecast_source": position.get("entry_forecast_source"),
+        }
+    )
+    save_live_strategy_state(state)
+
+
+def record_live_mark(market_id: str, current_price: float) -> None:
+    state = load_live_strategy_state()
+    position = state.get("positions", {}).get(market_id)
+    if not position:
+        return
+    shares = float(position.get("shares", 0.0) or 0.0)
+    cost_basis = float(position.get("cost_basis", 0.0) or 0.0)
+    unrealized_pnl = shares * float(current_price or 0.0) - cost_basis
+    position.update(
+        {
+            "current_price": float(current_price or 0.0),
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl_pct": unrealized_pnl / cost_basis if cost_basis > 0 else 0.0,
+            "last_price_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    state["positions"][market_id] = position
+    save_live_strategy_state(state)
+
+
+def record_live_sell(
+    *,
+    market_id: str,
+    side: str,
+    shares: float,
+    exit_price: float,
+    question: str,
+    exit_reason: str,
+    partial_exit: bool,
+    runner_after_partial_exit: bool,
+    trade_id: str = None,
+    order_status: str = None,
+) -> None:
+    state = load_live_strategy_state()
+    now = datetime.now(timezone.utc).isoformat()
+    position = state["positions"].get(market_id) or {}
+    previous_shares = float(position.get("shares", shares) or shares or 0.0)
+    previous_cost = float(position.get("cost_basis", 0.0) or 0.0)
+    shares = min(float(shares or 0.0), previous_shares) if previous_shares > 0 else float(shares or 0.0)
+    removed_cost = previous_cost * (shares / previous_shares) if previous_shares > 0 else 0.0
+    proceeds = shares * float(exit_price or 0.0)
+    realized_pnl = proceeds - removed_cost
+    remaining_shares = max(0.0, previous_shares - shares)
+    remaining_cost = max(0.0, previous_cost - removed_cost)
+
+    state["trades"].append(
+        {
+            "timestamp": now,
+            "action": "sell",
+            "market_id": market_id,
+            "side": side,
+            "filled_shares": shares,
+            "simulated_fill_price": exit_price,
+            "realized_pnl": realized_pnl,
+            "question": question,
+            "strategy_id": ACTIVE_STRATEGY_ID,
+            "trade_id": trade_id,
+            "order_status": order_status,
+            "exit_reason": exit_reason,
+            "partial_exit": bool(partial_exit),
+            "runner_after_partial_exit": bool(runner_after_partial_exit),
+        }
+    )
+
+    if remaining_shares > 1e-9:
+        position.update(
+            {
+                "shares": remaining_shares,
+                "cost_basis": remaining_cost,
+                "partial_take_profit_done": bool(position.get("partial_take_profit_done", False) or partial_exit),
+                "partial_take_profit_at": now if partial_exit else position.get("partial_take_profit_at"),
+                "partial_take_profit_price": exit_price if partial_exit else position.get("partial_take_profit_price"),
+                "partial_take_profit_shares": shares if partial_exit else position.get("partial_take_profit_shares"),
+                "partial_take_profit_realized_pnl": realized_pnl if partial_exit else position.get("partial_take_profit_realized_pnl"),
+                "runner_after_partial_exit": bool(position.get("runner_after_partial_exit", False) or runner_after_partial_exit),
+            }
+        )
+        state["positions"][market_id] = position
+    else:
+        state["positions"].pop(market_id, None)
+        state["last_exits"][market_id] = {
+            "timestamp": now,
+            "reason": exit_reason,
+            "side": side,
+            "question": question,
+        }
+
+    save_live_strategy_state(state)
+
+
+def sync_live_positions_with_exchange(live_positions_by_market: dict) -> None:
+    """Drop local live state for markets no longer present on the exchange."""
+    state = load_live_strategy_state()
+    if not state.get("positions"):
+        return
+    live_market_ids = set(live_positions_by_market or {})
+    removed = False
+    for market_id in list(state["positions"].keys()):
+        if market_id not in live_market_ids:
+            state["positions"].pop(market_id, None)
+            removed = True
+    if removed:
+        save_live_strategy_state(state)
+
+
 # Positive value means primary forecast has historically run hot versus actual;
 # the corrected forecast subtracts this value. Keep this conservative until the
 # Wunderground calibration sample grows.
@@ -493,7 +747,7 @@ STRATEGY_V1_FORECAST_FRESH_MAX_HOURS = 12
 STRATEGY_V1_EARLY_MARKET_MIN_HOURS = 48
 STRATEGY_V1_LATE_MARKET_MAX_HOURS = 24
 FORECAST_DRIFT_THRESHOLD_DEGREES = 2.0
-MAX_TOTAL_POSITIONS = 40
+MAX_TOTAL_POSITIONS = _get_non_negative_int_env("WEATHER_BOT_MAX_TOTAL_POSITIONS", 40)
 STRATEGY_V1_MAX_POSITION_PER_MARKET_USD = 40.0
 STRATEGY_V1_MAX_BUYS_PER_MARKET = 5
 STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES = 20
@@ -1017,7 +1271,50 @@ def _apply_strategy_v1_rebuy_guard(
                 "position_cost_usd": live_position.current_value,
                 "current_side_price": current_side_price,
             }
-        if len(live_positions_by_market) >= MAX_TOTAL_POSITIONS:
+        strategy_config = get_active_strategy_config()
+        if strategy_config.get("block_reentry_after_stop_loss") and live_last_exit_reason(market_id) == "stop_loss":
+            return {
+                "action": "skip",
+                "reason": "blocked_after_stop_loss",
+                "selected_side": selected_side,
+                "price_yes": entry["yes_price"],
+                "gaussian_probability": entry["gaussian_probability"],
+                "edge_yes": entry["edge_yes"],
+                "edge_no": entry["edge_no"],
+                "open_position_exists": False,
+                "historical_trade_exists": True,
+                "buy_count": None,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "position_cost_usd": None,
+                "current_side_price": current_side_price,
+            }
+        last_exit_at = live_last_exit_time(market_id)
+        if last_exit_at:
+            try:
+                last_exit_dt = datetime.fromisoformat(str(last_exit_at).replace("Z", "+00:00"))
+                if last_exit_dt.tzinfo is None:
+                    last_exit_dt = last_exit_dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < last_exit_dt + timedelta(minutes=MARKET_EXIT_COOLDOWN_MINUTES):
+                    return {
+                        "action": "skip",
+                        "reason": "market_cooldown",
+                        "selected_side": selected_side,
+                        "price_yes": entry["yes_price"],
+                        "gaussian_probability": entry["gaussian_probability"],
+                        "edge_yes": entry["edge_yes"],
+                        "edge_no": entry["edge_no"],
+                        "open_position_exists": False,
+                        "historical_trade_exists": True,
+                        "buy_count": None,
+                        "last_buy_at": None,
+                        "last_buy_price": None,
+                        "position_cost_usd": None,
+                        "current_side_price": current_side_price,
+                    }
+            except Exception:
+                pass
+        if MAX_TOTAL_POSITIONS > 0 and len(live_positions_by_market) >= MAX_TOTAL_POSITIONS:
             return {
                 "action": "skip",
                 "reason": "max_positions_reached",
@@ -1444,7 +1741,7 @@ def get_strategy_v1_rebuy_context(
             "reason": "already_have_position",
             "open_positions_count": open_positions_count,
         }
-    if open_positions_count >= MAX_TOTAL_POSITIONS:
+    if MAX_TOTAL_POSITIONS > 0 and open_positions_count >= MAX_TOTAL_POSITIONS:
         return {
             "open_position_exists": False,
             "rebuy_allowed": False,
@@ -1736,6 +2033,14 @@ def run_model_comparison(
 TRADE_SOURCE = "sdk:weather"
 SKILL_SLUG = "polymarket-weather-trader"
 _automaton_reported = False
+
+
+def filter_live_strategy_positions(positions: list[Position]) -> list[Position]:
+    """Keep live exits scoped to bot-created positions unless explicitly widened."""
+    if os.environ.get("WEATHER_BOT_LIVE_MANAGE_KEYWORD_POSITIONS") == "1":
+        return filter_weather_positions(positions, TRADE_SOURCE)
+    return [pos for pos in positions or [] if TRADE_SOURCE in (pos.sources or [])]
+
 
 # Polymarket constraints
 MIN_SHARES_PER_ORDER = 5.0  # Polymarket requires minimum 5 shares
@@ -2875,7 +3180,7 @@ def check_exit_opportunities(
     if not positions:
         return 0, 0
 
-    weather_positions = positions if execution_mode == ExecutionMode.PAPER else filter_weather_positions(positions, TRADE_SOURCE)
+    weather_positions = positions if execution_mode == ExecutionMode.PAPER else filter_live_strategy_positions(positions)
 
     if not weather_positions:
         return 0, 0
@@ -3052,6 +3357,23 @@ def check_exit_opportunities(
                 )
             continue
 
+        if execution_mode == ExecutionMode.LIVE_ENABLED:
+            position_state = get_live_position_state(market_id)
+            if position_state:
+                stored_question = position_state.get("question") or stored_question
+                opened_at = position_state.get("opened_at")
+                if opened_at:
+                    try:
+                        opened_dt = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+                        if opened_dt.tzinfo is None:
+                            opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                        position_age_hours = max(
+                            0.0,
+                            (datetime.now(timezone.utc) - opened_dt.astimezone(timezone.utc)).total_seconds() / 3600.0,
+                        )
+                    except Exception:
+                        position_age_hours = None
+
         entry_regime = position_state.get("entry_regime") if position_state else None
         take_profit, stop_loss = get_exit_targets(
             entry_price,
@@ -3075,7 +3397,7 @@ def check_exit_opportunities(
             exit_reason = "max_age_exit"
         elif current_price >= take_profit:
             exit_reason = "take_profit"
-            if execution_mode == ExecutionMode.PAPER and partial_tp_enabled and not partial_tp_done:
+            if execution_mode in {ExecutionMode.PAPER, ExecutionMode.LIVE_ENABLED} and partial_tp_enabled and not partial_tp_done:
                 partial_exit = True
         elif current_price <= stop_loss:
             exit_reason = "stop_loss"
@@ -3119,6 +3441,9 @@ def check_exit_opportunities(
                     stop_loss=round(stop_loss, 6),
                     position_age_hours=round(position_age_hours, 6) if position_age_hours is not None else None,
                 )
+
+        if execution_mode == ExecutionMode.LIVE_ENABLED:
+            record_live_mark(market_id, current_price)
 
         if ignored_edge_invalidated:
             print(f"  📊 {question}...")
@@ -3200,6 +3525,21 @@ def check_exit_opportunities(
                     f"     ✅ {'[PAPER] ' if result.get('simulated') else ''}"
                     f"Sold {position_side.upper()} {shares_to_sell:.1f} shares @ ${current_price:.2f}"
                 )
+                if execution_mode == ExecutionMode.LIVE_ENABLED and not result.get("is_submitted_only"):
+                    record_live_sell(
+                        market_id=market_id,
+                        side=position_side,
+                        shares=shares_to_sell,
+                        exit_price=current_price,
+                        question=stored_question,
+                        exit_reason=exit_reason,
+                        partial_exit=partial_exit,
+                        runner_after_partial_exit=runner_after_partial_exit,
+                        trade_id=trade_id,
+                        order_status=result.get("order_status"),
+                    )
+                elif execution_mode == ExecutionMode.LIVE_ENABLED and result.get("is_submitted_only"):
+                    print("     ⚠️  Live sell is pending on-book; local runner state was not advanced yet.")
                 if execution_mode == ExecutionMode.PAPER and logger is not None:
                     logger.event(
                         "strategy_v1_exit_decision",
@@ -3447,12 +3787,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
     live_strategy_positions_by_market = {}
     if execution_mode == ExecutionMode.LIVE_ENABLED:
+        live_positions = load_positions(adapter, execution_mode=execution_mode)
         live_strategy_positions_by_market = build_live_strategy_position_map(
-            filter_weather_positions(
-                load_positions(adapter, execution_mode=execution_mode),
-                TRADE_SOURCE,
-            )
+            filter_live_strategy_positions(live_positions)
         )
+        sync_live_positions_with_exchange(build_live_strategy_position_map(live_positions))
 
     trades_executed = 0
     total_usd_spent = 0.0
@@ -3938,18 +4277,34 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     force=True,
                 )
                 if execution_mode == ExecutionMode.LIVE_ENABLED:
-                    live_strategy_positions_by_market[market_id] = Position(
-                        market_id=market_id,
-                        question=candidate.market.question,
-                        venue="polymarket",
-                        shares_yes=result.get("shares_bought") if selected_side == "yes" else 0,
-                        shares_no=result.get("shares_bought") if selected_side == "no" else 0,
-                        avg_cost=price if selected_side == "yes" else 1.0 - price,
-                        current_price=price if selected_side == "yes" else 1.0 - price,
-                        current_value=position_size,
-                        sources=[TRADE_SOURCE],
-                        opened_by_weather_strategy=True,
-                    )
+                    if result.get("is_submitted_only"):
+                        log("  ⚠️  Live buy is pending on-book; local live state will wait for an actual fill.", force=True)
+                    elif shares > 0:
+                        record_live_buy(
+                            market_id=market_id,
+                            side=selected_side,
+                            amount=position_size,
+                            shares=shares,
+                            entry_price=price if selected_side == "yes" else 1.0 - price,
+                            question=candidate.market.question,
+                            signal_data=signal.metadata,
+                            trade_id=trade_id,
+                            order_status=result.get("order_status"),
+                        )
+                        live_strategy_positions_by_market[market_id] = Position(
+                            market_id=market_id,
+                            question=candidate.market.question,
+                            venue="polymarket",
+                            shares_yes=result.get("shares_bought") if selected_side == "yes" else 0,
+                            shares_no=result.get("shares_bought") if selected_side == "no" else 0,
+                            avg_cost=price if selected_side == "yes" else 1.0 - price,
+                            current_price=price if selected_side == "yes" else 1.0 - price,
+                            current_value=position_size,
+                            sources=[TRADE_SOURCE],
+                            opened_by_weather_strategy=True,
+                        )
+                    else:
+                        log("  ⚠️  Live buy returned success but no filled shares; local live state was not updated.", force=True)
 
                 # Log trade context for journal (skip for paper trades)
                 if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
@@ -4081,6 +4436,7 @@ def run_live_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True
         logger.log(f"  ⏭️  Live exit check skipped: execution mode is {execution_mode.value}")
         return
     live_positions = load_positions(get_adapter(), execution_mode=execution_mode)
+    sync_live_positions_with_exchange(build_live_strategy_position_map(live_positions))
     check_exit_opportunities(
         dry_run=dry_run,
         use_safeguards=use_safeguards,
