@@ -659,6 +659,59 @@ def normalize_state(
 
     sells = [trade for trade in trades if trade.get("action") == "sell"]
     sells.sort(key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ), reverse=True)
+    all_sells_by_key: dict[tuple[str, str], list[dict]] = {}
+    for trade in raw_trades:
+        if trade.get("action") == "sell":
+            all_sells_by_key.setdefault(trade_market_key(trade), []).append(trade)
+    for items in all_sells_by_key.values():
+        items.sort(key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ))
+
+    def closed_leg_info(trade: dict | None) -> dict | None:
+        if trade is None:
+            return None
+        entry, _, _, original_cost = closed_entry_info(trade, buy_history)
+        side = (trade.get("side") or "?").upper()
+        stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
+        pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake)
+        return {
+            "time": format_time(trade.get("timestamp")),
+            "stake": stake,
+            "entry_price": entry,
+            "exit_price": to_float(trade.get("simulated_fill_price")),
+            "pnl": pnl,
+            "final_value": stake + pnl if stake is not None and pnl is not None else None,
+            "exit_reason": trade_exit_reason(trade),
+        }
+
+    def runner_leg_summary(trade: dict) -> dict | None:
+        if not (is_partial_exit_trade(trade) or is_runner_trade(trade) or trade_exit_reason(trade) == "market_settlement"):
+            return None
+        group = all_sells_by_key.get(trade_market_key(trade), [])
+        partial_trade = next((item for item in group if is_partial_exit_trade(item)), None)
+        runner_trade = next(
+            (
+                item
+                for item in reversed(group)
+                if is_runner_trade(item) or trade_exit_reason(item) == "market_settlement"
+            ),
+            None,
+        )
+        if not partial_trade and not runner_trade:
+            return None
+        partial_leg = closed_leg_info(partial_trade)
+        runner_leg = closed_leg_info(runner_trade)
+        legs = [leg for leg in (partial_leg, runner_leg) if leg is not None]
+        total_stake = sum(leg.get("stake") or 0.0 for leg in legs)
+        total_pnl = sum(leg.get("pnl") or 0.0 for leg in legs)
+        return {
+            "tp40": partial_leg,
+            "runner": runner_leg,
+            "total_stake": total_stake,
+            "total_pnl": total_pnl,
+            "total_final": total_stake + total_pnl,
+            "tp40_filled": partial_leg is not None,
+        }
+
     closed_trades = []
     for trade in sells[:80]:
         entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
@@ -668,6 +721,7 @@ def normalize_state(
         question = clean_text(trade.get("question") or trade.get("market_id"))
         closed_trades.append(
             {
+                "market_id": trade.get("market_id"),
                 "timestamp": trade.get("timestamp"),
                 "time": format_time(trade.get("timestamp")),
                 "city": city_for_question(question),
@@ -685,6 +739,7 @@ def normalize_state(
                 "runner_after_partial_exit": bool(
                     trade.get("runner_after_partial_exit") or nested_signal(trade).get("runner_after_partial_exit")
                 ),
+                "runner_legs": runner_leg_summary(trade),
             }
         )
 
@@ -1641,8 +1696,63 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(255,64,92,.14);
       border-color: rgba(255,64,92,.28);
     }
+    .mode-chip.combo {
+      color: #0a7d64;
+      background: linear-gradient(135deg, rgba(22,185,120,.20), rgba(34,146,255,.14));
+      border-color: rgba(22,185,120,.30);
+    }
     .runner-col {
       min-width: 92px;
+    }
+    .runner-breakdown {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .runner-leg {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 9px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--card) 78%, var(--soft) 22%);
+      color: var(--market-ink);
+      font-size: 13px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .runner-leg strong {
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 950;
+    }
+    .runner-leg.positive {
+      border-color: rgba(22,185,120,.25);
+      background: rgba(22,185,120,.10);
+    }
+    .runner-leg.negative {
+      border-color: rgba(255,64,92,.25);
+      background: rgba(255,64,92,.10);
+    }
+    .runner-leg.missing {
+      color: var(--muted);
+      background: var(--empty-bg);
+      border-style: dashed;
+    }
+    .runner-total {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 10px;
+      color: var(--ink);
+      background: var(--amber-soft);
+      border: 1px solid rgba(247,185,85,.28);
+      font-size: 13px;
+      font-weight: 950;
+      white-space: nowrap;
     }
     .regime { color: var(--blue); font-weight: 900; }
     .city-chip {
@@ -2281,12 +2391,49 @@ INDEX_HTML = r"""<!doctype html>
     }
     function closedModeChip(trade) {
       if (!isRunnerMode()) return `<span class="neutral">-</span>`;
+      if (trade.runner_legs && !trade.partial_exit) return `<span class="mode-chip combo">TP40 + Runner</span>`;
       if (trade.partial_exit) return `<span class="mode-chip partial">TP40 half</span>`;
       const reason = String(trade.exit_reason || "").toLowerCase();
       if (reason === "market_settlement") return `<span class="mode-chip settlement">Settlement</span>`;
       if (reason === "stop_loss") return `<span class="mode-chip stop">Stop</span>`;
       if (reason === "take_profit") return `<span class="mode-chip runner">TP</span>`;
       return reason ? `<span class="mode-chip">${esc(reason)}</span>` : `<span class="neutral">-</span>`;
+    }
+
+    function runnerLegLine(label, leg, missingText) {
+      if (!leg) return `<span class="runner-leg missing">${esc(label)} · ${esc(missingText)}</span>`;
+      return `
+        <span class="runner-leg ${cls(leg.pnl)}">
+          ${esc(label)}
+          <strong>${price(leg.exit_price)}</strong>
+          <strong class="${cls(leg.pnl)}">${money(leg.pnl)}</strong>
+        </span>
+      `;
+    }
+
+    function runnerBreakdown(trade) {
+      if (!isRunnerMode() || !trade.runner_legs) return "";
+      const legs = trade.runner_legs;
+      return `
+        <div class="runner-breakdown">
+          ${runnerLegLine("TP40 half", legs.tp40, "not filled")}
+          ${runnerLegLine("Runner", legs.runner, "not closed")}
+          <span class="runner-total">Total <strong class="${cls(legs.total_pnl)}">${money(legs.total_pnl)}</strong></span>
+        </div>
+      `;
+    }
+
+    function collapsedRunnerRows(rows) {
+      if (!isRunnerMode()) return rows;
+      const hasFinalByKey = new Set(
+        rows
+          .filter(row => row.runner_legs && !row.partial_exit)
+          .map(row => `${row.market_id || row.question}|${row.side}`)
+      );
+      return rows.filter(row => {
+        const key = `${row.market_id || row.question}|${row.side}`;
+        return !(row.partial_exit && hasFinalByKey.has(key));
+      });
     }
 
     function setMetric(id, value) {
@@ -2618,23 +2765,27 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderClosed(rows) {
       const q = state.search.toLowerCase();
-      const filtered = rows.filter(t => !q || `${t.city} ${t.question}`.toLowerCase().includes(q));
+      const filtered = collapsedRunnerRows(rows.filter(t => !q || `${t.city} ${t.question}`.toLowerCase().includes(q)));
       setText("closed-count", `${filtered.length}/${rows.length}`);
       setHTML("closed", filtered.length ? filtered.slice(0, 36).map(t => {
-        const rowClass = Number(t.pnl || 0) > 0 ? "closed-profit" : Number(t.pnl || 0) < 0 ? "closed-loss" : "";
+        const displayStake = t.runner_legs && !t.partial_exit ? t.runner_legs.total_stake : t.stake;
+        const displayPnl = t.runner_legs && !t.partial_exit ? t.runner_legs.total_pnl : t.pnl;
+        const displayFinal = t.runner_legs && !t.partial_exit ? t.runner_legs.total_final : t.final_value;
+        const displayExit = t.runner_legs && !t.partial_exit && t.runner_legs.runner ? t.runner_legs.runner.exit_price : t.exit_price;
+        const rowClass = Number(displayPnl || 0) > 0 ? "closed-profit" : Number(displayPnl || 0) < 0 ? "closed-loss" : "";
         return `
         <tr class="${rowClass}">
           <td>${esc(t.time)}</td>
           <td><span class="pill ${t.side === "YES" ? "yes" : "no"}">${esc(t.side)}</span></td>
           <td class="regime">${esc(t.regime)}</td>
           <td>${closedModeChip(t)}</td>
-          <td class="num">${money(t.stake)}</td>
+          <td class="num">${money(displayStake)}</td>
           <td class="num">${price(t.entry_price)}</td>
-          <td class="num">${price(t.exit_price)}</td>
-          <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
-          <td class="num ${cls(t.final_value)}">${money(t.final_value)}</td>
+          <td class="num">${price(displayExit)}</td>
+          <td class="num ${cls(displayPnl)}">${money(displayPnl)}</td>
+          <td class="num ${cls(displayFinal)}">${money(displayFinal)}</td>
           <td class="city-col">${cityChip(t.city)}</td>
-          <td class="market">${esc(t.question)}</td>
+          <td class="market">${esc(t.question)}${runnerBreakdown(t)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `;
