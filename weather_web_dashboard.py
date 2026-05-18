@@ -36,7 +36,7 @@ AUTH_SECRET = os.environ.get("WEATHER_DASHBOARD_AUTH_SECRET") or AUTH_PASSWORD o
 AUTH_COOKIE = "weather_dashboard_session"
 AUTH_TTL_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_AUTH_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 LIVE_POSITIONS_TTL_SECONDS = float(os.environ.get("WEATHER_DASHBOARD_LIVE_POSITIONS_TTL_SECONDS", "10"))
-LIVE_POSITION_SOURCE_FILTER = os.environ.get("WEATHER_DASHBOARD_LIVE_POSITION_SOURCE", "weather")
+LIVE_POSITION_SOURCE_FILTER = os.environ.get("WEATHER_DASHBOARD_LIVE_POSITION_SOURCE", "")
 
 VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
@@ -264,7 +264,10 @@ def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
         from simmer_sdk import SimmerClient
 
         client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
-        positions = client.get_positions(venue="polymarket", source=LIVE_POSITION_SOURCE_FILTER)
+        if LIVE_POSITION_SOURCE_FILTER:
+            positions = client.get_positions(venue="polymarket", source=LIVE_POSITION_SOURCE_FILTER)
+        else:
+            positions = client.get_positions(venue="polymarket")
         if not positions and LIVE_POSITION_SOURCE_FILTER:
             positions = client.get_positions(venue="polymarket")
         rows = [dict_from_obj(position) for position in positions]
@@ -620,6 +623,17 @@ def trade_entry_cost(trade: dict, entry_price: float | None) -> float | None:
     return None
 
 
+def actual_trade_pnl_from_prices(trade: dict, entry_price: float | None) -> float | None:
+    exit_price = to_float(trade.get("simulated_fill_price"))
+    shares = to_float(trade.get("filled_shares")) or to_float(trade.get("requested_shares"))
+    if entry_price is not None and exit_price is not None and shares is not None and shares > 0:
+        return shares * (exit_price - entry_price)
+    original_cost = trade_entry_cost(trade, entry_price)
+    if entry_price is not None and entry_price > 0 and exit_price is not None and original_cost is not None:
+        return original_cost * (exit_price / entry_price - 1.0)
+    return None
+
+
 def build_buy_history(trades: list[dict]) -> dict:
     history = {}
     for trade in trades:
@@ -674,9 +688,20 @@ def closed_entry_info(trade: dict, buy_history: dict) -> tuple[float | None, str
     return entry, regime, forecast, original_cost
 
 
-def adjusted_trade_pnl(trade: dict, buy_history: dict, yes_stake: float | None = None, no_stake: float | None = None) -> float | None:
+def adjusted_trade_pnl(
+    trade: dict,
+    buy_history: dict,
+    yes_stake: float | None = None,
+    no_stake: float | None = None,
+    source: str = "paper",
+) -> float | None:
     realized = to_float(trade.get("realized_pnl"))
     entry, _, _, original_cost = closed_entry_info(trade, buy_history)
+    if source == "live":
+        actual = actual_trade_pnl_from_prices(trade, entry)
+        if actual is not None:
+            return actual
+        return realized
     target_stake = partial_trade_target_stake(trade, stake_for_side(trade.get("side"), yes_stake, no_stake))
     simulated = simulated_price_pnl(entry, to_float(trade.get("simulated_fill_price")), target_stake)
     if simulated is not None:
@@ -738,11 +763,12 @@ def summarize(
     buy_history: dict | None = None,
     yes_stake: float | None = None,
     no_stake: float | None = None,
+    source: str = "paper",
 ) -> dict:
     buy_history = buy_history or {}
     buys = [trade for trade in trades if trade.get("action") == "buy"]
     sells = [trade for trade in trades if trade.get("action") == "sell"]
-    sell_pnls = [adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake) or 0.0 for trade in sells]
+    sell_pnls = [adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source) or 0.0 for trade in sells]
     wins = [pnl for pnl in sell_pnls if pnl > 0]
     losses = [pnl for pnl in sell_pnls if pnl < 0]
     realized = sum(sell_pnls)
@@ -806,7 +832,7 @@ def normalize_state(
     raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
     trades = filter_recent_trades(raw_trades, lookback_hours)
     buy_history = build_buy_history(raw_trades)
-    summary = summarize(raw_positions, trades, buy_history, yes_stake, no_stake)
+    summary = summarize(raw_positions, trades, buy_history, yes_stake, no_stake, source)
 
     positions = []
     for position in raw_positions:
@@ -855,7 +881,7 @@ def normalize_state(
         entry, _, _, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
         stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
-        pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake)
+        pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source)
         return {
             "time": format_time(trade.get("timestamp")),
             "stake": stake,
@@ -900,7 +926,7 @@ def normalize_state(
         entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
         stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
-        pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake)
+        pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source)
         question = clean_text(trade.get("question") or trade.get("market_id"))
         closed_trades.append(
             {
@@ -932,10 +958,10 @@ def normalize_state(
         city = city_for_question(question)
         city_pnl.setdefault(city, {"city": city, "sells": 0, "pnl": 0.0})
         city_pnl[city]["sells"] += 1
-        city_pnl[city]["pnl"] += adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake) or 0.0
+        city_pnl[city]["pnl"] += adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source) or 0.0
 
     pnl_values = [
-        adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake) or 0.0
+        adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source) or 0.0
         for trade in sorted(sells, key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ))
     ]
 
@@ -994,7 +1020,7 @@ def compare_state(
         raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
         trades = filter_recent_trades(raw_trades, lookback_hours)
         buy_history = build_buy_history(raw_trades)
-        summary = summarize(positions, trades, buy_history, yes_stake, no_stake)
+        summary = summarize(positions, trades, buy_history, yes_stake, no_stake, source)
         rows.append(
             {
                 "key": key,
@@ -1025,7 +1051,7 @@ def compare_state(
             "state_path": str(state_root_for_source(source)),
         },
         "rows": rows,
-        "stats": summarize([], []),
+        "stats": summarize([], [], source=source),
     }
 
 
