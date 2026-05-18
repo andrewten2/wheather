@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +35,8 @@ AUTH_PASSWORD = os.environ.get("WEATHER_DASHBOARD_PASSWORD") or os.environ.get("
 AUTH_SECRET = os.environ.get("WEATHER_DASHBOARD_AUTH_SECRET") or AUTH_PASSWORD or "weather-dashboard-dev-secret"
 AUTH_COOKIE = "weather_dashboard_session"
 AUTH_TTL_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_AUTH_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+LIVE_POSITIONS_TTL_SECONDS = float(os.environ.get("WEATHER_DASHBOARD_LIVE_POSITIONS_TTL_SECONDS", "10"))
+LIVE_POSITION_SOURCE_FILTER = os.environ.get("WEATHER_DASHBOARD_LIVE_POSITION_SOURCE", "weather")
 
 VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
@@ -180,6 +183,7 @@ def resolve_live_state_root() -> Path:
 
 
 LIVE_STATE_ROOT = resolve_live_state_root()
+LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
 
 
 def tp40_runner_strategy_id(strategy: str) -> str:
@@ -213,6 +217,62 @@ def load_state(strategy: str = "baseline", source: str = "paper") -> dict:
         return json.loads(path.read_text())
     except Exception:
         return {"strategy_id": strategy, "positions": {}, "trades": []}
+
+
+def read_env_file_value(name: str) -> str | None:
+    for path in (ROOT / ".env", Path("/root/wheather/.env")):
+        try:
+            for line in path.read_text().splitlines():
+                text = line.strip()
+                if not text or text.startswith("#") or "=" not in text:
+                    continue
+                key, value = text.split("=", 1)
+                if key.strip() == name:
+                    return value.strip().strip('"').strip("'")
+        except Exception:
+            continue
+    return None
+
+
+def simmer_api_key() -> str | None:
+    return os.environ.get("SIMMER_API_KEY") or read_env_file_value("SIMMER_API_KEY")
+
+
+def dict_from_obj(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "__dict__"):
+        return dict(value.__dict__)
+    return {}
+
+
+def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
+    """Fetch actual live positions from Simmer so live dashboard matches agent PnL."""
+    now = time.time()
+    cached_positions = LIVE_POSITIONS_CACHE.get("positions")
+    if cached_positions is not None and now - float(LIVE_POSITIONS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached_positions, LIVE_POSITIONS_CACHE.get("error")
+
+    api_key = simmer_api_key()
+    if not api_key:
+        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": None, "error": "SIMMER_API_KEY missing"})
+        return None, LIVE_POSITIONS_CACHE["error"]
+
+    try:
+        from simmer_sdk import SimmerClient
+
+        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        positions = client.get_positions(venue="polymarket", source=LIVE_POSITION_SOURCE_FILTER)
+        if not positions and LIVE_POSITION_SOURCE_FILTER:
+            positions = client.get_positions(venue="polymarket")
+        rows = [dict_from_obj(position) for position in positions]
+        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": rows, "error": None})
+        return rows, None
+    except Exception as exc:
+        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": None, "error": str(exc)})
+        return None, str(exc)
 
 
 def values(value):
@@ -310,6 +370,81 @@ def filter_by_view(items, view: str):
     ]
 
 
+def live_position_source_matches(position: dict) -> bool:
+    expected = (LIVE_POSITION_SOURCE_FILTER or "").lower()
+    if not expected:
+        return True
+    sources = position.get("sources") or []
+    if isinstance(sources, str):
+        sources = [sources]
+    if not sources:
+        return True
+    return any(expected in str(source).lower() for source in sources)
+
+
+def merge_simmer_live_positions(remote_positions: list[dict] | None, local_positions) -> list[dict] | None:
+    if remote_positions is None:
+        return None
+    local_by_market = {
+        str(position.get("market_id")): position
+        for position in values(local_positions)
+        if position.get("market_id")
+    }
+    merged = []
+    for raw in remote_positions:
+        position = dict_from_obj(raw)
+        market_id = str(position.get("market_id") or "")
+        if not market_id:
+            continue
+        if not live_position_source_matches(position):
+            continue
+        local = local_by_market.get(market_id, {})
+        shares_yes = to_float(position.get("shares_yes")) or 0.0
+        shares_no = to_float(position.get("shares_no")) or 0.0
+        if shares_yes <= 0 and shares_no <= 0:
+            continue
+
+        side = "yes" if shares_yes > 0 else "no"
+        shares = shares_yes if side == "yes" else shares_no
+        cost_basis = to_float(position.get("cost_basis"))
+        pnl = to_float(position.get("pnl"))
+        current_value = to_float(position.get("current_value"))
+        if cost_basis is None and current_value is not None and pnl is not None:
+            cost_basis = current_value - pnl
+        if cost_basis is None:
+            cost_basis = to_float(local.get("cost_basis")) or 0.0
+
+        current_price = to_float(position.get("current_price"))
+        if current_price is None and current_value is not None and shares > 0:
+            current_price = current_value / shares
+        avg_cost = to_float(position.get("avg_cost"))
+        if avg_cost is None and cost_basis and shares > 0:
+            avg_cost = cost_basis / shares
+        if pnl is None and current_price is not None:
+            pnl = shares * current_price - cost_basis
+
+        question = clean_text(position.get("question") or local.get("question") or market_id)
+        merged.append(
+            {
+                **local,
+                "market_id": market_id,
+                "question": question,
+                "side": side,
+                "shares": shares,
+                "cost_basis": cost_basis,
+                "entry_price": avg_cost,
+                "avg_cost": avg_cost,
+                "current_price": current_price,
+                "current_value_usd": current_value,
+                "unrealized_pnl": pnl,
+                "unrealized_pnl_pct": pnl / cost_basis if pnl is not None and cost_basis and cost_basis > 0 else None,
+                "sources": position.get("sources") or local.get("sources") or [],
+                "status": position.get("status") or local.get("status"),
+            }
+        )
+    return merged
+
+
 def filter_recent_trades(trades: list[dict], hours: float) -> list[dict]:
     if not hours or hours <= 0:
         return list(trades)
@@ -401,7 +536,7 @@ def forecast_label(item: dict) -> str:
 
 
 def trade_cost(trade: dict, entry_price: float | None = None) -> float | None:
-    for field in ("cost_usd", "position_cost_usd", "notional_usd"):
+    for field in ("amount_usd", "cost_usd", "position_cost_usd", "notional_usd", "filled_value_usd"):
         value = to_float(trade.get(field))
         if value is not None and value > 0:
             return value
@@ -649,9 +784,25 @@ def normalize_state(
     no_stake: float | None = None,
     source: str = "paper",
 ) -> dict:
+    requested_yes_stake = yes_stake
+    requested_no_stake = no_stake
+    live_positions_source = "local_state"
+    live_positions_error = None
+    if source == "live":
+        # Live must mirror real Simmer fills. Stake simulator is paper-only.
+        yes_stake = None
+        no_stake = None
+
     effective = effective_strategy(strategy, exit_mode)
     state = load_state(effective, source)
-    raw_positions = filter_by_view(state.get("positions"), view)
+    raw_position_source = state.get("positions")
+    if source == "live":
+        remote_positions, live_positions_error = fetch_simmer_live_positions()
+        merged_positions = merge_simmer_live_positions(remote_positions, raw_position_source)
+        if merged_positions is not None:
+            raw_position_source = merged_positions
+            live_positions_source = "simmer"
+    raw_positions = filter_by_view(raw_position_source, view)
     raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
     trades = filter_recent_trades(raw_trades, lookback_hours)
     buy_history = build_buy_history(raw_trades)
@@ -805,6 +956,11 @@ def normalize_state(
             "lookback_hours": lookback_hours,
             "yes_stake": yes_stake,
             "no_stake": no_stake,
+            "requested_yes_stake": requested_yes_stake,
+            "requested_no_stake": requested_no_stake,
+            "stake_simulator_enabled": source != "live",
+            "live_positions_source": live_positions_source,
+            "live_positions_error": live_positions_error,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_updated_at": state.get("updated_at"),
         },
@@ -824,6 +980,12 @@ def compare_state(
     no_stake: float | None = None,
     source: str = "paper",
 ) -> dict:
+    requested_yes_stake = yes_stake
+    requested_no_stake = no_stake
+    if source == "live":
+        yes_stake = None
+        no_stake = None
+
     rows = []
     for key, strategy in STRATEGY_KEYS.items():
         effective = effective_strategy(strategy, exit_mode)
@@ -856,6 +1018,9 @@ def compare_state(
             "lookback_hours": lookback_hours,
             "yes_stake": yes_stake,
             "no_stake": no_stake,
+            "requested_yes_stake": requested_yes_stake,
+            "requested_no_stake": requested_no_stake,
+            "stake_simulator_enabled": source != "live",
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_path": str(state_root_for_source(source)),
         },
@@ -1284,6 +1449,10 @@ INDEX_HTML = r"""<!doctype html>
     .stake-sim input:focus {
       border-color: rgba(22,185,120,.55);
       box-shadow: 0 0 0 3px rgba(22,185,120,.12);
+    }
+    .stake-sim input:disabled {
+      opacity: .75;
+      cursor: not-allowed;
     }
     .top-actions > .stake-sim {
       display: none;
@@ -2415,7 +2584,10 @@ INDEX_HTML = r"""<!doctype html>
       return `${state.lookback}h`;
     };
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
-    const stakeLabel = () => state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
+    const stakeLabel = () => {
+      if (state.source === "live") return " · real fills";
+      return state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
+    };
     const sourceLabel = () => state.source === "live" ? "Live" : "Paper";
     const CITY_FLAGS = {
       "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
@@ -2718,16 +2890,20 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-layout]").forEach(btn => btn.classList.toggle("active", btn.dataset.layout === state.layout));
       document.querySelectorAll('[data-stake-side="yes"]').forEach(input => {
         if (input.value !== state.yesStake) input.value = state.yesStake;
+        input.disabled = state.source === "live";
+        input.placeholder = state.source === "live" ? "actual" : "real";
       });
       document.querySelectorAll('[data-stake-side="no"]').forEach(input => {
         if (input.value !== state.noStake) input.value = state.noStake;
+        input.disabled = state.source === "live";
+        input.placeholder = state.source === "live" ? "actual" : "real";
       });
       const stakeTotal = document.getElementById("stake-total");
       if (stakeTotal) {
         const yes = Number(state.yesStake || 0);
         const no = Number(state.noStake || 0);
         const hasStake = state.yesStake || state.noStake;
-        stakeTotal.textContent = hasStake ? money(yes + no) : "real";
+        stakeTotal.textContent = state.source === "live" ? "actual" : hasStake ? money(yes + no) : "real";
       }
       const daysInput = document.getElementById("lookback-days");
       if (daysInput) {
@@ -3120,9 +3296,10 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
       const titleSource = meta.source === "live" ? "Live" : meta.view_label;
+      const liveDataLabel = meta.source === "live" ? ` · ${meta.live_positions_source === "simmer" ? "Simmer positions" : "local positions"}` : "";
       setText("title", `${titleSource} / ${meta.strategy_label}`);
-      setText("subtitle", `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()} · effective state: ${meta.effective_strategy}`);
+      setText("subtitle", `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
       setText("sidebar-meta", `${meta.source_label} · ${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", lookbackLabel());
@@ -3131,7 +3308,7 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}`);
+      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${meta.live_positions_error ? ` · Simmer positions error: ${meta.live_positions_error}` : ""}`);
       renderStats(s);
       renderPositions(data.positions);
       renderClosed(data.closed_trades);
@@ -3154,8 +3331,8 @@ INDEX_HTML = r"""<!doctype html>
         lookback: state.lookback,
         ts: Date.now(),
       });
-      if (state.yesStake) params.set("yes_stake", state.yesStake);
-      if (state.noStake) params.set("no_stake", state.noStake);
+      if (state.source !== "live" && state.yesStake) params.set("yes_stake", state.yesStake);
+      if (state.source !== "live" && state.noStake) params.set("no_stake", state.noStake);
       const res = await fetch(`/api/state?${params}`, {cache: "no-store"});
       const data = await res.json();
       const payload = JSON.stringify(data);
