@@ -184,6 +184,8 @@ def resolve_live_state_root() -> Path:
 
 LIVE_STATE_ROOT = resolve_live_state_root()
 LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
+LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
+LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
 
 
 def tp40_runner_strategy_id(strategy: str) -> str:
@@ -278,10 +280,90 @@ def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
         return None, str(exc)
 
 
+def fetch_simmer_live_portfolio() -> tuple[dict | None, str | None]:
+    """Fetch Simmer's own portfolio summary. In live mode this is the source of truth."""
+    now = time.time()
+    cached = LIVE_PORTFOLIO_CACHE.get("portfolio")
+    if cached is not None and now - float(LIVE_PORTFOLIO_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_PORTFOLIO_CACHE.get("error")
+
+    api_key = simmer_api_key()
+    if not api_key:
+        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": None, "error": "SIMMER_API_KEY missing"})
+        return None, LIVE_PORTFOLIO_CACHE["error"]
+
+    try:
+        from simmer_sdk import SimmerClient
+
+        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        portfolio = client.get_portfolio() or {}
+        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": dict_from_obj(portfolio), "error": None})
+        return LIVE_PORTFOLIO_CACHE["portfolio"], None
+    except Exception as exc:
+        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": None, "error": str(exc)})
+        return None, str(exc)
+
+
+def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
+    """Best-effort fetch of Simmer activity/trade rows.
+
+    The public SDK exposes positions/portfolio directly. Some deployed Simmer API
+    versions also expose activity; when they do, live closed trades should come
+    from there, not from our local strategy ledger.
+    """
+    now = time.time()
+    cached = LIVE_ACTIVITY_CACHE.get("activity")
+    if cached is not None and now - float(LIVE_ACTIVITY_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_ACTIVITY_CACHE.get("error")
+
+    api_key = simmer_api_key()
+    if not api_key:
+        LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": None, "error": "SIMMER_API_KEY missing"})
+        return None, LIVE_ACTIVITY_CACHE["error"]
+
+    errors = []
+    try:
+        from simmer_sdk import SimmerClient
+
+        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        for path in ("/api/sdk/activity", "/api/sdk/trades", "/api/sdk/transactions"):
+            try:
+                data = client._request("GET", path, params={"venue": "polymarket"})
+                rows = extract_rows(data, ("activity", "items", "events", "trades", "transactions", "data", "results"))
+                if rows is not None:
+                    normalized = [dict_from_obj(row) for row in rows]
+                    LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": normalized, "error": None})
+                    return normalized, None
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+    except Exception as exc:
+        errors.append(str(exc))
+
+    error = "; ".join(errors) or "Simmer activity endpoint unavailable"
+    LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": None, "error": error})
+    return None, error
+
+
 def values(value):
     if isinstance(value, dict):
         return list(value.values())
     return list(value or [])
+
+
+def extract_rows(payload, keys: tuple[str, ...]) -> list | None:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_rows(value, keys)
+            if nested is not None:
+                return nested
+    return None
 
 
 def to_float(value):
@@ -291,6 +373,33 @@ def to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def is_price(value: float | None) -> bool:
+    return value is not None and 0.0 <= value <= 1.000001
+
+
+def price_value(value) -> float | None:
+    parsed = to_float(value)
+    return parsed if is_price(parsed) else None
+
+
+def first_price(row: dict, fields: tuple[str, ...]) -> float | None:
+    for field in fields:
+        parsed = price_value(row.get(field))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def first_float(row: dict | None, fields: tuple[str, ...]) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    for field in fields:
+        value = to_float(row.get(field))
+        if value is not None:
+            return value
+    return None
 
 
 def parse_optional_float(value) -> float | None:
@@ -402,13 +511,15 @@ def merge_simmer_live_positions(remote_positions: list[dict] | None, local_posit
         if not live_position_source_matches(position):
             continue
         local = local_by_market.get(market_id, {})
-        shares_yes = to_float(position.get("shares_yes")) or 0.0
-        shares_no = to_float(position.get("shares_no")) or 0.0
-        if shares_yes <= 0 and shares_no <= 0:
+        remote_shares_yes = to_float(position.get("shares_yes")) or 0.0
+        remote_shares_no = to_float(position.get("shares_no")) or 0.0
+        local_side = (local.get("side") or "").lower()
+        if remote_shares_yes <= 0 and remote_shares_no <= 0 and not local_side:
             continue
 
-        side = "yes" if shares_yes > 0 else "no"
-        shares = shares_yes if side == "yes" else shares_no
+        side = "yes" if remote_shares_yes > 0 else "no" if remote_shares_no > 0 else local_side
+        remote_shares = remote_shares_yes if side == "yes" else remote_shares_no
+        local_shares = to_float(local.get("shares")) or 0.0
         cost_basis = to_float(position.get("cost_basis"))
         pnl = to_float(position.get("pnl"))
         current_value = to_float(position.get("current_value"))
@@ -416,13 +527,42 @@ def merge_simmer_live_positions(remote_positions: list[dict] | None, local_posit
             cost_basis = current_value - pnl
         if cost_basis is None:
             cost_basis = to_float(local.get("cost_basis")) or 0.0
+        local_cost_basis = to_float(local.get("cost_basis"))
 
-        current_price = to_float(position.get("current_price"))
-        if current_price is None and current_value is not None and shares > 0:
-            current_price = current_value / shares
-        avg_cost = to_float(position.get("avg_cost"))
+        local_entry = first_price(local, ("entry_price", "avg_cost", "avg_price", "buy_price", "entry_fill_price"))
+        remote_entry = first_price(position, ("avg_cost", "avg_price", "entry_price", "average_price"))
+        avg_cost = local_entry if local_entry is not None else remote_entry
+
+        # Some Simmer SDK position payloads expose share/avg fields in a non-price scale.
+        # Never let those values become displayed Polymarket prices.
+        remote_implied_entry = cost_basis / remote_shares if cost_basis and remote_shares > 0 else None
+        remote_shares_look_scaled = remote_implied_entry is not None and not is_price(remote_implied_entry)
+        if remote_shares_look_scaled and local_cost_basis is not None and local_cost_basis > 0:
+            cost_basis = local_cost_basis
+        if remote_shares_look_scaled and local_shares > 0:
+            shares = local_shares
+        elif remote_shares > 0:
+            shares = remote_shares
+        elif local_shares > 0:
+            shares = local_shares
+        elif cost_basis and avg_cost and avg_cost > 0:
+            shares = cost_basis / avg_cost
+        else:
+            shares = 0.0
+
         if avg_cost is None and cost_basis and shares > 0:
-            avg_cost = cost_basis / shares
+            inferred_entry = cost_basis / shares
+            avg_cost = inferred_entry if is_price(inferred_entry) else None
+
+        current_price = first_price(position, ("current_price", "price", "market_price")) or first_price(
+            local, ("current_price", "last_price", "market_price")
+        )
+        if current_price is None and current_value is not None and shares > 0:
+            inferred_current = current_value / shares
+            current_price = inferred_current if is_price(inferred_current) else None
+
+        if pnl is None and current_value is not None and cost_basis is not None:
+            pnl = current_value - cost_basis
         if pnl is None and current_price is not None:
             pnl = shares * current_price - cost_basis
 
@@ -448,6 +588,59 @@ def merge_simmer_live_positions(remote_positions: list[dict] | None, local_posit
     return merged
 
 
+def normalize_simmer_live_position(raw: dict) -> dict | None:
+    """Normalize one Simmer position without borrowing any local strategy data."""
+    position = dict_from_obj(raw)
+    market_id = str(position.get("market_id") or "")
+    if not market_id:
+        return None
+    if not live_position_source_matches(position):
+        return None
+
+    shares_yes = to_float(position.get("shares_yes")) or 0.0
+    shares_no = to_float(position.get("shares_no")) or 0.0
+    if shares_yes <= 0 and shares_no <= 0:
+        return None
+
+    side = "yes" if shares_yes > 0 else "no"
+    shares = shares_yes if side == "yes" else shares_no
+    cost_basis = to_float(position.get("cost_basis"))
+    pnl = to_float(position.get("pnl"))
+    current_value = to_float(position.get("current_value"))
+    if cost_basis is None and current_value is not None and pnl is not None:
+        cost_basis = current_value - pnl
+    cost_basis = cost_basis or 0.0
+
+    entry_price = first_price(position, ("entry_price", "avg_cost", "avg_price", "average_price"))
+    implied_entry = cost_basis / shares if cost_basis and shares > 0 else None
+    if entry_price is None and implied_entry is not None and is_price(implied_entry):
+        entry_price = implied_entry
+
+    current_price = first_price(position, ("current_price", "price", "market_price"))
+    if current_price is None and current_value is not None and shares > 0:
+        implied_current = current_value / shares
+        current_price = implied_current if is_price(implied_current) else None
+
+    if pnl is None and current_value is not None:
+        pnl = current_value - cost_basis
+
+    question = clean_text(position.get("question") or market_id)
+    return {
+        **position,
+        "market_id": market_id,
+        "question": question,
+        "side": side,
+        "shares": shares,
+        "cost_basis": cost_basis,
+        "entry_price": entry_price,
+        "avg_cost": entry_price,
+        "current_price": current_price,
+        "current_value_usd": current_value,
+        "unrealized_pnl": pnl,
+        "unrealized_pnl_pct": pnl / cost_basis if pnl is not None and cost_basis > 0 else None,
+    }
+
+
 def filter_recent_trades(trades: list[dict], hours: float) -> list[dict]:
     if not hours or hours <= 0:
         return list(trades)
@@ -457,7 +650,7 @@ def filter_recent_trades(trades: list[dict], hours: float) -> list[dict]:
 
 def trade_price(trade: dict, fields: tuple[str, ...]):
     for field in fields:
-        value = to_float(trade.get(field))
+        value = price_value(trade.get(field))
         if value is not None:
             return value
     return None
@@ -608,7 +801,7 @@ def trade_entry_cost(trade: dict, entry_price: float | None) -> float | None:
     if entry_price is not None and entry_price > 0 and shares is not None and shares > 0:
         return entry_price * shares
 
-    exit_price = to_float(trade.get("simulated_fill_price"))
+    exit_price = price_value(trade.get("simulated_fill_price"))
     realized = to_float(trade.get("realized_pnl"))
     if (
         entry_price is not None
@@ -623,12 +816,17 @@ def trade_entry_cost(trade: dict, entry_price: float | None) -> float | None:
     return None
 
 
-def actual_trade_pnl_from_prices(trade: dict, entry_price: float | None) -> float | None:
-    exit_price = to_float(trade.get("simulated_fill_price"))
+def actual_trade_pnl_from_prices(
+    trade: dict,
+    entry_price: float | None,
+    original_cost: float | None = None,
+) -> float | None:
+    exit_price = price_value(trade.get("simulated_fill_price"))
     shares = to_float(trade.get("filled_shares")) or to_float(trade.get("requested_shares"))
     if entry_price is not None and exit_price is not None and shares is not None and shares > 0:
         return shares * (exit_price - entry_price)
-    original_cost = trade_entry_cost(trade, entry_price)
+    if original_cost is None:
+        original_cost = trade_entry_cost(trade, entry_price)
     if entry_price is not None and entry_price > 0 and exit_price is not None and original_cost is not None:
         return original_cost * (exit_price / entry_price - 1.0)
     return None
@@ -698,12 +896,14 @@ def adjusted_trade_pnl(
     realized = to_float(trade.get("realized_pnl"))
     entry, _, _, original_cost = closed_entry_info(trade, buy_history)
     if source == "live":
-        actual = actual_trade_pnl_from_prices(trade, entry)
+        if trade.get("_simmer_activity"):
+            return realized
+        actual = actual_trade_pnl_from_prices(trade, entry, original_cost)
         if actual is not None:
             return actual
         return realized
     target_stake = partial_trade_target_stake(trade, stake_for_side(trade.get("side"), yes_stake, no_stake))
-    simulated = simulated_price_pnl(entry, to_float(trade.get("simulated_fill_price")), target_stake)
+    simulated = simulated_price_pnl(entry, price_value(trade.get("simulated_fill_price")), target_stake)
     if simulated is not None:
         return simulated
     return scaled_value(realized, original_cost or trade_cost(trade, entry), target_stake)
@@ -711,8 +911,8 @@ def adjusted_trade_pnl(
 
 def position_pnl(position: dict, yes_stake: float | None = None, no_stake: float | None = None):
     pnl = to_float(position.get("unrealized_pnl"))
-    current_price = to_float(position.get("current_price"))
-    entry_price = to_float(position.get("entry_price")) or to_float(position.get("avg_cost"))
+    current_price = price_value(position.get("current_price"))
+    entry_price = price_value(position.get("entry_price")) or price_value(position.get("avg_cost"))
     shares = to_float(position.get("shares")) or 0.0
     cost_basis = to_float(position.get("cost_basis")) or 0.0
     if pnl is None and current_price is not None:
@@ -775,7 +975,7 @@ def summarize(
     unrealized = sum(position_pnl(position, yes_stake, no_stake)[0] or 0.0 for position in positions)
     exposure = sum(position_exposure(position, yes_stake, no_stake) for position in positions)
     total = realized + unrealized
-    stale = sum(1 for position in positions if to_float(position.get("current_price")) is None)
+    stale = sum(1 for position in positions if price_value(position.get("current_price")) is None)
     return {
         "open_positions": len(positions),
         "total_trades": len(trades),
@@ -789,6 +989,164 @@ def summarize(
         "total": total,
         "exposure": exposure,
         "stale": stale,
+    }
+
+
+def apply_simmer_portfolio_summary(summary: dict, portfolio: dict | None, positions: list[dict]) -> dict:
+    """Overlay Simmer's own totals in live mode.
+
+    We intentionally prefer Simmer totals over reconstructed local math. If a
+    field is absent from the API response we keep a conservative derived value.
+    """
+    if not isinstance(portfolio, dict):
+        return summary
+
+    total = first_float(
+        portfolio,
+        (
+            "profit_loss",
+            "profitLoss",
+            "total_pnl",
+            "totalPnL",
+            "pnl",
+            "pnl_usdc",
+            "net_pnl",
+            "netPnl",
+        ),
+    )
+    realized = first_float(
+        portfolio,
+        (
+            "realized_pnl",
+            "realizedPnL",
+            "realized",
+            "closed_pnl",
+            "closedPnl",
+        ),
+    )
+    unrealized = first_float(
+        portfolio,
+        (
+            "unrealized_pnl",
+            "unrealizedPnL",
+            "unrealized",
+            "open_pnl",
+            "openPnl",
+        ),
+    )
+    wins = first_float(portfolio, ("wins", "winning_trades", "winningTrades"))
+    losses = first_float(portfolio, ("losses", "losing_trades", "losingTrades"))
+    winrate = first_float(portfolio, ("winrate", "win_rate", "winRate"))
+    open_positions = first_float(portfolio, ("open_positions", "openPositions", "positions_count", "positionsCount"))
+    exposure = first_float(portfolio, ("exposure", "total_exposure", "totalExposure"))
+
+    if total is not None:
+        summary["total"] = total
+    if realized is not None:
+        summary["realized"] = realized
+    if unrealized is not None:
+        summary["unrealized"] = unrealized
+    elif total is not None and realized is not None:
+        summary["unrealized"] = total - realized
+    elif total is not None:
+        # If Simmer only gives one P/L number, do not invent a realized split
+        # from local/activity rows. Put the authoritative number in total and
+        # mirror it as open P/L rather than mixing sources.
+        if realized is None:
+            summary["realized"] = 0.0
+            summary["unrealized"] = total
+        else:
+            summary["unrealized"] = total - summary.get("realized", 0.0)
+    if total is None and (realized is not None or unrealized is not None):
+        summary["total"] = summary.get("realized", 0.0) + summary.get("unrealized", 0.0)
+
+    if wins is not None:
+        summary["wins"] = int(wins)
+    if losses is not None:
+        summary["losses"] = int(losses)
+    if winrate is not None:
+        summary["winrate"] = winrate * 100 if 0 <= winrate <= 1 else winrate
+    elif wins is not None and losses is not None and wins + losses > 0:
+        summary["winrate"] = wins / (wins + losses) * 100
+    if open_positions is not None:
+        summary["open_positions"] = int(open_positions)
+    else:
+        summary["open_positions"] = len(positions)
+    if exposure is not None:
+        summary["exposure"] = exposure
+    return summary
+
+
+def normalize_simmer_activity_trade(row: dict) -> dict | None:
+    text = " ".join(str(row.get(field, "")) for field in ("action", "type", "event", "status", "kind")).lower()
+    if "fail" in text or "error" in text:
+        return None
+
+    action = "sell" if "sell" in text or "redeem" in text else "buy" if "buy" in text else None
+    if action is None:
+        return None
+
+    side = str(row.get("side") or row.get("outcome") or row.get("token_side") or "").lower()
+    if side not in ("yes", "no"):
+        joined = " ".join(str(value) for value in row.values()).lower()
+        if " yes" in f" {joined} ":
+            side = "yes"
+        elif " no" in f" {joined} ":
+            side = "no"
+    if side not in ("yes", "no"):
+        side = "yes"
+
+    price = first_price(
+        row,
+        (
+            "price",
+            "fill_price",
+            "filled_price",
+            "avg_price",
+            "average_price",
+            "execution_price",
+            "simulated_fill_price",
+        ),
+    )
+    shares = first_float(row, ("shares", "filled_shares", "size", "quantity", "qty"))
+    amount = first_float(row, ("amount", "amount_usd", "cost", "cost_usd", "value", "value_usdc", "usdc"))
+    pnl = first_float(row, ("pnl", "realized_pnl", "profit_loss", "profitLoss"))
+
+    signed_amount = None
+    if amount is not None:
+        signed_amount = amount if action == "sell" else -abs(amount)
+
+    timestamp = (
+        row.get("timestamp")
+        or row.get("created_at")
+        or row.get("createdAt")
+        or row.get("time")
+        or row.get("updated_at")
+    )
+    question = clean_text(
+        row.get("question")
+        or row.get("market_question")
+        or row.get("title")
+        or row.get("market")
+        or row.get("market_id")
+    )
+    return {
+        "timestamp": timestamp,
+        "action": action,
+        "side": side,
+        "market_id": row.get("market_id") or row.get("marketId"),
+        "question": question,
+        "filled_shares": shares,
+        "requested_shares": shares,
+        "simulated_fill_price": price,
+        "entry_price": price if action == "buy" else None,
+        "amount_usd": abs(amount) if amount is not None else None,
+        "realized_pnl": pnl if pnl is not None else signed_amount,
+        "exit_reason": row.get("exit_reason") or row.get("reason") or action.upper(),
+        "entry_regime": row.get("entry_regime") or row.get("regime"),
+        "forecast_value": row.get("forecast_value"),
+        "forecast_unit": row.get("forecast_unit"),
+        "_simmer_activity": True,
     }
 
 
@@ -814,6 +1172,8 @@ def normalize_state(
     requested_no_stake = no_stake
     live_positions_source = "local_state"
     live_positions_error = None
+    live_portfolio_error = None
+    live_activity_error = None
     if source == "live":
         # Live must mirror real Simmer fills. Stake simulator is paper-only.
         yes_stake = None
@@ -821,18 +1181,35 @@ def normalize_state(
 
     effective = effective_strategy(strategy, exit_mode)
     state = load_state(effective, source)
-    raw_position_source = state.get("positions")
     if source == "live":
+        portfolio, live_portfolio_error = fetch_simmer_live_portfolio()
         remote_positions, live_positions_error = fetch_simmer_live_positions()
-        merged_positions = merge_simmer_live_positions(remote_positions, raw_position_source)
-        if merged_positions is not None:
-            raw_position_source = merged_positions
+        activity_rows, live_activity_error = fetch_simmer_live_activity()
+        raw_position_source = [
+            position
+            for position in (normalize_simmer_live_position(row) for row in values(remote_positions or []))
+            if position is not None
+        ]
+        raw_positions = values(raw_position_source)
+        raw_trades = [
+            trade
+            for trade in (normalize_simmer_activity_trade(row) for row in values(activity_rows or []))
+            if trade is not None
+        ]
+        if remote_positions is not None:
             live_positions_source = "simmer"
-    raw_positions = filter_by_view(raw_position_source, view)
-    raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
+        else:
+            live_positions_source = "simmer_unavailable"
+    else:
+        portfolio = None
+        raw_position_source = state.get("positions")
+        raw_positions = filter_by_view(raw_position_source, view)
+        raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
     trades = filter_recent_trades(raw_trades, lookback_hours)
     buy_history = build_buy_history(raw_trades)
     summary = summarize(raw_positions, trades, buy_history, yes_stake, no_stake, source)
+    if source == "live":
+        summary = apply_simmer_portfolio_summary(summary, portfolio, raw_positions)
 
     positions = []
     for position in raw_positions:
@@ -846,8 +1223,8 @@ def normalize_state(
                 "question": question,
                 "side": (position.get("side") or "?").upper(),
                 "regime": (position.get("entry_regime") or "?").upper(),
-                "entry_price": to_float(position.get("entry_price")) or to_float(position.get("avg_cost")),
-                "current_price": to_float(position.get("current_price")),
+                "entry_price": price_value(position.get("entry_price")) or price_value(position.get("avg_cost")),
+                "current_price": price_value(position.get("current_price")),
                 "pnl": pnl,
                 "final_value": stake + pnl if pnl is not None else None,
                 "pnl_pct": pnl_pct,
@@ -856,7 +1233,7 @@ def normalize_state(
                 "cost_basis": stake,
                 "shares": to_float(position.get("shares")),
                 "forecast": forecast_label(position),
-                "stale": to_float(position.get("current_price")) is None,
+                "stale": price_value(position.get("current_price")) is None,
                 "runner": bool(position.get("runner_after_partial_exit")),
                 "partial_done": bool(position.get("partial_take_profit_done")),
                 "partial_price": to_float(position.get("partial_take_profit_price")),
@@ -867,7 +1244,11 @@ def normalize_state(
     positions.sort(key=lambda item: (item["stale"], -(abs(item["pnl"] or 0.0)), item["city"]))
 
     sells = [trade for trade in trades if trade.get("action") == "sell"]
-    sells.sort(key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ), reverse=True)
+    display_closed_source = trades if source == "live" else sells
+    display_closed_source.sort(
+        key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
+        reverse=True,
+    )
     all_sells_by_key: dict[tuple[str, str], list[dict]] = {}
     for trade in raw_trades:
         if trade.get("action") == "sell":
@@ -886,7 +1267,7 @@ def normalize_state(
             "time": format_time(trade.get("timestamp")),
             "stake": stake,
             "entry_price": entry,
-            "exit_price": to_float(trade.get("simulated_fill_price")),
+            "exit_price": price_value(trade.get("simulated_fill_price")),
             "pnl": pnl,
             "final_value": stake + pnl if stake is not None and pnl is not None else None,
             "exit_reason": trade_exit_reason(trade),
@@ -922,7 +1303,7 @@ def normalize_state(
         }
 
     closed_trades = []
-    for trade in sells[:80]:
+    for trade in display_closed_source[:80]:
         entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
         stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
@@ -937,7 +1318,7 @@ def normalize_state(
                 "side": side,
                 "regime": (regime or "?").upper(),
                 "entry_price": entry,
-                "exit_price": to_float(trade.get("simulated_fill_price")),
+                "exit_price": price_value(trade.get("simulated_fill_price")),
                 "pnl": pnl,
                 "final_value": stake + pnl if stake is not None and pnl is not None else None,
                 "stake": stake,
@@ -952,8 +1333,9 @@ def normalize_state(
             }
         )
 
+    city_trade_source = trades if source == "live" else sells
     city_pnl = {}
-    for trade in sells:
+    for trade in city_trade_source:
         question = clean_text(trade.get("question") or trade.get("market_id"))
         city = city_for_question(question)
         city_pnl.setdefault(city, {"city": city, "sells": 0, "pnl": 0.0})
@@ -962,7 +1344,10 @@ def normalize_state(
 
     pnl_values = [
         adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source) or 0.0
-        for trade in sorted(sells, key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ))
+        for trade in sorted(
+            city_trade_source,
+            key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
+        )
     ]
 
     return {
@@ -987,6 +1372,8 @@ def normalize_state(
             "stake_simulator_enabled": source != "live",
             "live_positions_source": live_positions_source,
             "live_positions_error": live_positions_error,
+            "live_portfolio_error": live_portfolio_error,
+            "live_activity_error": live_activity_error,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_updated_at": state.get("updated_at"),
         },
@@ -3334,7 +3721,8 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${meta.live_positions_error ? ` · Simmer positions error: ${meta.live_positions_error}` : ""}`);
+      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error, meta.live_activity_error].filter(Boolean).join(" · ");
+      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · Simmer error: ${liveErrors}` : ""}`);
       renderStats(s);
       renderPositions(data.positions);
       renderClosed(data.closed_trades);
