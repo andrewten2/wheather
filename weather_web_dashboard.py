@@ -476,13 +476,37 @@ def clean_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
-def question_to_polymarket_slug(question: str | None) -> str:
-    text = clean_text(question).lower()
-    if not text:
-        return ""
-    text = text.replace("°", "")
+def slugify_text(value: str | None) -> str:
+    text = clean_text(value).lower().replace("°", "")
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")
+
+
+def weather_question_to_event_slug(question: str | None) -> str:
+    text = clean_text(question)
+    if not text:
+        return ""
+    match = re.search(
+        r"\b(highest|lowest)\s+temperature\s+in\s+(.+?)\s+be\s+.+?\s+on\s+([A-Za-z]+)\s+(\d{1,2})(?:,?\s+(\d{4}))?\??$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    metric, city, month, day, year = match.groups()
+    city_slug = slugify_text(city)
+    month_slug = slugify_text(month)
+    if not city_slug or not month_slug:
+        return ""
+    year = year or str(datetime.now(DISPLAY_TZ).year)
+    return f"{metric.lower()}-temperature-in-{city_slug}-on-{month_slug}-{int(day)}-{year}"
+
+
+def question_to_polymarket_slug(question: str | None) -> str:
+    weather_slug = weather_question_to_event_slug(question)
+    if weather_slug:
+        return weather_slug
+    return slugify_text(question)
 
 
 def polymarket_market_url(item: dict | None) -> str | None:
@@ -754,6 +778,33 @@ def trade_market_key(trade: dict) -> tuple[str, str]:
 
 def trade_exit_reason(trade: dict) -> str:
     return str(trade.get("exit_reason") or nested_signal(trade).get("exit_reason") or "")
+
+
+def inferred_live_exit_reason(
+    side: str,
+    entry_price: float | None,
+    exit_price: float | None,
+    pnl: float | None,
+    explicit_reason: str | None = None,
+) -> str:
+    reason = clean_text(explicit_reason).lower()
+    if reason and reason not in {"sell", "buy", "trade", "sdk"}:
+        return reason
+    side = (side or "").upper()
+    if entry_price is not None and exit_price is not None and entry_price > 0:
+        if side == "YES":
+            if exit_price >= entry_price * 1.4 - 1e-9:
+                return "take_profit"
+            if exit_price <= entry_price * 0.9 + 1e-9:
+                return "stop_loss"
+        elif side == "NO":
+            if exit_price >= 0.98 - 1e-9:
+                return "take_profit"
+            if exit_price <= entry_price - 0.1 + 1e-9:
+                return "stop_loss"
+    if pnl is not None and pnl < -1e-9:
+        return "stop_loss"
+    return reason or "sell"
 
 
 def is_partial_exit_trade(trade: dict) -> bool:
@@ -1504,6 +1555,7 @@ def summarize_live(positions: list[dict], activity_trades: list[dict], closed_su
 
 def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> dict | None:
     order = dict_from_obj(row)
+    raw_status_text = json.dumps(order, default=str).lower()
     market_id = clean_text(order.get("market_id") or order.get("marketId") or order.get("condition_id") or order.get("conditionId"))
     question = clean_text(
         order.get("question")
@@ -1565,9 +1617,20 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
     if amount is None and price is not None and shares is not None:
         amount = price * shares
     status = clean_text(order.get("status") or order.get("order_status") or order.get("orderStatus") or "open").lower()
-    if status in {"open", "pending", "live", "active"} and (filled or 0) > 0 and (remaining or 0) > 0:
+    if "fail" in raw_status_text or "error" in raw_status_text:
+        status = "failed"
+    elif "reject" in raw_status_text:
+        status = "rejected"
+    elif "cancel" in raw_status_text:
+        status = "canceled"
+    elif status in {"open", "pending", "live", "active"} and (filled or 0) > 0 and (remaining or 0) > 0:
         status = "partial"
-    elif status in {"open", "pending", "live", "active"} and filled is not None and (remaining or 0) <= 0:
+    elif (
+        status in {"open", "pending", "live", "active"}
+        and filled is not None
+        and filled > 0
+        and (remaining or 0) <= 0
+    ):
         status = "filled"
     fill_pct = None
     if shares and shares > 0 and filled is not None:
