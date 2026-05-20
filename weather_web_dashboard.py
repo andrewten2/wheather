@@ -38,6 +38,11 @@ AUTH_COOKIE = "weather_dashboard_session"
 AUTH_TTL_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_AUTH_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 LIVE_POSITIONS_TTL_SECONDS = float(os.environ.get("WEATHER_DASHBOARD_LIVE_POSITIONS_TTL_SECONDS", "10"))
 LIVE_POSITION_SOURCE_FILTER = os.environ.get("WEATHER_DASHBOARD_LIVE_POSITION_SOURCE", "")
+LIVE_LOG_CANDIDATES = [
+    Path(os.environ["WEATHER_DASHBOARD_LIVE_LOG"]) if os.environ.get("WEATHER_DASHBOARD_LIVE_LOG") else None,
+    Path("/root/wheather/live_bot.log"),
+    ROOT / "live_bot.log",
+]
 
 VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
@@ -388,6 +393,35 @@ def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
     error = "; ".join(errors) or "Simmer open orders endpoint unavailable"
     LIVE_ORDERS_CACHE.update({"ts": now, "orders": None, "error": error})
     return None, error
+
+
+def reset_live_caches():
+    """Force the next dashboard refresh to re-read live data from Simmer."""
+    for cache in (LIVE_POSITIONS_CACHE, LIVE_PORTFOLIO_CACHE, LIVE_ACTIVITY_CACHE, LIVE_ORDERS_CACHE):
+        cache["ts"] = 0.0
+
+
+def live_log_path() -> Path | None:
+    for candidate in LIVE_LOG_CANDIDATES:
+        if candidate and candidate.exists():
+            return candidate
+    return None
+
+
+def tail_live_log(lines: int = 80) -> dict:
+    path = live_log_path()
+    if not path:
+        return {"ok": False, "path": "", "lines": ["live_bot.log not found"]}
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 32_000))
+            chunk = fh.read().decode("utf-8", errors="replace")
+        log_lines = [line for line in chunk.splitlines() if line.strip()]
+        return {"ok": True, "path": str(path), "lines": log_lines[-max(1, min(lines, 250)) :]}
+    except Exception as exc:
+        return {"ok": False, "path": str(path), "lines": [f"failed to read live log: {exc}"]}
 
 
 def values(value):
@@ -2428,6 +2462,59 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(255,255,255,.04);
       color: rgba(239,249,255,.70);
     }
+    .live-log-card {
+      display: none;
+      margin-top: 16px;
+      padding: 12px;
+      border: 1px solid rgba(15,34,65,.10);
+      border-radius: 16px;
+      background: #07131f;
+      box-shadow: inset 0 0 0 1px rgba(62, 255, 177, .08), 0 18px 42px rgba(5, 18, 32, .16);
+      color: #bfffe0;
+      min-height: 180px;
+      max-height: 340px;
+      overflow: hidden;
+    }
+    body.live-source .live-log-card {
+      display: block;
+    }
+    .live-log-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      color: #52f0a8;
+      font-size: 11px;
+      font-weight: 950;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .live-log-path {
+      display: block;
+      margin-bottom: 8px;
+      color: rgba(191,255,224,.58);
+      font-size: 10px;
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .live-log-lines {
+      margin: 0;
+      max-height: 270px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #d8ffe9;
+      font: 800 10.5px/1.45 "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    }
+    .live-log-lines::-webkit-scrollbar { width: 6px; }
+    .live-log-lines::-webkit-scrollbar-thumb { background: rgba(82,240,168,.34); border-radius: 999px; }
+    html[data-theme="dark"] .live-log-card {
+      border-color: rgba(82,240,168,.20);
+      background: rgba(1, 9, 16, .92);
+    }
     .dot-live {
       display: inline-block;
       width: 10px;
@@ -3140,6 +3227,30 @@ INDEX_HTML = r"""<!doctype html>
       background: linear-gradient(135deg, rgba(22,185,120,.20), rgba(34,146,255,.14));
       border-color: rgba(22,185,120,.30);
     }
+    .close-position-btn {
+      width: auto;
+      min-width: 76px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      color: #c91f3f;
+      border-color: rgba(255,64,92,.30);
+      background: rgba(255,64,92,.10);
+      box-shadow: none;
+      font-size: 12px;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .close-position-btn:hover {
+      color: #fff;
+      border-color: rgba(255,64,92,.66);
+      background: linear-gradient(135deg, #ff405c, #e02b49);
+      box-shadow: 0 10px 24px rgba(255,64,92,.20);
+    }
+    .close-position-btn:disabled {
+      cursor: wait;
+      opacity: .62;
+      transform: none;
+    }
     .runner-col {
       min-width: 92px;
     }
@@ -3590,6 +3701,11 @@ INDEX_HTML = r"""<!doctype html>
         <div class="nav-item" data-mode="charts" title="Strategy graphs"><span class="nav-icon">▥</span>Graphs</div>
         <div class="nav-item" data-mode="live" title="Live trading ledger"><span class="nav-icon">●</span>Live</div>
       </nav>
+      <div class="live-log-card" id="live-log-card">
+        <div class="live-log-head"><span>Live Logs</span><span id="live-log-status">tail</span></div>
+        <span class="live-log-path" id="live-log-path">live_bot.log</span>
+        <pre class="live-log-lines" id="live-log-lines">Loading live log...</pre>
+      </div>
       <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
     </aside>
 
@@ -3683,7 +3799,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="runner-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Side</th><th>Regime</th><th class="runner-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th><th>Action</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
@@ -3784,6 +3900,7 @@ INDEX_HTML = r"""<!doctype html>
       lastPayload: "",
       lastCurveKey: "",
       compareSort: {key: "", dir: "asc"},
+      liveLogPayload: "",
     };
     if (state.page === "charts") state.source = "paper";
 
@@ -3836,6 +3953,13 @@ INDEX_HTML = r"""<!doctype html>
         ? `<a class="market-link" href="${esc(url)}" target="_blank" rel="noreferrer noopener" title="Open on Polymarket">${title}</a>`
         : title;
     };
+    function closePositionButton(position) {
+      const shares = Number(position?.shares || 0);
+      if (state.source !== "live" || !position?.market_id || !Number.isFinite(shares) || shares <= 0) {
+        return `<span class="neutral">-</span>`;
+      }
+      return `<button class="close-position-btn" data-close-market="${esc(position.market_id)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Close</button>`;
+    }
 	    const orderStatusClass = status => {
 	      const text = String(status || "").toLowerCase();
 	      if (["filled", "matched"].includes(text)) return "filled";
@@ -4121,6 +4245,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function syncActiveButtons() {
+      document.body.classList.toggle("live-source", state.source === "live");
       document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === state.view));
       document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
@@ -4276,8 +4401,9 @@ INDEX_HTML = r"""<!doctype html>
           <td class="city-col">${cityChip(p.city)}</td>
           <td class="market">${marketLink(p)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
+          <td>${closePositionButton(p)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="13"><div class="empty">No open positions for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="14"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -4377,8 +4503,9 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${marketLink(p)}</td>
+          <td>${closePositionButton(p)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="12" class="terminal-market">No open positions for this filter.</td></tr>`;
+      `).join("") : `<tr><td colspan="13" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
 
     function terminalClosedRows(rows) {
@@ -4423,7 +4550,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Side</th><th>Regime</th><th>Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Side</th><th>Regime</th><th>Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th><th>Action</th></tr></thead>
                 <tbody>${terminalOpenRows(data.positions)}</tbody>
               </table>
             </div>
@@ -4590,6 +4717,70 @@ INDEX_HTML = r"""<!doctype html>
       drawSpark("spark-unrealized", [0, s.unrealized], s.unrealized >= 0 ? "#16b978" : "#ff405c");
       drawSpark("spark-winrate", [0, s.winrate / 100], "#16b978");
       renderTerminalStandard(data);
+      refreshLiveLogs();
+    }
+
+    async function refreshLiveLogs() {
+      const linesEl = document.getElementById("live-log-lines");
+      const pathEl = document.getElementById("live-log-path");
+      const statusEl = document.getElementById("live-log-status");
+      if (!linesEl || state.source !== "live") {
+        state.liveLogPayload = "";
+        return;
+      }
+      try {
+        const res = await fetch(`/api/live/logs?lines=90&ts=${Date.now()}`, {cache: "no-store"});
+        const data = await res.json();
+        const payload = JSON.stringify(data);
+        if (payload === state.liveLogPayload) return;
+        state.liveLogPayload = payload;
+        if (pathEl) pathEl.textContent = data.path || "live_bot.log";
+        if (statusEl) statusEl.textContent = data.ok ? "tail" : "missing";
+        linesEl.textContent = (data.lines || []).slice(-90).join("\n") || "No live log lines yet.";
+        linesEl.scrollTop = linesEl.scrollHeight;
+      } catch (err) {
+        if (statusEl) statusEl.textContent = "error";
+        linesEl.textContent = `Failed to load live logs: ${err}`;
+      }
+    }
+
+    async function closeLivePosition(button) {
+      const marketId = button.dataset.closeMarket;
+      const side = button.dataset.closeSide;
+      const position = (state.lastData?.positions || []).find(p => String(p.market_id) === String(marketId) && String(p.side || "").toLowerCase() === side);
+      if (!position) {
+        window.alert("Position not found in current live dashboard data. Refresh and try again.");
+        return;
+      }
+      const shares = Number(position.shares || 0);
+      const label = `${position.side} ${position.city}: ${position.question}`;
+      if (!Number.isFinite(shares) || shares <= 0) {
+        window.alert("This position has no closable shares.");
+        return;
+      }
+      if (!window.confirm(`Close live position now?\n\n${label}\nShares: ${shares.toFixed(4)}`)) return;
+      const oldText = button.textContent;
+      button.disabled = true;
+      button.textContent = "Closing...";
+      try {
+        const res = await fetch("/api/live/close", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({market_id: marketId, side, shares}),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || data.result?.error || `close failed (${res.status})`);
+        }
+        state.lastPayload = "";
+        await refresh();
+        await refreshLiveLogs();
+      } catch (err) {
+        window.alert(`Close failed: ${err.message || err}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = oldText;
+      }
     }
 
     async function refresh() {
@@ -4607,7 +4798,10 @@ INDEX_HTML = r"""<!doctype html>
       const res = await fetch(`/api/state?${params}`, {cache: "no-store"});
       const data = await res.json();
       const payload = JSON.stringify(data);
-      if (payload === state.lastPayload) return;
+      if (payload === state.lastPayload) {
+        if (state.source === "live") refreshLiveLogs();
+        return;
+      }
       state.lastPayload = payload;
       state.lastData = data;
       if (state.page === "charts") renderCharts(data);
@@ -4648,6 +4842,11 @@ INDEX_HTML = r"""<!doctype html>
           dir: current.key === key && current.dir === "asc" ? "desc" : "asc",
         };
         if (state.lastData && state.strategy === "compare") renderCompare(state.lastData);
+        return;
+      }
+      const closeButton = e.target.closest("[data-close-market]");
+      if (closeButton) {
+        closeLivePosition(closeButton);
         return;
       }
       const b = e.target.closest("button");
@@ -4951,6 +5150,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json(self, payload: dict, status: int = 200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return self.send_bytes(body, "application/json; charset=utf-8", status=status)
+
     def send_redirect(self, location: str, cookie: str | None = None):
         self.send_response(303)
         self.send_header("Location", location)
@@ -4985,6 +5188,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         if path == "/api/options":
             return self.send_bytes(json.dumps(options_payload(), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        if path == "/api/live/logs":
+            qs = parse_qs(parsed.query)
+            try:
+                lines = int(qs.get("lines", ["80"])[0])
+            except (TypeError, ValueError):
+                lines = 80
+            return self.send_json(tail_live_log(lines))
         if path == "/api/state":
             qs = parse_qs(parsed.query)
             strategy = qs.get("strategy", ["baseline"])[0]
@@ -5013,8 +5223,93 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self.send_bytes(json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         return self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
 
+    def handle_live_close(self):
+        if auth_enabled() and not self.is_authenticated():
+            return self.send_json({"success": False, "error": "unauthorized"}, status=401)
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            payload = json.loads(self.rfile.read(min(length, 8192)).decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError:
+            return self.send_json({"success": False, "error": "invalid json"}, status=400)
+
+        market_id = clean_text(payload.get("market_id"))
+        side = clean_text(payload.get("side")).lower()
+        if not market_id or side not in {"yes", "no"}:
+            return self.send_json({"success": False, "error": "market_id and side are required"}, status=400)
+
+        remote_positions, position_error = fetch_simmer_live_positions()
+        positions = [
+            position
+            for position in (normalize_simmer_live_position(row) for row in values(remote_positions or []))
+            if position is not None
+        ]
+        position = next(
+            (
+                item
+                for item in positions
+                if clean_text(item.get("market_id")) == market_id and clean_text(item.get("side")).lower() == side
+            ),
+            None,
+        )
+        if not position:
+            return self.send_json(
+                {"success": False, "error": position_error or "live position not found in Simmer"},
+                status=404,
+            )
+
+        shares = to_float(payload.get("shares")) or to_float(position.get("shares")) or 0.0
+        held_shares = to_float(position.get("shares")) or 0.0
+        if held_shares > 0:
+            shares = min(shares, held_shares)
+        if shares <= 0:
+            return self.send_json({"success": False, "error": "position has no shares to close"}, status=400)
+
+        api_key = simmer_api_key()
+        if not api_key:
+            return self.send_json({"success": False, "error": "SIMMER_API_KEY missing"}, status=500)
+
+        try:
+            from simmer_sdk import SimmerClient
+
+            client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+            result = client.trade(
+                market_id=market_id,
+                side=side,
+                action="sell",
+                shares=shares,
+                amount=0,
+                venue="polymarket",
+                order_type=os.environ.get("WEATHER_DASHBOARD_MANUAL_CLOSE_ORDER_TYPE", "FAK"),
+                source=os.environ.get("WEATHER_DASHBOARD_TRADE_SOURCE", "sdk:weather"),
+                skill_slug=os.environ.get("WEATHER_DASHBOARD_SKILL_SLUG", "polymarket-weather-trader"),
+                reasoning=f"Manual close from weather web dashboard: {clean_text(position.get('question'))[:180]}",
+                signal_data={
+                    "manual_close": True,
+                    "question": clean_text(position.get("question")),
+                    "dashboard_action": "close_position",
+                },
+            )
+        except Exception as exc:
+            return self.send_json({"success": False, "error": str(exc)}, status=500)
+
+        reset_live_caches()
+        result_payload = dict_from_obj(result)
+        return self.send_json(
+            {
+                "success": bool(result_payload.get("success")),
+                "market_id": market_id,
+                "side": side,
+                "shares": shares,
+                "result": result_payload,
+                "error": result_payload.get("error"),
+            },
+            status=200 if result_payload.get("success") else 400,
+        )
+
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/live/close":
+            return self.handle_live_close()
         if parsed.path != "/login":
             return self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
         if not auth_enabled():
