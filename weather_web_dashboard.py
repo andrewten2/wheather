@@ -2462,39 +2462,57 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(255,255,255,.04);
       color: rgba(239,249,255,.70);
     }
-    .live-log-card {
+    .live-logs-view {
       display: none;
-      margin-top: 16px;
-      padding: 12px;
-      border: 1px solid rgba(15,34,65,.10);
-      border-radius: 16px;
-      background: #07131f;
-      box-shadow: inset 0 0 0 1px rgba(62, 255, 177, .08), 0 18px 42px rgba(5, 18, 32, .16);
-      color: #bfffe0;
-      min-height: 180px;
-      max-height: 340px;
-      overflow: hidden;
     }
-    body.live-source .live-log-card {
+    .logs-only .standard-view,
+    .logs-only .compare-view,
+    .logs-only .charts-view,
+    .logs-only .metrics,
+    .logs-only .toolbar {
+      display: none;
+    }
+    .logs-only .live-logs-view {
       display: block;
+    }
+    .live-logs-terminal {
+      min-height: min(72vh, 860px);
+      padding: 18px;
+      border: 1px solid #00d28b;
+      border-radius: 14px;
+      background:
+        radial-gradient(circle at 18% 0%, rgba(0, 210, 139, .12), transparent 28%),
+        radial-gradient(circle at 82% 14%, rgba(107, 72, 255, .14), transparent 24%),
+        #000;
+      box-shadow: 0 28px 76px rgba(0, 0, 0, .18), inset 0 0 0 1px rgba(98, 255, 153, .08);
+      color: #d8ffe9;
+      font-family: var(--mono);
     }
     .live-log-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      margin-bottom: 8px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(98,255,153,.22);
       color: #52f0a8;
-      font-size: 11px;
+      font-size: 13px;
       font-weight: 950;
       letter-spacing: .12em;
       text-transform: uppercase;
     }
+    .live-log-head .hint {
+      color: rgba(216,255,233,.68);
+      font-size: 12px;
+      letter-spacing: 0;
+      text-transform: none;
+    }
     .live-log-path {
       display: block;
-      margin-bottom: 8px;
+      margin-bottom: 12px;
       color: rgba(191,255,224,.58);
-      font-size: 10px;
+      font-size: 12px;
       font-weight: 800;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -2502,16 +2520,21 @@ INDEX_HTML = r"""<!doctype html>
     }
     .live-log-lines {
       margin: 0;
-      max-height: 270px;
+      min-height: min(58vh, 700px);
+      max-height: min(70vh, 860px);
+      padding: 18px;
       overflow: auto;
       white-space: pre-wrap;
       word-break: break-word;
-      color: #d8ffe9;
-      font: 800 10.5px/1.45 "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      color: #e9fff2;
+      background: rgba(2, 12, 10, .72);
+      border: 1px solid rgba(98,255,153,.14);
+      border-radius: 10px;
+      font: 850 13px/1.55 "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     }
     .live-log-lines::-webkit-scrollbar { width: 6px; }
     .live-log-lines::-webkit-scrollbar-thumb { background: rgba(82,240,168,.34); border-radius: 999px; }
-    html[data-theme="dark"] .live-log-card {
+    html[data-theme="dark"] .live-logs-terminal {
       border-color: rgba(82,240,168,.20);
       background: rgba(1, 9, 16, .92);
     }
@@ -3700,12 +3723,8 @@ INDEX_HTML = r"""<!doctype html>
         <div class="nav-item active" data-mode="paper" title="Paper mode"><span class="nav-icon">▣</span>Paper</div>
         <div class="nav-item" data-mode="charts" title="Strategy graphs"><span class="nav-icon">▥</span>Graphs</div>
         <div class="nav-item" data-mode="live" title="Live trading ledger"><span class="nav-icon">●</span>Live</div>
+        <div class="nav-item" data-mode="live_logs" title="Live terminal logs"><span class="nav-icon">⌁</span>Live Logs</div>
       </nav>
-      <div class="live-log-card" id="live-log-card">
-        <div class="live-log-head"><span>Live Logs</span><span id="live-log-status">tail</span></div>
-        <span class="live-log-path" id="live-log-path">live_bot.log</span>
-        <pre class="live-log-lines" id="live-log-lines">Loading live log...</pre>
-      </div>
       <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
     </aside>
 
@@ -3875,9 +3894,20 @@ INDEX_HTML = r"""<!doctype html>
         <div id="terminal-body"></div>
       </section>
 
+      <section class="live-logs-view">
+        <div class="live-logs-terminal">
+          <div class="live-log-head">
+            <span>Weather Bot Live Logs</span>
+            <span class="hint" id="live-log-status">tail</span>
+          </div>
+          <span class="live-log-path" id="live-log-path">live_bot.log</span>
+          <pre class="live-log-lines" id="live-log-lines">Loading live log...</pre>
+        </div>
+      </section>
+
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light · p paper · l live</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light · p paper · l live · o logs</span>
       </div>
     </main>
   </div>
@@ -3903,6 +3933,7 @@ INDEX_HTML = r"""<!doctype html>
       liveLogPayload: "",
     };
     if (state.page === "charts") state.source = "paper";
+    if (state.page === "logs") state.source = "live";
 
     const money = v => v === null || v === undefined ? "n/a" : `${v < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}`;
     const price = v => v === null || v === undefined ? "n/a" : Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
@@ -4246,13 +4277,20 @@ INDEX_HTML = r"""<!doctype html>
 
     function syncActiveButtons() {
       document.body.classList.toggle("live-source", state.source === "live");
+      document.body.classList.toggle("terminal-layout", state.layout === "terminal" && state.page !== "logs");
+      document.body.classList.toggle("charts-only", state.page === "charts" && state.layout !== "terminal");
+      document.body.classList.toggle("logs-only", state.page === "logs");
       document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === state.view));
       document.querySelectorAll("[data-exit]").forEach(btn => btn.classList.toggle("active", btn.dataset.exit === state.exit_mode));
       document.querySelectorAll("[data-strategy]").forEach(btn => btn.classList.toggle("active", btn.dataset.strategy === state.strategy));
       document.querySelectorAll("[data-lookback]").forEach(btn => btn.classList.toggle("active", Number(btn.dataset.lookback) === Number(state.lookback)));
       document.querySelectorAll("[data-mode]").forEach(item => {
         const mode = item.dataset.mode;
-        const active = mode === "charts" ? state.page === "charts" : state.page !== "charts" && state.source === mode;
+        const active = mode === "charts"
+          ? state.page === "charts"
+          : mode === "live_logs"
+            ? state.page === "logs"
+            : state.page === "dashboard" && state.source === mode;
         item.classList.toggle("active", active);
       });
       document.querySelectorAll("[data-theme-choice]").forEach(btn => btn.classList.toggle("active", btn.dataset.themeChoice === state.theme));
@@ -4294,15 +4332,18 @@ INDEX_HTML = r"""<!doctype html>
 
     function applyLayout(layout) {
       state.layout = layout === "terminal" ? "terminal" : "modern";
-      document.body.classList.toggle("terminal-layout", state.layout === "terminal");
+      document.body.classList.toggle("terminal-layout", state.layout === "terminal" && state.page !== "logs");
       localStorage.weatherLayout = state.layout;
       document.body.classList.toggle("charts-only", state.page === "charts" && state.layout !== "terminal");
+      document.body.classList.toggle("logs-only", state.page === "logs");
       syncActiveButtons();
     }
 
     function applyPage(page) {
-      state.page = page === "charts" ? "charts" : "dashboard";
+      state.page = page === "charts" ? "charts" : page === "logs" ? "logs" : "dashboard";
+      document.body.classList.toggle("terminal-layout", state.layout === "terminal" && state.page !== "logs");
       document.body.classList.toggle("charts-only", state.page === "charts" && state.layout !== "terminal");
+      document.body.classList.toggle("logs-only", state.page === "logs");
       localStorage.weatherPage = state.page;
       syncActiveButtons();
     }
@@ -4316,6 +4357,16 @@ INDEX_HTML = r"""<!doctype html>
         setState({
           source: "live",
           page: "dashboard",
+          view: "watchlist",
+          exit_mode: "tp40_runner",
+          strategy: "watchlist_no_reentry",
+        });
+        return;
+      }
+      if (mode === "live_logs") {
+        setState({
+          source: "live",
+          page: "logs",
           view: "watchlist",
           exit_mode: "tp40_runner",
           strategy: "watchlist_no_reentry",
@@ -4614,6 +4665,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderCompare(data) {
+      document.body.classList.remove("logs-only");
       document.body.classList.remove("charts-only");
       document.body.classList.add("compare-only");
       const meta = data.meta;
@@ -4651,6 +4703,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderCharts(data) {
       document.body.classList.remove("compare-only");
+      document.body.classList.remove("logs-only");
       document.body.classList.toggle("charts-only", state.layout !== "terminal");
       const meta = data.meta;
       const rows = [...data.rows].sort((a, b) => b.total - a.total);
@@ -4686,6 +4739,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderStandard(data) {
+      document.body.classList.remove("logs-only");
       document.body.classList.remove("charts-only");
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
@@ -4718,6 +4772,19 @@ INDEX_HTML = r"""<!doctype html>
       drawSpark("spark-winrate", [0, s.winrate / 100], "#16b978");
       renderTerminalStandard(data);
       refreshLiveLogs();
+    }
+
+    async function renderLiveLogsPage() {
+      document.body.classList.remove("charts-only");
+      document.body.classList.remove("compare-only");
+      document.body.classList.remove("terminal-layout");
+      document.body.classList.add("logs-only");
+      setText("title", "Live / Logs");
+      setText("subtitle", "Terminal-style tail of live_bot.log");
+      setText("status-line", "Live · execution logs · protected dashboard");
+      setText("sidebar-meta", "Live · Logs");
+      setText("state-path", "log: live_bot.log");
+      await refreshLiveLogs();
     }
 
     async function refreshLiveLogs() {
@@ -4784,6 +4851,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function refresh() {
+      if (state.page === "logs") {
+        await renderLiveLogsPage();
+        syncActiveButtons();
+        return;
+      }
       const requestStrategy = state.page === "charts" ? "compare" : state.strategy;
       const params = new URLSearchParams({
         strategy: requestStrategy,
@@ -4899,6 +4971,7 @@ INDEX_HTML = r"""<!doctype html>
       if (key === "m") applyLayout(state.layout === "terminal" ? "modern" : "terminal");
       if (key === "p") applyMode("paper");
       if (key === "l") applyMode("live");
+      if (key === "o") applyMode("live_logs");
       if ("abcdefghij".includes(key) && state.options) {
         const found = state.options.strategies.find(s => s.key === key);
         if (found) setState({strategy: found.id});
