@@ -476,6 +476,25 @@ def clean_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+def flattened_value_text(value) -> str:
+    if isinstance(value, dict):
+        return " ".join(flattened_value_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(flattened_value_text(item) for item in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def simmer_failure_status(row: dict) -> str | None:
+    text = flattened_value_text(row).lower()
+    if re.search(r"\b(rejected|reject)\b", text):
+        return "rejected"
+    if re.search(r"\b(failed|failure|fail|errored|error)\b", text):
+        return "failed"
+    return None
+
+
 def slugify_text(value: str | None) -> str:
     text = clean_text(value).lower().replace("°", "")
     text = re.sub(r"[^a-z0-9]+", "-", text)
@@ -1213,9 +1232,9 @@ def apply_simmer_portfolio_summary(summary: dict, portfolio: dict | None, positi
 
 
 def normalize_simmer_activity_trade(row: dict) -> dict | None:
-    text = " ".join(str(row.get(field, "")) for field in ("action", "type", "event", "status", "kind")).lower()
-    if "fail" in text or "error" in text:
+    if simmer_failure_status(row):
         return None
+    text = " ".join(str(row.get(field, "")) for field in ("action", "type", "event", "status", "kind")).lower()
 
     action = "sell" if "sell" in text or "redeem" in text else "buy" if "buy" in text else None
     if action is None:
@@ -1562,7 +1581,7 @@ def summarize_live(positions: list[dict], activity_trades: list[dict], closed_su
 
 def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> dict | None:
     order = dict_from_obj(row)
-    raw_status_text = json.dumps(order, default=str).lower()
+    failure_status = simmer_failure_status(order)
     market_id = clean_text(order.get("market_id") or order.get("marketId") or order.get("condition_id") or order.get("conditionId"))
     question = clean_text(
         order.get("question")
@@ -1624,8 +1643,8 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
     if amount is None and price is not None and shares is not None:
         amount = price * shares
     status = clean_text(order.get("status") or order.get("order_status") or order.get("orderStatus") or "open").lower()
-    if "fail" in raw_status_text or "error" in raw_status_text:
-        status = "failed"
+    if failure_status:
+        status = failure_status
     elif "reject" in raw_status_text:
         status = "rejected"
     elif "cancel" in raw_status_text:
@@ -1639,6 +1658,8 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         and (remaining or 0) <= 0
     ):
         status = "filled"
+    elif status in {"filled", "matched"} and (filled or 0) <= 0 and (amount or 0) <= 0 and (shares or 0) <= 0:
+        status = "failed"
     fill_pct = None
     if shares and shares > 0 and filled is not None:
         fill_pct = min(1.0, max(0.0, filled / shares))
@@ -1682,6 +1703,10 @@ def build_live_order_rows(
         if trade.get("action") != "buy":
             continue
         amount = live_trade_amount(trade)
+        filled_shares = to_float(trade.get("filled_shares"))
+        fill_price = price_value(trade.get("simulated_fill_price"))
+        if amount is None or amount <= 0 or filled_shares is None or filled_shares <= 0 or fill_price is None:
+            continue
         rows.append(
             {
                 "timestamp": trade.get("timestamp"),
@@ -1692,9 +1717,9 @@ def build_live_order_rows(
                 "city": city_for_question(trade.get("question") or trade.get("market_id")),
                 "side": (trade.get("side") or "?").upper(),
                 "status": "filled",
-                "price": price_value(trade.get("simulated_fill_price")),
-                "shares": to_float(trade.get("filled_shares")),
-                "filled_shares": to_float(trade.get("filled_shares")),
+                "price": fill_price,
+                "shares": filled_shares,
+                "filled_shares": filled_shares,
                 "remaining_shares": 0.0,
                 "fill_pct": 1.0,
                 "amount_usd": amount,
