@@ -1454,7 +1454,14 @@ def build_live_trade_summaries(
         open_position = position_by_key.get(key)
         open_position_shares = to_float(open_position.get("shares")) if isinstance(open_position, dict) else None
         has_open_runner = remaining_lot_shares > 1e-9 or (open_position_shares is not None and open_position_shares > 1e-9)
-        partial_exit = bool(has_open_runner)
+        inferred_reason = inferred_live_exit_reason(
+            trade.get("side") or key[1],
+            avg_entry,
+            price,
+            pnl,
+            trade_exit_reason(trade),
+        )
+        partial_exit = bool(has_open_runner and inferred_reason in {"take_profit", "tp40_half", "partial_take_profit"})
         runner_close = key in partial_by_key and not partial_exit
 
         sell_row = {
@@ -1471,7 +1478,7 @@ def build_live_trade_summaries(
             "requested_shares": matched_shares or shares,
             "partial_exit": partial_exit,
             "runner_after_partial_exit": runner_close,
-            "exit_reason": "tp40_half" if partial_exit else trade_exit_reason(trade),
+            "exit_reason": "tp40_half" if partial_exit else inferred_reason,
             "_live_grouped": True,
         }
         if partial_exit:
@@ -2905,14 +2912,24 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 850;
     }
     .market-link {
-      color: inherit;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--market-ink);
       text-decoration: none;
-      border-bottom: 1px solid transparent;
-      transition: color .14s ease, border-color .14s ease;
+      border-bottom: 1px solid color-mix(in srgb, var(--blue) 48%, transparent);
+      transition: color .14s ease, border-color .14s ease, background .14s ease;
+    }
+    .market-link::after {
+      content: "↗";
+      color: var(--blue);
+      font-size: .82em;
+      font-weight: 950;
+      opacity: .78;
     }
     .market-link:hover {
       color: var(--blue);
-      border-color: currentColor;
+      border-color: var(--blue);
     }
     .orders-panel {
       display: none;
@@ -3699,7 +3716,7 @@ INDEX_HTML = r"""<!doctype html>
       const title = esc(item?.question || item?.market_id || "market");
       const url = item?.market_url;
       return url
-        ? `<a class="market-link" href="${esc(url)}" target="_blank" rel="noreferrer noopener">${title}</a>`
+        ? `<a class="market-link" href="${esc(url)}" target="_blank" rel="noreferrer noopener" title="Open on Polymarket">${title}</a>`
         : title;
     };
 	    const orderStatusClass = status => {
