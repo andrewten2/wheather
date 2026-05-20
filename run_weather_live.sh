@@ -9,8 +9,7 @@ if pgrep -f "skills/polymarket-weather-trader/weather_trader.py --live --live-lo
 fi
 
 export $(grep -v '^#' .env | xargs)
-export TRADING_VENUE=polymarket
-export WEATHER_BOT_LIVE_MAX_POSITION_USD="${WEATHER_BOT_LIVE_MAX_POSITION_USD:-2.00}"
+source ./run_weather_live_settings.sh
 source venv/bin/activate
 
 exec env WEATHER_BOT_LOOP_SECONDS="${WEATHER_BOT_LOOP_SECONDS:-120}" \

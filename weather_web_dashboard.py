@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from collections import defaultdict, deque
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -186,6 +187,7 @@ LIVE_STATE_ROOT = resolve_live_state_root()
 LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
 LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
+LIVE_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
 
 
 def tp40_runner_strategy_id(strategy: str) -> str:
@@ -344,6 +346,50 @@ def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
     return None, error
 
 
+def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
+    """Fetch currently resting live orders from Simmer/Polymarket."""
+    now = time.time()
+    cached = LIVE_ORDERS_CACHE.get("orders")
+    if cached is not None and now - float(LIVE_ORDERS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_ORDERS_CACHE.get("error")
+
+    api_key = simmer_api_key()
+    if not api_key:
+        LIVE_ORDERS_CACHE.update({"ts": now, "orders": None, "error": "SIMMER_API_KEY missing"})
+        return None, LIVE_ORDERS_CACHE["error"]
+
+    errors = []
+    try:
+        from simmer_sdk import SimmerClient
+
+        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        try:
+            payload = client.get_open_orders()
+            rows = extract_rows(payload, ("orders", "open_orders", "openOrders", "items", "data", "results"))
+            normalized = [dict_from_obj(row) for row in (rows or [])]
+            LIVE_ORDERS_CACHE.update({"ts": now, "orders": normalized, "error": None})
+            return normalized, None
+        except Exception as exc:
+            errors.append(f"get_open_orders: {exc}")
+
+        for path in ("/api/sdk/orders/open", "/api/sdk/open-orders", "/api/sdk/orders"):
+            try:
+                payload = client._request("GET", path, params={"venue": "polymarket"})
+                rows = extract_rows(payload, ("orders", "open_orders", "openOrders", "items", "data", "results"))
+                if rows is not None:
+                    normalized = [dict_from_obj(row) for row in rows]
+                    LIVE_ORDERS_CACHE.update({"ts": now, "orders": normalized, "error": None})
+                    return normalized, None
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+    except Exception as exc:
+        errors.append(str(exc))
+
+    error = "; ".join(errors) or "Simmer open orders endpoint unavailable"
+    LIVE_ORDERS_CACHE.update({"ts": now, "orders": None, "error": error})
+    return None, error
+
+
 def values(value):
     if isinstance(value, dict):
         return list(value.values())
@@ -430,6 +476,34 @@ def clean_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+def question_to_polymarket_slug(question: str | None) -> str:
+    text = clean_text(question).lower()
+    if not text:
+        return ""
+    text = text.replace("°", "")
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")
+
+
+def polymarket_market_url(item: dict | None) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    for field in ("market_url", "marketUrl", "url", "link"):
+        value = clean_text(item.get(field))
+        if value.startswith("https://polymarket.com/"):
+            return value
+    event_slug = clean_text(item.get("eventSlug") or item.get("event_slug") or item.get("event_slug_id"))
+    market_slug = clean_text(item.get("slug") or item.get("market_slug") or item.get("marketSlug"))
+    if event_slug:
+        return f"https://polymarket.com/event/{event_slug}"
+    if market_slug:
+        return f"https://polymarket.com/event/{market_slug}"
+    question_slug = question_to_polymarket_slug(item.get("question") or item.get("market_question") or item.get("title"))
+    if question_slug:
+        return f"https://polymarket.com/event/{question_slug}"
+    return None
+
+
 def contains_alias(text: str, alias: str) -> bool:
     return re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", text) is not None
 
@@ -480,6 +554,13 @@ def filter_by_view(items, view: str):
         for item in items
         if city_group_for_question(item.get("question") or item.get("market_id")) == view
     ]
+
+
+def maybe_filter_live_by_view(items, view: str):
+    """Live Simmer portfolio totals are global, but rows should still respect city tabs."""
+    if view == "all":
+        return values(items)
+    return filter_by_view(items, view)
 
 
 def live_position_source_matches(position: dict) -> bool:
@@ -638,6 +719,9 @@ def normalize_simmer_live_position(raw: dict) -> dict | None:
         "current_value_usd": current_value,
         "unrealized_pnl": pnl,
         "unrealized_pnl_pct": pnl / cost_basis if pnl is not None and cost_basis > 0 else None,
+        "slug": position.get("slug") or position.get("market_slug") or position.get("marketSlug"),
+        "event_slug": position.get("event_slug") or position.get("eventSlug"),
+        "market_url": polymarket_market_url(position),
     }
 
 
@@ -1134,7 +1218,7 @@ def normalize_simmer_activity_trade(row: dict) -> dict | None:
         "timestamp": timestamp,
         "action": action,
         "side": side,
-        "market_id": row.get("market_id") or row.get("marketId"),
+        "market_id": row.get("market_id") or row.get("marketId") or row.get("condition_id") or row.get("conditionId"),
         "question": question,
         "filled_shares": shares,
         "requested_shares": shares,
@@ -1146,8 +1230,416 @@ def normalize_simmer_activity_trade(row: dict) -> dict | None:
         "entry_regime": row.get("entry_regime") or row.get("regime"),
         "forecast_value": row.get("forecast_value"),
         "forecast_unit": row.get("forecast_unit"),
+        "slug": row.get("slug") or row.get("market_slug") or row.get("marketSlug"),
+        "event_slug": row.get("event_slug") or row.get("eventSlug"),
+        "market_url": polymarket_market_url(row),
         "_simmer_activity": True,
     }
+
+
+def live_primary_key(item: dict) -> tuple[str, str]:
+    question = clean_text(item.get("question") or item.get("market_question") or item.get("title"))
+    market_id = clean_text(
+        item.get("market_id")
+        or item.get("marketId")
+        or item.get("condition_id")
+        or item.get("conditionId")
+    )
+    side = str(item.get("side") or item.get("outcome") or "?").upper()
+    return market_id or question, side
+
+
+def live_trade_amount(trade: dict) -> float | None:
+    amount = first_float(
+        trade,
+        (
+            "amount_usd",
+            "cost_usd",
+            "filled_value_usd",
+            "value_usdc",
+            "value",
+            "amount",
+            "realized_pnl",
+        ),
+    )
+    if amount is not None:
+        return abs(amount)
+    price = trade_price(trade, ("simulated_fill_price", "price", "avg_price", "fill_price", "filled_price"))
+    shares = to_float(trade.get("filled_shares")) or to_float(trade.get("requested_shares")) or to_float(trade.get("shares"))
+    if price is not None and shares is not None and shares > 0:
+        return abs(price * shares)
+    return None
+
+
+def live_leg_from_trade(trade: dict) -> dict:
+    stake = to_float(trade.get("cost_basis")) or live_trade_amount(trade)
+    pnl = to_float(trade.get("realized_pnl")) or 0.0
+    return {
+        "time": format_time(trade.get("timestamp")),
+        "stake": stake,
+        "entry_price": price_value(trade.get("entry_price")),
+        "exit_price": price_value(trade.get("simulated_fill_price")),
+        "pnl": pnl,
+        "final_value": (stake + pnl) if stake is not None else live_trade_amount(trade),
+        "exit_reason": trade_exit_reason(trade),
+    }
+
+
+def build_live_trade_summaries(
+    raw_trades: list[dict],
+    raw_positions: list[dict],
+) -> tuple[list[dict], dict[tuple[str, str], dict]]:
+    """Convert Simmer BUY/SELL activity into net sell rows and open runner hints.
+
+    Simmer activity is cashflow-like: BUY is negative spend and SELL is positive
+    proceeds. The dashboard needs trade PnL, so we match sells against prior buys
+    with FIFO and only display net SELL rows.
+    """
+    lots: dict[tuple[str, str], deque] = defaultdict(deque)
+    partial_by_key: dict[tuple[str, str], dict] = {}
+    closed: list[dict] = []
+    position_by_key = {live_primary_key(position): position for position in raw_positions}
+
+    ordered = sorted(
+        raw_trades,
+        key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
+    )
+    for trade in ordered:
+        key = live_primary_key(trade)
+        if not key[0]:
+            continue
+        action = trade.get("action")
+        price = trade_price(
+            trade,
+            ("simulated_fill_price", "entry_price", "price", "avg_price", "fill_price", "filled_price"),
+        )
+        shares = (
+            to_float(trade.get("filled_shares"))
+            or to_float(trade.get("requested_shares"))
+            or to_float(trade.get("shares"))
+        )
+        amount = live_trade_amount(trade)
+        if shares is None and amount is not None and price and price > 0:
+            shares = amount / price
+        if amount is None and shares is not None and price is not None:
+            amount = shares * price
+
+        if action == "buy":
+            if not shares or shares <= 0:
+                continue
+            cost = amount if amount is not None else (shares * price if price is not None else None)
+            if cost is None or cost <= 0:
+                continue
+            lots[key].append(
+                {
+                    "remaining_shares": float(shares),
+                    "remaining_cost": float(cost),
+                    "entry_price": price or cost / shares,
+                    "timestamp": trade.get("timestamp"),
+                    "entry_regime": trade.get("entry_regime"),
+                    "forecast": forecast_label(trade),
+                    "market_url": trade.get("market_url"),
+                    "market_id": trade.get("market_id"),
+                }
+            )
+            continue
+
+        if action != "sell":
+            continue
+
+        proceeds = amount
+        if proceeds is None:
+            continue
+        if shares is None and price and price > 0:
+            shares = proceeds / price
+        shares = float(shares or 0.0)
+        remaining_to_match = shares
+        matched_shares = 0.0
+        matched_cost = 0.0
+        entry_prices = []
+        regimes = []
+        forecasts = []
+        market_url = trade.get("market_url")
+
+        while remaining_to_match > 1e-9 and lots[key]:
+            lot = lots[key][0]
+            lot_shares = float(lot.get("remaining_shares") or 0.0)
+            if lot_shares <= 1e-9:
+                lots[key].popleft()
+                continue
+            take = min(lot_shares, remaining_to_match)
+            fraction = take / lot_shares
+            lot_cost = float(lot.get("remaining_cost") or 0.0)
+            matched_cost += lot_cost * fraction
+            matched_shares += take
+            remaining_to_match -= take
+            lot["remaining_shares"] = lot_shares - take
+            lot["remaining_cost"] = max(0.0, lot_cost - lot_cost * fraction)
+            if lot.get("entry_price") is not None:
+                entry_prices.append(float(lot["entry_price"]))
+            if lot.get("entry_regime"):
+                regimes.append(lot["entry_regime"])
+            if lot.get("forecast") and lot.get("forecast") != "-":
+                forecasts.append(lot["forecast"])
+            if not market_url and lot.get("market_url"):
+                market_url = lot.get("market_url")
+            if lot["remaining_shares"] <= 1e-9:
+                lots[key].popleft()
+
+        if matched_cost <= 0 and shares > 0:
+            fallback_entry = trade_price(trade, ("entry_price", "avg_cost", "avg_price", "buy_price"))
+            if fallback_entry is not None:
+                matched_cost = shares * fallback_entry
+                matched_shares = shares
+            else:
+                # If the matching buy is outside the fetched activity window,
+                # avoid fake green PnL: proceeds alone are not profit.
+                matched_cost = proceeds
+                matched_shares = shares
+
+        avg_entry = matched_cost / matched_shares if matched_shares > 0 and matched_cost > 0 else None
+        pnl = proceeds - matched_cost
+        remaining_lot_shares = sum(float(lot.get("remaining_shares") or 0.0) for lot in lots[key])
+        open_position = position_by_key.get(key)
+        open_position_shares = to_float(open_position.get("shares")) if isinstance(open_position, dict) else None
+        has_open_runner = remaining_lot_shares > 1e-9 or (open_position_shares is not None and open_position_shares > 1e-9)
+        partial_exit = bool(has_open_runner)
+        runner_close = key in partial_by_key and not partial_exit
+
+        sell_row = {
+            **trade,
+            "action": "sell",
+            "entry_price": avg_entry,
+            "entry_regime": regimes[-1] if regimes else trade.get("entry_regime"),
+            "forecast_label": forecasts[-1] if forecasts else forecast_label(trade),
+            "market_url": market_url or trade.get("market_url"),
+            "amount_usd": proceeds,
+            "cost_basis": matched_cost,
+            "realized_pnl": pnl,
+            "filled_shares": matched_shares or shares,
+            "requested_shares": matched_shares or shares,
+            "partial_exit": partial_exit,
+            "runner_after_partial_exit": runner_close,
+            "exit_reason": "tp40_half" if partial_exit else trade_exit_reason(trade),
+            "_live_grouped": True,
+        }
+        if partial_exit:
+            sell_row["runner_legs"] = {
+                "tp40": live_leg_from_trade(sell_row),
+                "runner": None,
+                "total_stake": matched_cost,
+                "total_pnl": pnl,
+                "total_final": proceeds,
+                "tp40_filled": True,
+            }
+            partial_by_key[key] = sell_row
+        elif runner_close:
+            first_leg = partial_by_key.get(key)
+            legs = [leg for leg in (live_leg_from_trade(first_leg), live_leg_from_trade(sell_row)) if leg]
+            sell_row["runner_legs"] = {
+                "tp40": live_leg_from_trade(first_leg),
+                "runner": live_leg_from_trade(sell_row),
+                "total_stake": sum(leg.get("stake") or 0.0 for leg in legs),
+                "total_pnl": sum(leg.get("pnl") or 0.0 for leg in legs),
+                "total_final": sum(leg.get("final_value") or 0.0 for leg in legs),
+                "tp40_filled": True,
+            }
+        closed.append(sell_row)
+
+    annotations: dict[tuple[str, str], dict] = {}
+    for key, queue in lots.items():
+        remaining_shares = sum(float(lot.get("remaining_shares") or 0.0) for lot in queue)
+        remaining_cost = sum(float(lot.get("remaining_cost") or 0.0) for lot in queue)
+        if remaining_shares <= 1e-9 or remaining_cost <= 0:
+            continue
+        last_lot = queue[-1] if queue else {}
+        annotation = {
+            "shares": remaining_shares,
+            "cost_basis": remaining_cost,
+            "entry_price": remaining_cost / remaining_shares,
+            "opened_at": queue[0].get("timestamp") if queue else None,
+            "entry_regime": last_lot.get("entry_regime"),
+            "forecast": last_lot.get("forecast"),
+            "market_url": last_lot.get("market_url"),
+        }
+        partial = partial_by_key.get(key)
+        if partial:
+            annotation.update(
+                {
+                    "runner_after_partial_exit": True,
+                    "partial_take_profit_done": True,
+                    "partial_take_profit_price": price_value(partial.get("simulated_fill_price")),
+                    "partial_take_profit_realized_pnl": to_float(partial.get("realized_pnl")),
+                    "partial_take_profit_shares": to_float(partial.get("filled_shares")),
+                }
+            )
+        annotations[key] = annotation
+    return closed, annotations
+
+
+def summarize_live(positions: list[dict], activity_trades: list[dict], closed_summaries: list[dict]) -> dict:
+    buys = [trade for trade in activity_trades if trade.get("action") == "buy"]
+    sells = [trade for trade in closed_summaries if trade.get("action") == "sell"]
+    sell_pnls = [to_float(trade.get("realized_pnl")) or 0.0 for trade in sells]
+    wins = [pnl for pnl in sell_pnls if pnl > 0]
+    losses = [pnl for pnl in sell_pnls if pnl < 0]
+    realized = sum(sell_pnls)
+    unrealized = sum(position_pnl(position, None, None)[0] or 0.0 for position in positions)
+    exposure = sum(position_exposure(position, None, None) for position in positions)
+    return {
+        "open_positions": len(positions),
+        "total_trades": len(buys) + len(sells),
+        "buys": len(buys),
+        "sells": len(sells),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winrate": len(wins) / len(sells) * 100 if sells else 0.0,
+        "realized": realized,
+        "unrealized": unrealized,
+        "total": realized + unrealized,
+        "exposure": exposure,
+        "stale": sum(1 for position in positions if price_value(position.get("current_price")) is None),
+    }
+
+
+def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> dict | None:
+    order = dict_from_obj(row)
+    market_id = clean_text(order.get("market_id") or order.get("marketId") or order.get("condition_id") or order.get("conditionId"))
+    question = clean_text(
+        order.get("question")
+        or order.get("market_question")
+        or order.get("title")
+        or question_lookup.get(market_id)
+        or market_id
+    )
+    side = str(order.get("side") or order.get("outcome") or order.get("token_side") or "yes").upper()
+    price = first_price(order, ("price", "limit_price", "limitPrice", "bid", "bid_price", "order_price"))
+    shares = first_float(
+        order,
+        (
+            "original_shares",
+            "originalShares",
+            "original_size",
+            "originalSize",
+            "shares",
+            "size",
+            "quantity",
+            "qty",
+            "order_size",
+            "orderSize",
+        ),
+    )
+    remaining = first_float(
+        order,
+        (
+            "remaining_shares",
+            "remainingShares",
+            "remaining_size",
+            "remainingSize",
+            "unfilled_shares",
+            "unfilledShares",
+            "open_shares",
+            "openShares",
+        ),
+    )
+    filled = first_float(
+        order,
+        (
+            "filled_shares",
+            "filledShares",
+            "filled_size",
+            "filledSize",
+            "matched_shares",
+            "matchedShares",
+            "matched_size",
+            "matchedSize",
+        ),
+    )
+    if shares is None and filled is not None and remaining is not None:
+        shares = filled + remaining
+    if filled is None and shares is not None and remaining is not None:
+        filled = max(0.0, shares - remaining)
+    if remaining is None and shares is not None and filled is not None:
+        remaining = max(0.0, shares - filled)
+    amount = first_float(order, ("amount", "amount_usd", "cost", "cost_usd", "value", "notional"))
+    if amount is None and price is not None and shares is not None:
+        amount = price * shares
+    status = clean_text(order.get("status") or order.get("order_status") or order.get("orderStatus") or "open").lower()
+    if status in {"open", "pending", "live", "active"} and (filled or 0) > 0 and (remaining or 0) > 0:
+        status = "partial"
+    elif status in {"open", "pending", "live", "active"} and filled is not None and (remaining or 0) <= 0:
+        status = "filled"
+    fill_pct = None
+    if shares and shares > 0 and filled is not None:
+        fill_pct = min(1.0, max(0.0, filled / shares))
+    timestamp = order.get("created_at") or order.get("createdAt") or order.get("timestamp") or order.get("placed_at")
+    if not question and not market_id:
+        return None
+    return {
+        "timestamp": timestamp,
+        "time": format_time(timestamp),
+        "age": age_label(timestamp),
+        "market_id": market_id,
+        "question": question,
+        "city": city_for_question(question),
+        "side": side if side in {"YES", "NO"} else side.upper(),
+        "status": status or "open",
+        "price": price,
+        "shares": shares,
+        "filled_shares": filled,
+        "remaining_shares": remaining,
+        "fill_pct": fill_pct,
+        "amount_usd": amount,
+        "market_url": polymarket_market_url(order) or polymarket_market_url({"question": question}),
+        "is_pending": status not in {"filled", "matched", "cancelled", "canceled", "failed", "rejected"},
+        "row_kind": "resting_bid",
+    }
+
+
+def build_live_order_rows(
+    open_order_rows: list[dict],
+    activity_trades: list[dict],
+    question_lookup: dict[str, str],
+    lookback_hours: float,
+) -> list[dict]:
+    rows = [
+        order
+        for order in (normalize_simmer_open_order(row, question_lookup) for row in values(open_order_rows))
+        if order is not None
+    ]
+    recent_activity = filter_recent_trades(activity_trades, lookback_hours)
+    for trade in recent_activity:
+        if trade.get("action") != "buy":
+            continue
+        amount = live_trade_amount(trade)
+        rows.append(
+            {
+                "timestamp": trade.get("timestamp"),
+                "time": format_time(trade.get("timestamp")),
+                "age": age_label(trade.get("timestamp")),
+                "market_id": trade.get("market_id"),
+                "question": clean_text(trade.get("question") or trade.get("market_id")),
+                "city": city_for_question(trade.get("question") or trade.get("market_id")),
+                "side": (trade.get("side") or "?").upper(),
+                "status": "filled",
+                "price": price_value(trade.get("simulated_fill_price")),
+                "shares": to_float(trade.get("filled_shares")),
+                "filled_shares": to_float(trade.get("filled_shares")),
+                "remaining_shares": 0.0,
+                "fill_pct": 1.0,
+                "amount_usd": amount,
+                "market_url": trade.get("market_url"),
+                "is_pending": False,
+                "row_kind": "recent_fill",
+            }
+        )
+    def order_sort_key(item: dict):
+        parsed = parse_dt(item.get("timestamp"))
+        timestamp = parsed.timestamp() if parsed else 0.0
+        return (0 if item.get("is_pending") else 1, -timestamp)
+
+    rows.sort(key=order_sort_key)
+    return rows[:30]
 
 
 def cumulative(values_: list[float]) -> list[float]:
@@ -1174,6 +1666,7 @@ def normalize_state(
     live_positions_error = None
     live_portfolio_error = None
     live_activity_error = None
+    live_orders_error = None
     if source == "live":
         # Live must mirror real Simmer fills. Stake simulator is paper-only.
         yes_stake = None
@@ -1185,6 +1678,7 @@ def normalize_state(
         portfolio, live_portfolio_error = fetch_simmer_live_portfolio()
         remote_positions, live_positions_error = fetch_simmer_live_positions()
         activity_rows, live_activity_error = fetch_simmer_live_activity()
+        open_order_rows, live_orders_error = fetch_simmer_live_open_orders()
         raw_position_source = [
             position
             for position in (normalize_simmer_live_position(row) for row in values(remote_positions or []))
@@ -1196,20 +1690,74 @@ def normalize_state(
             for trade in (normalize_simmer_activity_trade(row) for row in values(activity_rows or []))
             if trade is not None
         ]
+        question_lookup = {
+            clean_text(item.get("market_id")): clean_text(item.get("question"))
+            for item in [*raw_positions, *raw_trades]
+            if clean_text(item.get("market_id")) and clean_text(item.get("question"))
+        }
+        live_closed_summaries, live_position_annotations = build_live_trade_summaries(raw_trades, raw_positions)
+        open_orders = build_live_order_rows(open_order_rows or [], raw_trades, question_lookup, lookback_hours)
+        raw_positions = maybe_filter_live_by_view(raw_positions, view)
+        raw_trades = maybe_filter_live_by_view(raw_trades, view)
+        live_closed_summaries = maybe_filter_live_by_view(live_closed_summaries, view)
+        open_orders = maybe_filter_live_by_view(open_orders, view)
+        for position in raw_positions:
+            annotation = live_position_annotations.get(live_primary_key(position))
+            if not annotation:
+                continue
+            # When Simmer positions omit average entry/cost fields, reconstruct
+            # the open lot from real activity fills instead of local paper state.
+            position.update(
+                {
+                    "shares": annotation.get("shares") or position.get("shares"),
+                    "cost_basis": annotation.get("cost_basis") or position.get("cost_basis"),
+                    "entry_price": annotation.get("entry_price") or position.get("entry_price"),
+                    "avg_cost": annotation.get("entry_price") or position.get("avg_cost"),
+                    "opened_at": annotation.get("opened_at") or position.get("opened_at"),
+                    "entry_regime": annotation.get("entry_regime") or position.get("entry_regime"),
+                    "runner_after_partial_exit": annotation.get("runner_after_partial_exit")
+                    or position.get("runner_after_partial_exit"),
+                    "partial_take_profit_done": annotation.get("partial_take_profit_done")
+                    or position.get("partial_take_profit_done"),
+                    "partial_take_profit_price": annotation.get("partial_take_profit_price")
+                    or position.get("partial_take_profit_price"),
+                    "partial_take_profit_realized_pnl": annotation.get("partial_take_profit_realized_pnl")
+                    or position.get("partial_take_profit_realized_pnl"),
+                    "partial_take_profit_shares": annotation.get("partial_take_profit_shares")
+                    or position.get("partial_take_profit_shares"),
+                    "market_url": annotation.get("market_url") or position.get("market_url"),
+                }
+            )
         if remote_positions is not None:
             live_positions_source = "simmer"
         else:
             live_positions_source = "simmer_unavailable"
     else:
         portfolio = None
+        open_orders = []
         raw_position_source = state.get("positions")
         raw_positions = filter_by_view(raw_position_source, view)
         raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
-    trades = filter_recent_trades(raw_trades, lookback_hours)
+    display_trade_source = live_closed_summaries if source == "live" else raw_trades
+    trades = filter_recent_trades(display_trade_source, lookback_hours)
     buy_history = build_buy_history(raw_trades)
-    summary = summarize(raw_positions, trades, buy_history, yes_stake, no_stake, source)
+    summary = (
+        summarize_live(raw_positions, filter_recent_trades(raw_trades, lookback_hours), trades)
+        if source == "live"
+        else summarize(raw_positions, trades, buy_history, yes_stake, no_stake, source)
+    )
     if source == "live":
-        summary = apply_simmer_portfolio_summary(summary, portfolio, raw_positions)
+        if view == "all":
+            summary = apply_simmer_portfolio_summary(summary, portfolio, raw_positions)
+        else:
+            summary["note"] = "filtered_live_rows"
+            if portfolio:
+                portfolio_total = first_float(
+                    portfolio,
+                    ("profit_loss", "profitLoss", "total_pnl", "totalPnL", "pnl", "pnl_usdc", "net_pnl", "netPnl"),
+                )
+                if portfolio_total is not None:
+                    summary["global_total"] = portfolio_total
 
     positions = []
     for position in raw_positions:
@@ -1239,6 +1787,7 @@ def normalize_state(
                 "partial_price": to_float(position.get("partial_take_profit_price")),
                 "partial_pnl": to_float(position.get("partial_take_profit_realized_pnl")),
                 "partial_shares": to_float(position.get("partial_take_profit_shares")),
+                "market_url": position.get("market_url") or polymarket_market_url(position),
             }
         )
     positions.sort(key=lambda item: (item["stale"], -(abs(item["pnl"] or 0.0)), item["city"]))
@@ -1274,6 +1823,8 @@ def normalize_state(
         }
 
     def runner_leg_summary(trade: dict) -> dict | None:
+        if isinstance(trade.get("runner_legs"), dict):
+            return trade.get("runner_legs")
         if not (is_partial_exit_trade(trade) or is_runner_trade(trade) or trade_exit_reason(trade) == "market_settlement"):
             return None
         group = all_sells_by_key.get(trade_market_key(trade), [])
@@ -1330,6 +1881,7 @@ def normalize_state(
                     trade.get("runner_after_partial_exit") or nested_signal(trade).get("runner_after_partial_exit")
                 ),
                 "runner_legs": runner_leg_summary(trade),
+                "market_url": trade.get("market_url") or polymarket_market_url(trade),
             }
         )
 
@@ -1374,10 +1926,12 @@ def normalize_state(
             "live_positions_error": live_positions_error,
             "live_portfolio_error": live_portfolio_error,
             "live_activity_error": live_activity_error,
+            "live_orders_error": live_orders_error,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_updated_at": state.get("updated_at"),
         },
         "stats": summary,
+        "orders": open_orders,
         "positions": positions[:60],
         "closed_trades": closed_trades,
         "pnl_curve": cumulative(pnl_values),
@@ -2287,6 +2841,57 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 18px;
       font-weight: 850;
     }
+    .market-link {
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: color .14s ease, border-color .14s ease;
+    }
+    .market-link:hover {
+      color: var(--blue);
+      border-color: currentColor;
+    }
+    .orders-panel {
+      display: none;
+    }
+    .orders-panel.visible {
+      display: block;
+    }
+    .order-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 78px;
+      justify-content: center;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 950;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+    }
+	    .order-status.pending {
+	      color: #8a5c00;
+	      background: var(--amber-soft);
+	      border-color: rgba(247,185,85,.32);
+	    }
+	    .order-status.partial {
+	      color: #0a62b7;
+	      background: rgba(48,137,255,.13);
+	      border-color: rgba(48,137,255,.30);
+	    }
+	    .order-status.filled {
+	      color: #0b7d52;
+	      background: rgba(22,185,120,.14);
+	      border-color: rgba(22,185,120,.28);
+	    }
+    .order-status.failed,
+    .order-status.cancelled {
+      color: #c91f3f;
+      background: rgba(255,64,92,.13);
+      border-color: rgba(255,64,92,.26);
+    }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -2868,6 +3473,15 @@ INDEX_HTML = r"""<!doctype html>
         </aside>
 
         <section class="stack">
+          <div class="panel orders-panel" id="orders-panel">
+	            <div class="panel-head"><h2>Open Orders / Bid Fills</h2><span class="hint" id="orders-count">...</span></div>
+	            <div class="table-wrap">
+	              <table>
+	                <thead><tr><th>Placed</th><th>Side</th><th>Status</th><th class="num">Bid</th><th class="num">Stake</th><th class="num">Shares</th><th class="num">Filled</th><th class="num">Left</th><th class="num">Fill</th><th>City</th><th>Market</th></tr></thead>
+	                <tbody id="orders"></tbody>
+	              </table>
+	            </div>
+	          </div>
           <div class="panel">
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
@@ -3018,6 +3632,26 @@ INDEX_HTML = r"""<!doctype html>
     const cityFlag = city => CITY_FLAGS[city] || "🌐";
     const cityChip = city => `<span class="city-chip"><span class="flag">${cityFlag(city)}</span>${esc(city)}</span>`;
     const cityName = city => `<span class="top-city-name"><span class="flag">${cityFlag(city)}</span>${esc(city)}</span>`;
+    const marketLink = item => {
+      const title = esc(item?.question || item?.market_id || "market");
+      const url = item?.market_url;
+      return url
+        ? `<a class="market-link" href="${esc(url)}" target="_blank" rel="noreferrer noopener">${title}</a>`
+        : title;
+    };
+	    const orderStatusClass = status => {
+	      const text = String(status || "").toLowerCase();
+	      if (["filled", "matched"].includes(text)) return "filled";
+	      if (["partial", "partially_filled", "partially-filled", "partially filled"].includes(text)) return "partial";
+	      if (["cancelled", "canceled", "failed", "rejected"].includes(text)) return "failed";
+	      return "pending";
+	    };
+	    const orderStatusChip = order => {
+	      const status = String(order?.status || (order?.is_pending ? "pending" : "filled")).replace(/_/g, " ").toUpperCase();
+	      return `<span class="order-status ${orderStatusClass(status)}">${esc(status)}</span>`;
+	    };
+	    const qty = v => v === null || v === undefined ? "n/a" : Number(v).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+	    const fillPct = v => v === null || v === undefined ? "n/a" : `${(Number(v) * 100).toFixed(0)}%`;
     function isRunnerMode() {
       return state.exit_mode === "tp40_runner";
     }
@@ -3403,6 +4037,29 @@ INDEX_HTML = r"""<!doctype html>
       if (el.innerHTML !== html) el.innerHTML = html;
     }
 
+    function renderOrders(rows) {
+      const panel = document.getElementById("orders-panel");
+      const q = state.search.toLowerCase();
+      const filtered = (rows || []).filter(o => !q || `${o.city} ${o.question}`.toLowerCase().includes(q));
+      if (panel) panel.classList.toggle("visible", state.source === "live" || filtered.length > 0);
+	      setText("orders-count", `${filtered.length}/${(rows || []).length}`);
+	      setHTML("orders", filtered.length ? filtered.slice(0, 24).map(o => `
+	        <tr>
+	          <td><strong>${esc(o.time || "")}</strong><br><span class="hint">${esc(o.age || "")}</span></td>
+	          <td><span class="pill ${o.side === "YES" ? "yes" : "no"}">${esc(o.side || "?")}</span></td>
+	          <td>${orderStatusChip(o)}</td>
+	          <td class="num">${price(o.price)}</td>
+	          <td class="num">${money(o.amount_usd)}</td>
+	          <td class="num">${qty(o.shares)}</td>
+	          <td class="num">${qty(o.filled_shares)}</td>
+	          <td class="num">${qty(o.remaining_shares)}</td>
+	          <td class="num">${fillPct(o.fill_pct)}</td>
+	          <td class="city-col">${cityChip(o.city)}</td>
+	          <td class="market">${marketLink(o)}</td>
+	        </tr>
+	      `).join("") : `<tr><td colspan="11"><div class="empty">No resting bids/orders for this filter.</div></td></tr>`);
+	    }
+
     function renderPositions(rows) {
       const q = state.search.toLowerCase();
       const filtered = rows.filter(p => !q || `${p.city} ${p.question}`.toLowerCase().includes(q));
@@ -3420,7 +4077,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
           <td class="city-col">${cityChip(p.city)}</td>
-          <td class="market">${esc(p.question)}</td>
+          <td class="market">${marketLink(p)}</td>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
         </tr>
       `).join("") : `<tr><td colspan="13"><div class="empty">No open positions for this filter.</div></td></tr>`);
@@ -3448,7 +4105,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${cls(displayPnl)}">${money(displayPnl)}</td>
           <td class="num ${cls(displayFinal)}">${money(displayFinal)}</td>
           <td class="city-col">${cityChip(t.city)}</td>
-          <td class="market">${esc(t.question)}${runnerBreakdown(t)}</td>
+          <td class="market">${marketLink(t)}${runnerBreakdown(t)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `;
@@ -3522,7 +4179,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${p.stale ? "neutral" : cls(p.final_value)}">${p.stale ? "stale" : money(p.final_value)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : pct(p.pnl_pct)}</td>
           <td>${esc(p.age)}</td>
-          <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${esc(p.question)}</td>
+          <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${marketLink(p)}</td>
         </tr>
       `).join("") : `<tr><td colspan="12" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
@@ -3542,7 +4199,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(t.exit_price)}</td>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
           <td class="num ${cls(t.final_value)}">${money(t.final_value)}</td>
-          <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${esc(t.question)}</td>
+          <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${marketLink(t)}</td>
         </tr>
       `;
       }).join("") : `<tr><td colspan="11" class="terminal-market">No closed trades for this filter.</td></tr>`;
@@ -3711,8 +4368,10 @@ INDEX_HTML = r"""<!doctype html>
       const titleSource = meta.source === "live" ? "Live" : meta.view_label;
       const liveDataLabel = meta.source === "live" ? ` · ${meta.live_positions_source === "simmer" ? "Simmer positions" : "local positions"}` : "";
       setText("title", `${titleSource} / ${meta.strategy_label}`);
-      setText("subtitle", `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel} · effective state: ${meta.effective_strategy}`);
+      const filterNote = meta.source === "live" && meta.view !== "all" ? " · city-filtered rows" : "";
+      const globalNote = meta.source === "live" && s.global_total !== undefined ? ` · Simmer global ${money(s.global_total)}` : "";
+      setText("subtitle", `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
       setText("sidebar-meta", `${meta.source_label} · ${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", lookbackLabel());
@@ -3721,9 +4380,10 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error, meta.live_activity_error].filter(Boolean).join(" · ");
+      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error, meta.live_activity_error, meta.live_orders_error].filter(Boolean).join(" · ");
       setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · Simmer error: ${liveErrors}` : ""}`);
       renderStats(s);
+      renderOrders(data.orders || []);
       renderPositions(data.positions);
       renderClosed(data.closed_trades);
       renderCities(data.city_pnl);

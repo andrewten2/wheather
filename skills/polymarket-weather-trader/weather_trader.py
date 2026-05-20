@@ -27,7 +27,7 @@ from typing import Optional
 from datetime import date, datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 # Make local repo imports work when running this script directly from the checkout.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -156,6 +156,7 @@ for _old, _new in _LEGACY_ENV_ALIASES.items():
 _config = load_config(CONFIG_SCHEMA, __file__, slug="polymarket-weather-trader")
 
 NOAA_API_BASE = "https://api.weather.gov"
+CLOB_API_BASE = os.environ.get("POLYMARKET_CLOB_API", "https://clob.polymarket.com").rstrip("/")
 ORDER_TYPE = (_config.get("order_type") or "GTC").upper()
 
 
@@ -182,6 +183,7 @@ def _get_non_negative_int_env(name: str, default: int) -> int:
 WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
 WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_SECONDS", 30)
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
+LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 600)
 
 # SDK adapter / execution singletons
 _adapter = None
@@ -193,6 +195,7 @@ _strategy_v1_probability_model = None
 _dataset_recorder = None
 _actual_temperature_cache = {}
 _weather_markets_cache = {}
+_live_open_order_market_ids_cache = (datetime.min.replace(tzinfo=timezone.utc), set())
 
 BASELINE_STRATEGY_ID = "baseline"
 ACTIVE_STRATEGY_ID = BASELINE_STRATEGY_ID
@@ -419,6 +422,86 @@ def live_last_exit_reason(market_id: str) -> Optional[str]:
 def live_last_exit_time(market_id: str) -> Optional[str]:
     last_exit = load_live_strategy_state().get("last_exits", {}).get(market_id) or {}
     return last_exit.get("timestamp")
+
+
+def _order_field(order: dict, *names: str):
+    for name in names:
+        if isinstance(order, dict) and order.get(name) not in (None, ""):
+            return order.get(name)
+    return None
+
+
+def _order_market_id(order: dict) -> Optional[str]:
+    value = _order_field(order, "market_id", "marketId", "condition_id", "conditionId")
+    return str(value) if value else None
+
+
+def _order_id(order: dict) -> Optional[str]:
+    value = _order_field(order, "order_id", "orderId", "id", "trade_id", "tradeId")
+    return str(value) if value else None
+
+
+def _order_side(order: dict) -> Optional[str]:
+    value = _order_field(order, "side", "outcome", "token_side")
+    return str(value).lower() if value else None
+
+
+def _order_created_at(order: dict) -> Optional[datetime]:
+    value = _order_field(order, "created_at", "createdAt", "timestamp", "placed_at", "placedAt")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cancel_live_order(order: dict) -> bool:
+    order_id = _order_id(order)
+    market_id = _order_market_id(order)
+    side = _order_side(order)
+    try:
+        if order_id:
+            get_adapter().cancel_order(order_id)
+        elif market_id:
+            get_adapter().cancel_market_orders(market_id, side=side if side in {"yes", "no"} else None)
+        else:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def live_open_order_market_ids(ttl_seconds: int = 15) -> set[str]:
+    """Return markets with already-resting Simmer/Polymarket orders to avoid duplicates."""
+    global _live_open_order_market_ids_cache
+    cached_at, cached_ids = _live_open_order_market_ids_cache
+    if (datetime.now(timezone.utc) - cached_at).total_seconds() <= ttl_seconds:
+        return set(cached_ids)
+    try:
+        response = get_adapter().get_open_orders()
+    except Exception:
+        _live_open_order_market_ids_cache = (datetime.now(timezone.utc), set())
+        return set()
+
+    orders = response.get("orders", []) if isinstance(response, dict) else []
+    market_ids = set()
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        created_at = _order_created_at(order)
+        if LIVE_ENTRY_ORDER_TTL_SECONDS > 0 and created_at is not None:
+            age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+            if age_seconds >= LIVE_ENTRY_ORDER_TTL_SECONDS and _cancel_live_order(order):
+                continue
+        market_id = _order_market_id(order)
+        if market_id:
+            market_ids.add(market_id)
+    _live_open_order_market_ids_cache = (datetime.now(timezone.utc), market_ids)
+    return set(market_ids)
 
 
 def record_live_buy(
@@ -1272,6 +1355,23 @@ def _apply_strategy_v1_rebuy_guard(
                 "position_cost_usd": live_position.current_value,
                 "current_side_price": current_side_price,
             }
+        if market_id in live_open_order_market_ids():
+            return {
+                "action": "skip",
+                "reason": "open_order_pending",
+                "selected_side": selected_side,
+                "price_yes": entry["yes_price"],
+                "gaussian_probability": entry["gaussian_probability"],
+                "edge_yes": entry["edge_yes"],
+                "edge_no": entry["edge_no"],
+                "open_position_exists": False,
+                "historical_trade_exists": True,
+                "buy_count": None,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "position_cost_usd": None,
+                "current_side_price": current_side_price,
+            }
         strategy_config = get_active_strategy_config()
         if strategy_config.get("block_reentry_after_stop_loss") and live_last_exit_reason(market_id) == "stop_loss":
             return {
@@ -2047,11 +2147,113 @@ def filter_live_strategy_positions(positions: list[Position]) -> list[Position]:
 MIN_SHARES_PER_ORDER = 5.0  # Polymarket requires minimum 5 shares
 MIN_TICK_SIZE = 0.01        # Minimum tradeable price
 
+
+def _clob_request(url: str, timeout: int = 5) -> Optional[dict]:
+    """Fetch read-only Polymarket CLOB data without bypassing Simmer trade execution."""
+    try:
+        req = Request(url, headers={"User-Agent": "weather-bot/1.0"})
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _book_levels(levels: list[dict], reverse: bool) -> list[tuple[float, float]]:
+    parsed = []
+    for level in levels or []:
+        try:
+            price = float(level.get("price"))
+            size = float(level.get("size", 0))
+        except (TypeError, ValueError):
+            continue
+        parsed.append((price, size))
+    return sorted(parsed, key=lambda item: item[0], reverse=reverse)
+
+
+def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
+    """Return best bid/ask for a YES or NO CLOB token."""
+    if not token_id:
+        return None
+    result = _clob_request(f"{CLOB_API_BASE}/book?token_id={quote(str(token_id))}")
+    if not isinstance(result, dict):
+        return None
+
+    bids = _book_levels(result.get("bids", []), reverse=True)
+    asks = _book_levels(result.get("asks", []), reverse=False)
+    if not bids or not asks:
+        return None
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    spread = max(0.0, best_ask - best_bid)
+    mid = (best_ask + best_bid) / 2
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "spread_pct": (spread / mid) if mid > 0 else 0.0,
+        "bid_depth_usd": sum(price * size for price, size in bids[:5]),
+        "ask_depth_usd": sum(price * size for price, size in asks[:5]),
+    }
+
+
+def _extract_clob_token_id(raw_market: dict, side: str) -> Optional[str]:
+    if not isinstance(raw_market, dict):
+        return None
+    side = (side or "yes").lower()
+    key_candidates = (
+        ("polymarket_token_id", "yes_token_id", "token_id", "clob_token_id")
+        if side == "yes"
+        else ("polymarket_no_token_id", "no_token_id", "clob_no_token_id")
+    )
+    for key in key_candidates:
+        value = raw_market.get(key)
+        if value:
+            return str(value)
+
+    tokens = (
+        raw_market.get("clob_token_ids")
+        or raw_market.get("clobTokenIds")
+        or raw_market.get("token_ids")
+        or raw_market.get("outcome_token_ids")
+    )
+    if isinstance(tokens, str):
+        try:
+            tokens = json.loads(tokens)
+        except json.JSONDecodeError:
+            tokens = []
+    if isinstance(tokens, list) and tokens:
+        index = 0 if side == "yes" else 1
+        if len(tokens) > index and tokens[index]:
+            return str(tokens[index])
+    return None
+
+
+def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[float], Optional[dict], Optional[str]]:
+    """Choose the live entry limit: buy only at the current bid for the traded side."""
+    token_id = _extract_clob_token_id(raw_market, side)
+    if not token_id:
+        return None, None, "missing_clob_token_id"
+
+    book = fetch_orderbook_summary(token_id)
+    if not book:
+        return None, None, "orderbook_unavailable"
+
+    best_bid = book.get("best_bid")
+    if best_bid is None:
+        return None, book, "missing_best_bid"
+    if best_bid < MIN_TICK_SIZE:
+        return None, book, "bid_below_min_tick"
+
+    return round(max(0.001, min(0.999, float(best_bid))), 4), book, None
+
+
 # Strategy parameters - from config
 ENTRY_THRESHOLD = _config["entry_threshold"]
 EXIT_THRESHOLD = _config["exit_threshold"]
 MAX_POSITION_USD = _config["max_position_usd"]
-LIVE_MAX_POSITION_USD = float(os.environ.get("WEATHER_BOT_LIVE_MAX_POSITION_USD", "2.00"))
+_live_max_position_usd = os.environ.get("WEATHER_BOT_LIVE_MAX_POSITION_USD")
+LIVE_MAX_POSITION_USD = float(_live_max_position_usd) if _live_max_position_usd else MAX_POSITION_USD
 _automaton_max = os.environ.get("AUTOMATON_MAX_BET")
 if _automaton_max:
     MAX_POSITION_USD = min(MAX_POSITION_USD, float(_automaton_max))
@@ -2558,6 +2760,7 @@ def execute_trade(
     reasoning: str = None,
     signal_data: dict = None,
     execution_mode: ExecutionMode = None,
+    limit_price: float = None,
 ) -> dict:
     """Execute a buy trade via execution layer with source tagging."""
     forced_mode = ExecutionMode.PAPER if execution_mode == ExecutionMode.PAPER else None
@@ -2570,12 +2773,15 @@ def execute_trade(
         amount=amount,
         reasoning=reasoning,
         signal_data=signal_data,
+        limit_price=limit_price,
     )
     out = {
         "success": result.success,
         "trade_id": result.trade_id,
         "shares_bought": result.filled_shares,
         "shares": result.filled_shares,
+        "filled_value_usd": result.filled_value_usd,
+        "avg_fill_price": result.avg_fill_price,
         "error": result.error,
         "simulated": result.simulated,
         "order_status": result.order_status,
@@ -2618,6 +2824,8 @@ def execute_sell(
         "is_submitted_only": result.is_submitted_only,
         "is_filled": result.is_filled,
         "realized_pnl": result.realized_pnl,
+        "filled_shares": result.filled_shares,
+        "filled_value_usd": result.filled_value_usd,
         "avg_fill_price": result.avg_fill_price,
         "side": result.side,
     }
@@ -3525,16 +3733,24 @@ def check_exit_opportunities(
             if result.get("success"):
                 exits_executed += 1
                 trade_id = result.get("trade_id")
+                try:
+                    fill_exit_price = float(result.get("avg_fill_price") or current_price)
+                except (TypeError, ValueError):
+                    fill_exit_price = current_price
+                try:
+                    filled_sell_shares = float(result.get("filled_shares") or shares_to_sell)
+                except (TypeError, ValueError):
+                    filled_sell_shares = shares_to_sell
                 print(
                     f"     ✅ {'[PAPER] ' if result.get('simulated') else ''}"
-                    f"Sold {position_side.upper()} {shares_to_sell:.1f} shares @ ${current_price:.2f}"
+                    f"Sold {position_side.upper()} {filled_sell_shares:.1f} shares @ ${fill_exit_price:.4f}"
                 )
                 if execution_mode == ExecutionMode.LIVE_ENABLED and not result.get("is_submitted_only"):
                     record_live_sell(
                         market_id=market_id,
                         side=position_side,
-                        shares=shares_to_sell,
-                        exit_price=current_price,
+                        shares=filled_sell_shares,
+                        exit_price=fill_exit_price,
                         question=stored_question,
                         exit_reason=exit_reason,
                         partial_exit=partial_exit,
@@ -4263,21 +4479,59 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                         price_history=history,
                     )
                 )
+
+            limit_price = None
+            if execution_mode == ExecutionMode.LIVE_ENABLED:
+                limit_price, orderbook, bid_skip_reason = resolve_live_bid_entry_limit(
+                    candidate.market.raw_market,
+                    selected_side,
+                )
+                if limit_price is None:
+                    log(f"  ⏸️  Live bid-only entry skipped: {bid_skip_reason}")
+                    skip_reasons.append(f"live_bid_only_{bid_skip_reason}")
+                    continue
+
+                signal.metadata["live_entry_order_type"] = ORDER_TYPE
+                signal.metadata["live_entry_limit_price"] = round(limit_price, 6)
+                if orderbook:
+                    signal.metadata["live_entry_best_bid"] = round(float(orderbook["best_bid"]), 6)
+                    signal.metadata["live_entry_best_ask"] = round(float(orderbook["best_ask"]), 6)
+                    signal.metadata["live_entry_spread"] = round(float(orderbook["spread"]), 6)
+                    signal.metadata["live_entry_spread_pct"] = round(float(orderbook["spread_pct"]), 6)
+                    log(
+                        "  📚 Live bid-only entry: "
+                        f"bid ${orderbook['best_bid']:.4f} / ask ${orderbook['best_ask']:.4f}; "
+                        f"placing {ORDER_TYPE} BUY @ bid ${limit_price:.4f}",
+                        force=True,
+                    )
             result = execute_trade(
                 market_id, selected_side, position_size,
                 reasoning=signal.reasoning,
                 signal_data=signal.metadata,
                 execution_mode=execution_mode,
+                limit_price=limit_price,
             )
 
             if result.get("success"):
                 trades_executed += 1
-                total_usd_spent += position_size
-                shares = result.get("shares_bought") or result.get("shares") or 0
+                try:
+                    shares = float(result.get("shares_bought") or result.get("shares") or 0)
+                except (TypeError, ValueError):
+                    shares = 0.0
                 trade_id = result.get("trade_id")
+                signal_entry_price = price if selected_side == "yes" else 1.0 - price
+                try:
+                    fill_entry_price = float(result.get("avg_fill_price") or signal_entry_price)
+                except (TypeError, ValueError):
+                    fill_entry_price = signal_entry_price
+                try:
+                    fill_cost_usd = float(result.get("filled_value_usd"))
+                except (TypeError, ValueError):
+                    fill_cost_usd = shares * fill_entry_price
+                total_usd_spent += fill_cost_usd or position_size
                 log(
                     f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {selected_side.upper()} "
-                    f"{shares:.1f} shares @ ${price:.2f}",
+                    f"{shares:.1f} shares @ ${fill_entry_price:.4f}",
                     force=True,
                 )
                 if execution_mode == ExecutionMode.LIVE_ENABLED:
@@ -4287,9 +4541,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                         record_live_buy(
                             market_id=market_id,
                             side=selected_side,
-                            amount=position_size,
+                            amount=fill_cost_usd or position_size,
                             shares=shares,
-                            entry_price=price if selected_side == "yes" else 1.0 - price,
+                            entry_price=fill_entry_price,
                             question=candidate.market.question,
                             signal_data=signal.metadata,
                             trade_id=trade_id,
@@ -4301,9 +4555,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                             venue="polymarket",
                             shares_yes=result.get("shares_bought") if selected_side == "yes" else 0,
                             shares_no=result.get("shares_bought") if selected_side == "no" else 0,
-                            avg_cost=price if selected_side == "yes" else 1.0 - price,
-                            current_price=price if selected_side == "yes" else 1.0 - price,
-                            current_value=position_size,
+                            avg_cost=fill_entry_price,
+                            current_price=fill_entry_price,
+                            current_value=fill_cost_usd or position_size,
                             sources=[TRADE_SOURCE],
                             opened_by_weather_strategy=True,
                         )
