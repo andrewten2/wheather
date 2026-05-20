@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from trader.models.execution import ExecutionMode, ExecutionResult
@@ -45,6 +46,7 @@ class ExecutionEngine:
         amount: float,
         reasoning: str = None,
         signal_data: dict = None,
+        limit_price: Optional[float] = None,
     ) -> ExecutionResult:
         return self._submit_trade(
             market_id=market_id,
@@ -53,6 +55,7 @@ class ExecutionEngine:
             amount=amount,
             reasoning=reasoning,
             signal_data=signal_data,
+            limit_price=limit_price,
         )
 
     def sell(
@@ -85,6 +88,7 @@ class ExecutionEngine:
         signal_data: dict = None,
         market_price: Optional[float] = None,
         market_question: Optional[str] = None,
+        limit_price: Optional[float] = None,
     ) -> ExecutionResult:
         mode = self.get_mode()
         if mode == ExecutionMode.PAPER and self.paper_trader is not None:
@@ -123,7 +127,8 @@ class ExecutionEngine:
                 skill_slug=self.skill_slug,
                 reasoning=reasoning,
                 signal_data=signal_data,
-                order_type=self.order_type,
+                order_type=self._effective_order_type(action),
+                price=limit_price,
             )
         except Exception as e:
             return ExecutionResult(
@@ -138,6 +143,14 @@ class ExecutionEngine:
 
         order_status = getattr(result, "order_status", None)
         filled_shares = getattr(result, "shares_bought", 0) or 0
+        if action == "sell" and not filled_shares and order_status in {"matched", "simulated"}:
+            filled_shares = shares or getattr(result, "shares_requested", None) or 0
+        filled_value_usd = getattr(result, "cost", None)
+        avg_fill_price = None
+        if filled_shares and filled_value_usd is not None:
+            avg_fill_price = abs(float(filled_value_usd)) / float(filled_shares)
+        elif amount and filled_shares:
+            avg_fill_price = float(amount) / float(filled_shares)
         is_submitted_only = order_status in {"live", "delayed"}
         is_filled = bool(result.success and (getattr(result, "fully_filled", False) or order_status in {"matched", "simulated"}))
 
@@ -149,7 +162,8 @@ class ExecutionEngine:
             requested_amount_usd=amount,
             requested_shares=shares if shares is not None else getattr(result, "shares_requested", None),
             filled_shares=filled_shares,
-            avg_fill_price=(amount / filled_shares) if amount and filled_shares else None,
+            filled_value_usd=filled_value_usd,
+            avg_fill_price=avg_fill_price,
             order_status=order_status,
             trade_id=getattr(result, "trade_id", None),
             simulated=getattr(result, "simulated", False),
@@ -157,3 +171,10 @@ class ExecutionEngine:
             is_filled=is_filled,
             error=getattr(result, "error", None),
         )
+
+    def _effective_order_type(self, action: str) -> str:
+        """Let entries rest on-book while exits keep using immediate execution."""
+        configured = (self.order_type or "FAK").upper()
+        if action == "sell" and configured in {"GTC", "GTD"}:
+            return os.environ.get("SIMMER_WEATHER_SELL_ORDER_TYPE", "FAK").upper()
+        return configured

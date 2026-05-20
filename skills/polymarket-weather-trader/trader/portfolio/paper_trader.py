@@ -670,6 +670,7 @@ class PaperTrader:
             requested_amount_usd=requested_amount_usd,
             requested_shares=requested_shares,
             filled_shares=filled_shares,
+            filled_value_usd=round(filled_shares * price, 6),
             avg_fill_price=price,
             order_status="simulated",
             trade_id=order_id,

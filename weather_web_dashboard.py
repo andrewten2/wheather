@@ -17,6 +17,28 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE pairs without overriding already-exported env vars."""
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+load_env_file(ROOT / ".env")
+load_env_file(Path("/root/wheather/.env"))
+
 ENV_STATE_PATH = os.environ.get("WEATHER_DASHBOARD_STATE")
 ENV_LIVE_STATE_ROOT = os.environ.get("WEATHER_DASHBOARD_LIVE_STATE_ROOT")
 DEFAULT_STATE = ROOT / "skills" / "polymarket-weather-trader" / "data" / "paper_trading" / "state.json"

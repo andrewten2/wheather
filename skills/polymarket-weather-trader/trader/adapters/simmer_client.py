@@ -66,6 +66,15 @@ class SimmerAdapter:
     def get_price_history(self, market_id: str) -> List[dict]:
         return self.get_client().get_price_history(market_id)
 
+    def get_open_orders(self) -> dict:
+        return self.get_client().get_open_orders()
+
+    def cancel_order(self, order_id: str) -> dict:
+        return self.get_client().cancel_order(order_id)
+
+    def cancel_market_orders(self, market_id: str, side: str = None) -> dict:
+        return self.get_client().cancel_market_orders(market_id, side=side)
+
     def get_positions(self, venue: str = None) -> List[dict]:
         client = self.get_client()
         effective_venue = venue or client.venue

@@ -21,6 +21,7 @@ class ExecutionResult:
     requested_amount_usd: Optional[float] = None
     requested_shares: Optional[float] = None
     filled_shares: Optional[float] = None
+    filled_value_usd: Optional[float] = None
     avg_fill_price: Optional[float] = None
     order_status: Optional[str] = None
     trade_id: Optional[str] = None
