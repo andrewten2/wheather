@@ -2753,6 +2753,28 @@ def fetch_weather_markets(search_queries=None):
         return []
 
 
+def execution_result_value(result, field: str, default=None):
+    """Read SDK/adapter execution results safely across slightly different shapes."""
+    if isinstance(result, dict):
+        return result.get(field, default)
+    return getattr(result, field, default)
+
+
+def execution_result_filled_value(result) -> float | None:
+    value = execution_result_value(result, "filled_value_usd")
+    if value is None:
+        value = execution_result_value(result, "cost")
+    if value is not None:
+        return value
+    shares = execution_result_value(result, "filled_shares")
+    if shares is None:
+        shares = execution_result_value(result, "shares_bought")
+    avg_price = execution_result_value(result, "avg_fill_price")
+    if shares is not None and avg_price is not None:
+        return abs(float(shares) * float(avg_price))
+    return None
+
+
 def execute_trade(
     market_id: str,
     side: str,
@@ -2775,21 +2797,23 @@ def execute_trade(
         signal_data=signal_data,
         limit_price=limit_price,
     )
+    filled_shares = execution_result_value(result, "filled_shares")
+    filled_value_usd = execution_result_filled_value(result)
     out = {
-        "success": result.success,
-        "trade_id": result.trade_id,
-        "shares_bought": result.filled_shares,
-        "shares": result.filled_shares,
-        "filled_value_usd": result.filled_value_usd,
-        "avg_fill_price": result.avg_fill_price,
-        "error": result.error,
-        "simulated": result.simulated,
-        "order_status": result.order_status,
-        "is_submitted_only": result.is_submitted_only,
-        "is_filled": result.is_filled,
+        "success": execution_result_value(result, "success", False),
+        "trade_id": execution_result_value(result, "trade_id"),
+        "shares_bought": filled_shares,
+        "shares": filled_shares,
+        "filled_value_usd": filled_value_usd,
+        "avg_fill_price": execution_result_value(result, "avg_fill_price"),
+        "error": execution_result_value(result, "error"),
+        "simulated": execution_result_value(result, "simulated", False),
+        "order_status": execution_result_value(result, "order_status"),
+        "is_submitted_only": execution_result_value(result, "is_submitted_only", False),
+        "is_filled": execution_result_value(result, "is_filled", False),
     }
-    if result.is_submitted_only:
-        print(f"  [GTC] Order placed on book — waiting for fill (trade {result.trade_id})")
+    if out["is_submitted_only"]:
+        print(f"  [GTC] Order placed on book — waiting for fill (trade {out['trade_id']})")
     return out
 
 
@@ -2815,22 +2839,23 @@ def execute_sell(
         market_question=market_question,
         signal_data=signal_data,
     )
+    filled_value_usd = execution_result_filled_value(result)
     out = {
-        "success": result.success,
-        "trade_id": result.trade_id,
-        "error": result.error,
-        "simulated": result.simulated,
-        "order_status": result.order_status,
-        "is_submitted_only": result.is_submitted_only,
-        "is_filled": result.is_filled,
-        "realized_pnl": result.realized_pnl,
-        "filled_shares": result.filled_shares,
-        "filled_value_usd": result.filled_value_usd,
-        "avg_fill_price": result.avg_fill_price,
-        "side": result.side,
+        "success": execution_result_value(result, "success", False),
+        "trade_id": execution_result_value(result, "trade_id"),
+        "error": execution_result_value(result, "error"),
+        "simulated": execution_result_value(result, "simulated", False),
+        "order_status": execution_result_value(result, "order_status"),
+        "is_submitted_only": execution_result_value(result, "is_submitted_only", False),
+        "is_filled": execution_result_value(result, "is_filled", False),
+        "realized_pnl": execution_result_value(result, "realized_pnl"),
+        "filled_shares": execution_result_value(result, "filled_shares"),
+        "filled_value_usd": filled_value_usd,
+        "avg_fill_price": execution_result_value(result, "avg_fill_price"),
+        "side": execution_result_value(result, "side", side),
     }
-    if result.is_submitted_only:
-        print(f"  [GTC] Sell order placed on book — waiting for fill (trade {result.trade_id})")
+    if out["is_submitted_only"]:
+        print(f"  [GTC] Sell order placed on book — waiting for fill (trade {out['trade_id']})")
     return out
 
 
