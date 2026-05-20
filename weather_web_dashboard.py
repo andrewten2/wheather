@@ -1307,6 +1307,72 @@ def normalize_simmer_activity_trade(row: dict) -> dict | None:
     }
 
 
+def normalize_simmer_failed_activity_order(row: dict, question_lookup: dict[str, str]) -> dict | None:
+    """Show failed Simmer activity in the order panel without counting it as a trade."""
+    status = simmer_failure_status(row)
+    if not status:
+        return None
+    market_id = clean_text(
+        row.get("market_id")
+        or row.get("marketId")
+        or row.get("condition_id")
+        or row.get("conditionId")
+    )
+    question = clean_text(
+        row.get("question")
+        or row.get("market_question")
+        or row.get("title")
+        or row.get("market")
+        or question_lookup.get(market_id)
+        or market_id
+    )
+    if not question and not market_id:
+        return None
+    side = str(row.get("side") or row.get("outcome") or row.get("token_side") or "yes").upper()
+    price = first_price(
+        row,
+        (
+            "price",
+            "fill_price",
+            "filled_price",
+            "avg_price",
+            "average_price",
+            "execution_price",
+            "limit_price",
+            "bid",
+            "bid_price",
+        ),
+    )
+    shares = first_float(row, ("shares", "filled_shares", "size", "quantity", "qty"))
+    amount = first_float(row, ("amount", "amount_usd", "cost", "cost_usd", "value", "value_usdc", "usdc"))
+    timestamp = (
+        row.get("timestamp")
+        or row.get("created_at")
+        or row.get("createdAt")
+        or row.get("time")
+        or row.get("updated_at")
+    )
+    return {
+        "timestamp": timestamp,
+        "time": format_time(timestamp),
+        "age": age_label(timestamp),
+        "market_id": market_id,
+        "question": question,
+        "city": city_for_question(question),
+        "side": side if side in {"YES", "NO"} else side.upper(),
+        "status": status,
+        "price": price,
+        "shares": shares,
+        "filled_shares": 0.0,
+        "remaining_shares": shares,
+        "fill_pct": 0.0 if shares and shares > 0 else None,
+        "amount_usd": abs(amount) if amount is not None else None,
+        "market_url": polymarket_market_url(row) or polymarket_market_url({"question": question}),
+        "is_pending": False,
+        "row_kind": "failed_activity",
+    }
+
+
 def live_primary_key(item: dict) -> tuple[str, str]:
     question = clean_text(item.get("question") or item.get("market_question") or item.get("title"))
     market_id = clean_text(
@@ -1423,6 +1489,10 @@ def build_live_trade_summaries(
         if shares is None and price and price > 0:
             shares = proceeds / price
         shares = float(shares or 0.0)
+        if proceeds <= 0 or shares <= 0:
+            # Failed/redeem bookkeeping rows from Simmer can carry no notional
+            # value. They are order-status rows, not closed trades/PnL.
+            continue
         remaining_to_match = shares
         matched_shares = 0.0
         matched_cost = 0.0
@@ -1582,6 +1652,7 @@ def summarize_live(positions: list[dict], activity_trades: list[dict], closed_su
 def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> dict | None:
     order = dict_from_obj(row)
     failure_status = simmer_failure_status(order)
+    raw_value_text = flattened_value_text(order).lower()
     market_id = clean_text(order.get("market_id") or order.get("marketId") or order.get("condition_id") or order.get("conditionId"))
     question = clean_text(
         order.get("question")
@@ -1645,9 +1716,9 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
     status = clean_text(order.get("status") or order.get("order_status") or order.get("orderStatus") or "open").lower()
     if failure_status:
         status = failure_status
-    elif "reject" in raw_status_text:
+    elif re.search(r"\b(rejected|reject)\b", raw_value_text):
         status = "rejected"
-    elif "cancel" in raw_status_text:
+    elif re.search(r"\b(cancelled|canceled|cancel)\b", raw_value_text):
         status = "canceled"
     elif status in {"open", "pending", "live", "active"} and (filled or 0) > 0 and (remaining or 0) > 0:
         status = "partial"
@@ -1690,6 +1761,7 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
 def build_live_order_rows(
     open_order_rows: list[dict],
     activity_trades: list[dict],
+    failed_activity_rows: list[dict],
     question_lookup: dict[str, str],
     lookback_hours: float,
 ) -> list[dict]:
@@ -1698,6 +1770,19 @@ def build_live_order_rows(
         for order in (normalize_simmer_open_order(row, question_lookup) for row in values(open_order_rows))
         if order is not None
     ]
+    failed_orders = [
+        order
+        for order in (normalize_simmer_failed_activity_order(row, question_lookup) for row in values(failed_activity_rows))
+        if order is not None
+    ]
+    if lookback_hours and lookback_hours > 0:
+        cutoff = datetime.now(DISPLAY_TZ) - timedelta(hours=lookback_hours)
+        failed_orders = [
+            order
+            for order in failed_orders
+            if (parse_dt(order.get("timestamp")) or datetime.max.replace(tzinfo=DISPLAY_TZ)) >= cutoff
+        ]
+    rows.extend(failed_orders)
     recent_activity = filter_recent_trades(activity_trades, lookback_hours)
     for trade in recent_activity:
         if trade.get("action") != "buy":
@@ -1791,7 +1876,14 @@ def normalize_state(
             if clean_text(item.get("market_id")) and clean_text(item.get("question"))
         }
         live_closed_summaries, live_position_annotations = build_live_trade_summaries(raw_trades, raw_positions)
-        open_orders = build_live_order_rows(open_order_rows or [], raw_trades, question_lookup, lookback_hours)
+        failed_activity_rows = [row for row in values(activity_rows or []) if simmer_failure_status(row)]
+        open_orders = build_live_order_rows(
+            open_order_rows or [],
+            raw_trades,
+            failed_activity_rows,
+            question_lookup,
+            lookback_hours,
+        )
         raw_positions = maybe_filter_live_by_view(raw_positions, view)
         raw_trades = maybe_filter_live_by_view(raw_trades, view)
         live_closed_summaries = maybe_filter_live_by_view(live_closed_summaries, view)
