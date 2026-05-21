@@ -3565,7 +3565,7 @@ def check_exit_opportunities(
                     unrealized_pnl_pct=round(unrealized_pnl_pct, 6) if unrealized_pnl_pct is not None else None,
                 )
 
-        if execution_mode != ExecutionMode.PAPER and shares < MIN_SHARES_PER_ORDER:
+        if execution_mode != ExecutionMode.PAPER and shares <= 0:
             continue
 
         if current_price is None:
@@ -3720,8 +3720,8 @@ def check_exit_opportunities(
             if fresh_pos:
                 fresh_side = get_position_side(fresh_pos)
                 fresh_shares = (fresh_pos.shares_no or 0) if fresh_side == "no" else (fresh_pos.shares_yes or 0)
-                if execution_mode != ExecutionMode.PAPER and fresh_shares < MIN_SHARES_PER_ORDER:
-                    print(f"     ⏭️  Skipped: fresh share count {fresh_shares:.1f} below minimum")
+                if execution_mode != ExecutionMode.PAPER and fresh_shares <= 0:
+                    print(f"     ⏭️  Skipped: fresh share count {fresh_shares:.1f}")
                     continue
                 if fresh_shares != shares:
                     print(f"     ℹ️  Share count updated: {shares:.1f} → {fresh_shares:.1f}")
@@ -3731,26 +3731,6 @@ def check_exit_opportunities(
                     shares_to_sell = max(0.0, shares * min(1.0, max(0.0, partial_tp_fraction)))
                 else:
                     shares_to_sell = shares
-
-            if (
-                partial_exit
-                and execution_mode != ExecutionMode.PAPER
-                and shares_to_sell < MIN_SHARES_PER_ORDER
-            ):
-                if shares >= MIN_SHARES_PER_ORDER:
-                    print(
-                        f"     ℹ️  Partial TP size {shares_to_sell:.2f} shares is below "
-                        f"minimum {MIN_SHARES_PER_ORDER:.0f}; selling full position instead"
-                    )
-                    partial_exit = False
-                    runner_after_partial_exit = False
-                    shares_to_sell = shares
-                else:
-                    print(
-                        f"     ⏭️  Skipped: sell size {shares_to_sell:.2f} shares below "
-                        f"minimum {MIN_SHARES_PER_ORDER:.0f}"
-                    )
-                    continue
 
             tag = "PAPER" if execution_mode == ExecutionMode.PAPER else ("SIMULATED" if dry_run else "LIVE")
             side_label = position_side.upper()
