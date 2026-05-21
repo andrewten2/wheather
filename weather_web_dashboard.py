@@ -41,8 +41,11 @@ load_env_file(Path("/root/wheather/.env"))
 
 ENV_STATE_PATH = os.environ.get("WEATHER_DASHBOARD_STATE")
 ENV_LIVE_STATE_ROOT = os.environ.get("WEATHER_DASHBOARD_LIVE_STATE_ROOT")
+ENV_DIRECT_PAPER_STATE_ROOT = os.environ.get("WEATHER_DASHBOARD_DIRECT_PAPER_STATE_ROOT")
 DEFAULT_STATE = ROOT / "skills" / "polymarket-weather-trader" / "data" / "paper_trading" / "state.json"
 SERVER_STATE = Path("/root/wheather/skills/polymarket-weather-trader/data/paper_trading/state.json")
+DEFAULT_DIRECT_PAPER_STATE_ROOT = ROOT / "skills" / "polymarket-weather-trader" / "data" / "direct_polymarket_paper"
+SERVER_DIRECT_PAPER_STATE_ROOT = Path("/root/wheather/skills/polymarket-weather-trader/data/direct_polymarket_paper")
 DEFAULT_LIVE_STATE_ROOT = ROOT / "skills" / "polymarket-weather-trader" / "data" / "live_trading"
 SERVER_LIVE_STATE_ROOT = Path("/root/wheather/skills/polymarket-weather-trader/data/live_trading")
 
@@ -74,9 +77,10 @@ VIEW_LABELS = {
     "watchlist": "Watchlist",
 }
 
-SOURCE_ORDER = ("paper", "live")
+SOURCE_ORDER = ("paper", "direct_paper", "live")
 SOURCE_LABELS = {
     "paper": "Paper",
+    "direct_paper": "Direct Paper",
     "live": "Live",
 }
 
@@ -213,6 +217,21 @@ def resolve_live_state_root() -> Path:
 
 
 LIVE_STATE_ROOT = resolve_live_state_root()
+
+
+def resolve_direct_paper_state_root() -> Path:
+    candidates = [
+        Path(ENV_DIRECT_PAPER_STATE_ROOT) if ENV_DIRECT_PAPER_STATE_ROOT else None,
+        SERVER_DIRECT_PAPER_STATE_ROOT,
+        DEFAULT_DIRECT_PAPER_STATE_ROOT,
+    ]
+    for path in candidates:
+        if path and path.exists():
+            return path
+    return DEFAULT_DIRECT_PAPER_STATE_ROOT
+
+
+DIRECT_PAPER_STATE_ROOT = resolve_direct_paper_state_root()
 LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
 LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
@@ -232,12 +251,19 @@ def effective_strategy(strategy: str, exit_mode: str) -> str:
 
 
 def state_root_for_source(source: str = "paper") -> Path:
-    return LIVE_STATE_ROOT if source == "live" else STATE_ROOT
+    if source == "live":
+        return LIVE_STATE_ROOT
+    if source == "direct_paper":
+        return DIRECT_PAPER_STATE_ROOT
+    return STATE_ROOT
 
 
 def state_path_for_strategy(strategy: str, source: str = "paper") -> Path:
     if source == "live":
         root = LIVE_STATE_ROOT
+        return root / "state.json" if strategy == "baseline" else root / "strategies" / strategy / "state.json"
+    if source == "direct_paper":
+        root = DIRECT_PAPER_STATE_ROOT
         return root / "state.json" if strategy == "baseline" else root / "strategies" / strategy / "state.json"
     if strategy == "baseline":
         return STATE_PATH
@@ -3745,6 +3771,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <nav class="nav">
         <div class="nav-item active" data-mode="paper" title="Paper mode"><span class="nav-icon">▣</span>Paper</div>
+        <div class="nav-item" data-mode="direct_paper" title="Direct Polymarket paper mode"><span class="nav-icon">◇</span>Direct Paper</div>
         <div class="nav-item" data-mode="charts" title="Strategy graphs"><span class="nav-icon">▥</span>Graphs</div>
         <div class="nav-item" data-mode="live" title="Live trading ledger"><span class="nav-icon">●</span>Live</div>
         <div class="nav-item" data-mode="live_logs" title="Live terminal logs"><span class="nav-icon">⌁</span>Live Logs</div>
@@ -3984,7 +4011,7 @@ INDEX_HTML = r"""<!doctype html>
       if (state.source === "live") return " · real fills";
       return state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
     };
-    const sourceLabel = () => state.source === "live" ? "Live" : "Paper";
+    const sourceLabel = () => state.source === "live" ? "Live" : state.source === "direct_paper" ? "Direct Paper" : "Paper";
     const CITY_FLAGS = {
       "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
       "Austin": "🇺🇸", "Denver": "🇺🇸", "Houston": "🇺🇸", "Los Angeles": "🇺🇸", "San Francisco": "🇺🇸",
@@ -4384,6 +4411,18 @@ INDEX_HTML = r"""<!doctype html>
           view: "all",
           exit_mode: "tp40",
           strategy: "no_reentry_after_stop",
+        });
+        return;
+      }
+      if (mode === "direct_paper") {
+        setState({
+          source: "direct_paper",
+          page: "dashboard",
+          view: "all",
+          exit_mode: "tp40",
+          strategy: "no_reentry_after_stop",
+          yesStake: "3",
+          noStake: "2",
         });
         return;
       }
@@ -5427,6 +5466,8 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print(f"Weather web dashboard: http://{args.host}:{args.port}")
     print(f"Reading state root: {STATE_ROOT}")
+    print(f"Reading direct paper root: {DIRECT_PAPER_STATE_ROOT}")
+    print(f"Reading live state root: {LIVE_STATE_ROOT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

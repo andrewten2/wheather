@@ -197,6 +197,7 @@ _strategy_v1_probability_model = None
 _dataset_recorder = None
 _actual_temperature_cache = {}
 _weather_markets_cache = {}
+_clob_orderbook_cache = {}
 _live_open_order_market_ids_cache = (datetime.min.replace(tzinfo=timezone.utc), set())
 
 BASELINE_STRATEGY_ID = "baseline"
@@ -364,7 +365,13 @@ def set_active_strategy(strategy_id: str) -> None:
 
 def get_strategy_state_dir(strategy_id: str = None) -> Path:
     strategy_id = strategy_id or ACTIVE_STRATEGY_ID
-    base_dir = Path(__file__).resolve().parent / "data" / "paper_trading"
+    state_root = os.environ.get("WEATHER_BOT_PAPER_STATE_ROOT")
+    if state_root:
+        base_dir = Path(state_root)
+    elif direct_polymarket_paper_enabled():
+        base_dir = Path(__file__).resolve().parent / "data" / "direct_polymarket_paper"
+    else:
+        base_dir = Path(__file__).resolve().parent / "data" / "paper_trading"
     if strategy_id == BASELINE_STRATEGY_ID:
         return base_dir
     return base_dir / "strategies" / strategy_id
@@ -380,6 +387,15 @@ def get_live_strategy_state_dir(strategy_id: str = None) -> Path:
 
 def get_live_strategy_state_path(strategy_id: str = None) -> Path:
     return get_live_strategy_state_dir(strategy_id) / "state.json"
+
+
+def direct_polymarket_paper_enabled() -> bool:
+    return str(os.environ.get("WEATHER_BOT_DIRECT_POLYMARKET_PAPER", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _empty_live_strategy_state() -> dict:
@@ -1125,6 +1141,16 @@ def build_strategy_v1_event_candidates(
     probability_model = get_strategy_v1_probability_model()
     ranked_candidates = []
     for raw_market in event_markets:
+        raw_market = enrich_raw_market_with_direct_polymarket_prices(raw_market)
+        if direct_polymarket_paper_enabled() and not raw_market.get("_direct_polymarket_paper"):
+            if logger is not None:
+                logger.event(
+                    "market_skipped",
+                    reason="direct_polymarket_orderbook_unavailable",
+                    market_id=raw_market.get("id") or raw_market.get("market_id"),
+                    question=raw_market.get("question") or raw_market.get("event_name"),
+                )
+            continue
         weather_market = build_weather_market(raw_market)
         question_text = f"{weather_market.question or ''} {weather_market.event_name or ''}".lower()
         if "lowest temperature" in question_text:
@@ -1152,6 +1178,17 @@ def build_strategy_v1_event_candidates(
             market=weather_market,
             bucket=bucket,
         )
+        price_snapshot = build_market_price_snapshot(raw_market)
+        yes_price = (
+            float(price_snapshot["yes_price"])
+            if price_snapshot and price_snapshot.get("yes_price") is not None
+            else float(candidate.price_yes)
+        )
+        no_price = (
+            float(price_snapshot["no_price"])
+            if price_snapshot and price_snapshot.get("no_price") is not None
+            else 1.0 - yes_price
+        )
         probability_estimate = probability_model.estimate(
             candidate_trade=candidate,
             forecast=forecast,
@@ -1163,10 +1200,10 @@ def build_strategy_v1_event_candidates(
                 "candidate": candidate,
                 "probability_estimate": probability_estimate,
                 "bucket": bucket,
-                "yes_price": float(candidate.price_yes),
-                "no_price": 1.0 - float(candidate.price_yes),
-                "edge_yes": probability_estimate.estimated_probability - float(candidate.price_yes),
-                "edge_no": float(candidate.price_yes) - probability_estimate.estimated_probability,
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "edge_yes": probability_estimate.estimated_probability - yes_price,
+                "edge_no": (1.0 - probability_estimate.estimated_probability) - no_price,
                 "gaussian_probability": probability_estimate.estimated_probability,
             }
         )
@@ -2183,6 +2220,12 @@ def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
     """Return best bid/ask for a YES or NO CLOB token."""
     if not token_id:
         return None
+    cache_key = str(token_id)
+    cached = _clob_orderbook_cache.get(cache_key)
+    if cached:
+        fetched_at, cached_book = cached
+        if (datetime.now(timezone.utc) - fetched_at).total_seconds() <= 10:
+            return cached_book
     result = _clob_request(f"{CLOB_API_BASE}/book?token_id={quote(str(token_id))}")
     if not isinstance(result, dict):
         return None
@@ -2196,7 +2239,7 @@ def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
     best_ask = asks[0][0]
     spread = max(0.0, best_ask - best_bid)
     mid = (best_ask + best_bid) / 2
-    return {
+    summary = {
         "best_bid": best_bid,
         "best_ask": best_ask,
         "spread": spread,
@@ -2204,6 +2247,8 @@ def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
         "bid_depth_usd": sum(price * size for price, size in bids[:5]),
         "ask_depth_usd": sum(price * size for price, size in asks[:5]),
     }
+    _clob_orderbook_cache[cache_key] = (datetime.now(timezone.utc), summary)
+    return summary
 
 
 def _extract_clob_token_id(raw_market: dict, side: str) -> Optional[str]:
@@ -2255,6 +2300,48 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
         return None, book, "bid_below_min_tick"
 
     return round(max(0.001, min(0.999, float(best_bid))), 4), book, None
+
+
+def build_direct_polymarket_bid_snapshot(raw_market: dict) -> Optional[dict]:
+    """Use Polymarket CLOB bids as paper executable prices for both YES and NO."""
+    if not direct_polymarket_paper_enabled():
+        return None
+    if not isinstance(raw_market, dict):
+        return None
+
+    yes_token_id = _extract_clob_token_id(raw_market, "yes")
+    no_token_id = _extract_clob_token_id(raw_market, "no")
+    yes_book = fetch_orderbook_summary(yes_token_id) if yes_token_id else None
+    no_book = fetch_orderbook_summary(no_token_id) if no_token_id else None
+
+    yes_bid = yes_book.get("best_bid") if yes_book else None
+    no_bid = no_book.get("best_bid") if no_book else None
+    if yes_bid is None and no_bid is None:
+        return None
+    if yes_bid is None and no_bid is not None:
+        yes_bid = max(0.001, min(0.999, 1.0 - float(no_bid)))
+    if no_bid is None and yes_bid is not None:
+        no_bid = max(0.001, min(0.999, 1.0 - float(yes_bid)))
+
+    return {
+        "yes_price": round(float(yes_bid), 6),
+        "no_price": round(float(no_bid), 6),
+        "market": raw_market,
+        "direct_polymarket": True,
+        "yes_orderbook": yes_book,
+        "no_orderbook": no_book,
+    }
+
+
+def enrich_raw_market_with_direct_polymarket_prices(raw_market: dict) -> dict:
+    snapshot = build_direct_polymarket_bid_snapshot(raw_market)
+    if not snapshot:
+        return raw_market
+    enriched = dict(raw_market)
+    enriched["external_price_yes"] = snapshot["yes_price"]
+    enriched["external_price_no"] = snapshot["no_price"]
+    enriched["_direct_polymarket_paper"] = True
+    return enriched
 
 
 # Strategy parameters - from config
@@ -3000,12 +3087,20 @@ def build_market_price_snapshot(raw_market: dict) -> Optional[dict]:
     raw_price_yes = raw_market.get("external_price_yes")
     if raw_price_yes is None:
         raw_price_yes = raw_market.get("current_probability")
-    if raw_price_yes is None:
+    raw_price_no = raw_market.get("external_price_no")
+    if raw_price_no is None:
+        raw_price_no = raw_market.get("no_price")
+    if raw_price_yes is None and raw_price_no is None:
         return None
-    price_yes = float(raw_price_yes)
+    if raw_price_yes is None:
+        price_no = float(raw_price_no)
+        price_yes = 1.0 - price_no
+    else:
+        price_yes = float(raw_price_yes)
+        price_no = float(raw_price_no) if raw_price_no is not None else 1.0 - price_yes
     return {
         "yes_price": price_yes,
-        "no_price": 1.0 - price_yes,
+        "no_price": price_no,
         "market": raw_market,
     }
 
@@ -3013,10 +3108,17 @@ def build_market_price_snapshot(raw_market: dict) -> Optional[dict]:
 def build_market_snapshot_cache(markets: list) -> dict:
     """Build market_id -> side-aware price snapshot from one active market scan."""
     snapshots = {}
+    direct_market_ids = set()
+    if direct_polymarket_paper_enabled():
+        direct_market_ids = set((get_paper_trader().state.get("positions") or {}).keys())
     for raw_market in markets or []:
         market_id = raw_market.get("id") or raw_market.get("market_id")
         if not market_id:
             continue
+        if market_id in direct_market_ids:
+            raw_market = enrich_raw_market_with_direct_polymarket_prices(raw_market)
+            if not raw_market.get("_direct_polymarket_paper"):
+                continue
         snapshot = build_market_price_snapshot(raw_market)
         if snapshot is not None:
             snapshots[market_id] = snapshot
@@ -3720,11 +3822,22 @@ def check_exit_opportunities(
                     print(f"     ⚠️  Warnings: {'; '.join(reasons)}")
 
             # Re-fetch fresh share count to avoid selling more than available
-            fresh_positions = load_positions(
-                get_adapter(),
-                execution_mode=execution_mode,
-                paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
-            )
+            try:
+                fresh_positions = load_positions(
+                    get_adapter(),
+                    execution_mode=execution_mode,
+                    paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
+                )
+            except Exception as exc:
+                fresh_positions = []
+                print(f"     ⚠️  Fresh position refresh failed, using cached shares: {exc}")
+                if logger is not None:
+                    logger.event(
+                        "fresh_position_refresh_failed",
+                        market_id=market_id,
+                        side=position_side,
+                        error=str(exc),
+                    )
             fresh_pos = find_position(fresh_positions, market_id)
             if fresh_pos:
                 fresh_side = get_position_side(fresh_pos)
@@ -3961,6 +4074,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"  Loop interval:   {WEATHER_BOT_LOOP_SECONDS}s")
     if paper:
         log(f"  Exit check:      {WEATHER_BOT_EXIT_CHECK_SECONDS}s (open positions only)")
+        if direct_polymarket_paper_enabled():
+            log("  Price source:    direct Polymarket CLOB bids")
     log(f"  Forecast TTL:    {FORECAST_CACHE_TTL_SECONDS}s")
     log(f"  Locations:       {', '.join(ACTIVE_LOCATIONS)}")
     log(f"  Smart sizing:    {'✓ Enabled' if smart_sizing else '✗ Disabled'}")
@@ -4494,9 +4609,20 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 signal.metadata["city"] = candidate.location
                 signal.metadata["question"] = candidate.market.question
                 signal.metadata["event_name"] = candidate.event_name
+                side_price_snapshot = build_market_price_snapshot(candidate.market.raw_market)
+                metadata_yes_price = (
+                    float(side_price_snapshot["yes_price"])
+                    if side_price_snapshot and side_price_snapshot.get("yes_price") is not None
+                    else price
+                )
+                metadata_no_price = (
+                    float(side_price_snapshot["no_price"])
+                    if side_price_snapshot and side_price_snapshot.get("no_price") is not None
+                    else 1.0 - price
+                )
                 signal.metadata["market_price"] = round(price, 6)
-                signal.metadata["market_price_yes"] = round(price, 6)
-                signal.metadata["market_price_no"] = round(1.0 - price, 6)
+                signal.metadata["market_price_yes"] = round(metadata_yes_price, 6)
+                signal.metadata["market_price_no"] = round(metadata_no_price, 6)
                 signal.metadata["selected_edge"] = round(selected_edge, 6)
                 signal.metadata["gaussian_probability"] = round(model_probability, 6)
                 signal.metadata["entry_regime"] = strategy_v1_decision.get("mode") if strategy_v1_decision else None
@@ -4736,7 +4862,11 @@ def run_live_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True
     if execution_mode != ExecutionMode.LIVE_ENABLED:
         logger.log(f"  ⏭️  Live exit check skipped: execution mode is {execution_mode.value}")
         return
-    live_positions = load_positions(get_adapter(), execution_mode=execution_mode)
+    try:
+        live_positions = load_positions(get_adapter(), execution_mode=execution_mode)
+    except Exception as exc:
+        logger.log(f"  ⚠️  Live exit check skipped: failed to load positions ({exc})")
+        return
     sync_live_positions_with_exchange(build_live_strategy_position_map(live_positions))
     check_exit_opportunities(
         dry_run=dry_run,
@@ -4745,6 +4875,18 @@ def run_live_exit_check_cycle(dry_run: bool = False, use_safeguards: bool = True
         logger=logger,
         positions_override=live_positions,
     )
+
+
+def guarded_cycle_call(fn, *args, **kwargs):
+    """Keep long-running loops alive on transient provider/network failures."""
+    try:
+        return fn(*args, **kwargs)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(f"⚠️  Cycle error in {getattr(fn, '__name__', 'call')}: {exc}")
+        time.sleep(5)
+        return None
 
 
 def run_strategy_suite(args):
@@ -4923,34 +5065,36 @@ if __name__ == "__main__":
 
     if args.paper and not args.positions and not args.config:
         while True:
-            run_weather_strategy(**run_kwargs)
+            guarded_cycle_call(run_weather_strategy, **run_kwargs)
             remaining_sleep = WEATHER_BOT_LOOP_SECONDS
             while remaining_sleep > 0:
                 sleep_for = min(WEATHER_BOT_EXIT_CHECK_SECONDS, remaining_sleep)
                 time.sleep(sleep_for)
                 remaining_sleep -= sleep_for
                 if remaining_sleep > 0:
-                    run_paper_exit_check_cycle(
+                    guarded_cycle_call(
+                        run_paper_exit_check_cycle,
                         dry_run=run_kwargs["dry_run"],
                         use_safeguards=run_kwargs["use_safeguards"],
                         quiet=run_kwargs["quiet"],
                     )
     elif args.live and args.live_loop and not args.positions and not args.config:
         while True:
-            run_weather_strategy(**run_kwargs)
+            guarded_cycle_call(run_weather_strategy, **run_kwargs)
             remaining_sleep = WEATHER_BOT_LOOP_SECONDS
             while remaining_sleep > 0:
                 sleep_for = min(WEATHER_BOT_EXIT_CHECK_SECONDS, remaining_sleep)
                 time.sleep(sleep_for)
                 remaining_sleep -= sleep_for
                 if remaining_sleep > 0:
-                    run_live_exit_check_cycle(
+                    guarded_cycle_call(
+                        run_live_exit_check_cycle,
                         dry_run=run_kwargs["dry_run"],
                         use_safeguards=run_kwargs["use_safeguards"],
                         quiet=run_kwargs["quiet"],
                     )
     else:
-        run_weather_strategy(**run_kwargs)
+        guarded_cycle_call(run_weather_strategy, **run_kwargs)
 
     # Fallback report for automaton if the strategy returned early (no signal)
     if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
