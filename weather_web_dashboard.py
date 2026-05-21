@@ -485,6 +485,96 @@ def tail_live_log(lines: int = 80) -> dict:
         return {"ok": False, "path": str(path), "lines": [f"failed to read live log: {exc}"]}
 
 
+def parse_recent_exit_checks(lines: int = 6000) -> dict[tuple[str, str], list[dict]]:
+    path = live_log_path()
+    if not path:
+        return {}
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 2_000_000))
+            chunk = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for line in chunk.splitlines()[-lines:]:
+        text = line.strip()
+        if '"event": "exit_check"' not in text and '"event":"exit_check"' not in text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+        market_id = clean_text(payload.get("market_id"))
+        side = str(payload.get("side") or "?").upper()
+        if market_id and side != "?":
+            by_key[(market_id, side)].append(payload)
+    return by_key
+
+
+def local_trade_index(trades: list[dict]) -> dict[tuple[str, str], list[dict]]:
+    by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for trade in trades:
+        key = trade_market_key(trade)
+        if key[0] and key[1] != "?":
+            by_key[key].append(trade)
+    for items in by_key.values():
+        items.sort(key=lambda trade: parse_dt(trade.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ))
+    return by_key
+
+
+def enrich_live_sell_from_context(
+    trade: dict,
+    local_by_key: dict[tuple[str, str], list[dict]],
+    exit_checks_by_key: dict[tuple[str, str], list[dict]],
+) -> dict:
+    if trade.get("action") != "sell":
+        return trade
+    enriched = dict(trade)
+    key = trade_market_key(enriched)
+    local_sells = [item for item in local_by_key.get(key, []) if item.get("action") == "sell"]
+    local = local_sells[-1] if local_sells else None
+    exit_check = exit_checks_by_key.get(key, [])[-1] if exit_checks_by_key.get(key) else None
+
+    if local:
+        for field in (
+            "entry_price",
+            "entry_regime",
+            "forecast_value",
+            "forecast_unit",
+            "cost_basis",
+            "realized_pnl",
+            "partial_exit",
+            "runner_after_partial_exit",
+            "market_url",
+        ):
+            if enriched.get(field) in (None, "", "-"):
+                enriched[field] = local.get(field)
+        if trade_exit_reason(enriched).lower() in {"", "sell"}:
+            enriched["exit_reason"] = local.get("exit_reason") or nested_signal(local).get("exit_reason")
+
+    if exit_check:
+        if price_value(enriched.get("entry_price")) is None:
+            enriched["entry_price"] = exit_check.get("entry_price")
+        if price_value(enriched.get("simulated_fill_price")) is None:
+            enriched["simulated_fill_price"] = exit_check.get("current_price")
+        if trade_exit_reason(enriched).lower() in {"", "sell"}:
+            enriched["exit_reason"] = exit_check.get("exit_reason")
+        entry = price_value(enriched.get("entry_price"))
+        exit_price = price_value(enriched.get("simulated_fill_price"))
+        shares = to_float(enriched.get("filled_shares")) or to_float(enriched.get("requested_shares"))
+        if to_float(enriched.get("cost_basis")) is None and entry is not None and shares and shares > 0:
+            enriched["cost_basis"] = entry * shares
+        if to_float(enriched.get("realized_pnl")) is None:
+            cost_basis = to_float(enriched.get("cost_basis"))
+            if cost_basis is not None and exit_price is not None and shares and shares > 0:
+                enriched["realized_pnl"] = shares * exit_price - cost_basis
+
+    return enriched
+
+
 def values(value):
     if isinstance(value, dict):
         return list(value.values())
@@ -1145,7 +1235,7 @@ def adjusted_trade_pnl(
     realized = to_float(trade.get("realized_pnl"))
     entry, _, _, original_cost = closed_entry_info(trade, buy_history)
     if source == "live":
-        if trade.get("_simmer_activity"):
+        if trade.get("_simmer_activity") and realized is not None:
             return realized
         actual = actual_trade_pnl_from_prices(trade, entry, original_cost)
         if actual is not None:
@@ -1361,10 +1451,6 @@ def normalize_simmer_activity_trade(row: dict) -> dict | None:
     amount = first_float(row, ("amount", "amount_usd", "cost", "cost_usd", "value", "value_usdc", "usdc"))
     pnl = first_float(row, ("pnl", "realized_pnl", "profit_loss", "profitLoss"))
 
-    signed_amount = None
-    if amount is not None:
-        signed_amount = amount if action == "sell" else -abs(amount)
-
     timestamp = (
         row.get("timestamp")
         or row.get("created_at")
@@ -1390,7 +1476,7 @@ def normalize_simmer_activity_trade(row: dict) -> dict | None:
         "simulated_fill_price": price,
         "entry_price": price if action == "buy" else None,
         "amount_usd": abs(amount) if amount is not None else None,
-        "realized_pnl": pnl if pnl is not None else signed_amount,
+        "realized_pnl": pnl,
         "exit_reason": row.get("exit_reason") or row.get("reason") or action.upper(),
         "entry_regime": row.get("entry_regime") or row.get("regime"),
         "forecast_value": row.get("forecast_value"),
@@ -1624,8 +1710,13 @@ def build_live_trade_summaries(
 
         match_mode = "fifo"
         if matched_cost <= 0 and shares > 0:
+            explicit_cost = to_float(trade.get("cost_basis"))
             fallback_entry = trade_price(trade, ("entry_price", "avg_cost", "avg_price", "buy_price"))
-            if fallback_entry is not None:
+            if explicit_cost is not None and explicit_cost > 0:
+                matched_cost = explicit_cost
+                matched_shares = shares
+                match_mode = "fallback_cost_basis"
+            elif fallback_entry is not None:
                 matched_cost = shares * fallback_entry
                 matched_shares = shares
                 match_mode = "fallback_entry_price"
@@ -1948,6 +2039,9 @@ def normalize_state(
         remote_positions, live_positions_error = fetch_simmer_live_positions()
         activity_rows, live_activity_error = fetch_simmer_live_activity()
         open_order_rows, live_orders_error = fetch_simmer_live_open_orders()
+        local_live_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
+        local_by_key = local_trade_index(local_live_trades)
+        exit_checks_by_key = parse_recent_exit_checks()
         raw_position_source = [
             position
             for position in (normalize_simmer_live_position(row) for row in values(remote_positions or []))
@@ -1959,12 +2053,17 @@ def normalize_state(
             for trade in (normalize_simmer_activity_trade(row) for row in values(activity_rows or []))
             if trade is not None
         ]
+        raw_trades = [
+            enrich_live_sell_from_context(trade, local_by_key, exit_checks_by_key)
+            for trade in raw_trades
+        ]
+        matching_trades = raw_trades
         question_lookup = {
             clean_text(item.get("market_id")): clean_text(item.get("question"))
-            for item in [*raw_positions, *raw_trades]
+            for item in [*raw_positions, *matching_trades]
             if clean_text(item.get("market_id")) and clean_text(item.get("question"))
         }
-        live_closed_summaries, live_position_annotations = build_live_trade_summaries(raw_trades, raw_positions)
+        live_closed_summaries, live_position_annotations = build_live_trade_summaries(matching_trades, raw_positions)
         failed_activity_rows = [row for row in values(activity_rows or []) if simmer_failure_status(row)]
         open_orders = build_live_order_rows(
             open_order_rows or [],
@@ -1976,6 +2075,7 @@ def normalize_state(
         )
         raw_positions = maybe_filter_live_by_view(raw_positions, view)
         raw_trades = maybe_filter_live_by_view(raw_trades, view)
+        matching_trades = maybe_filter_live_by_view(matching_trades, view)
         live_closed_summaries = maybe_filter_live_by_view(live_closed_summaries, view)
         open_orders = maybe_filter_live_by_view(open_orders, view)
         for position in raw_positions:
@@ -2015,9 +2115,10 @@ def normalize_state(
         raw_position_source = state.get("positions")
         raw_positions = filter_by_view(raw_position_source, view)
         raw_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
+        matching_trades = raw_trades
     display_trade_source = live_closed_summaries if source == "live" else raw_trades
     trades = filter_recent_trades(display_trade_source, lookback_hours)
-    buy_history = build_buy_history(raw_trades)
+    buy_history = build_buy_history(matching_trades)
     summary = (
         summarize_live(raw_positions, filter_recent_trades(raw_trades, lookback_hours), trades)
         if source == "live"
@@ -2136,6 +2237,13 @@ def normalize_state(
         side = (trade.get("side") or "?").upper()
         stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
         pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source)
+        proceeds = live_trade_amount(trade) if source == "live" else None
+        if stake is None and proceeds is not None and pnl is not None:
+            stake = max(0.0, proceeds - pnl)
+        if entry is None and stake is not None:
+            shares = to_float(trade.get("filled_shares")) or to_float(trade.get("requested_shares"))
+            if shares and shares > 0:
+                entry = stake / shares
         question = clean_text(trade.get("question") or trade.get("market_id"))
         closed_trades.append(
             {
@@ -2148,11 +2256,18 @@ def normalize_state(
                 "entry_price": entry,
                 "exit_price": price_value(trade.get("simulated_fill_price")),
                 "pnl": pnl,
-                "final_value": stake + pnl if stake is not None and pnl is not None else None,
+                "final_value": stake + pnl if stake is not None and pnl is not None else proceeds,
                 "stake": stake,
                 "forecast": forecast,
                 "question": question,
-                "exit_reason": trade.get("exit_reason") or nested_signal(trade).get("exit_reason"),
+                "exit_reason": inferred_live_exit_reason(
+                    side,
+                    entry,
+                    price_value(trade.get("simulated_fill_price")),
+                    pnl,
+                    trade.get("exit_reason") or nested_signal(trade).get("exit_reason"),
+                ),
+                "match_mode": trade.get("match_mode"),
                 "partial_exit": bool(trade.get("partial_exit") or nested_signal(trade).get("partial_exit")),
                 "runner_after_partial_exit": bool(
                     trade.get("runner_after_partial_exit") or nested_signal(trade).get("runner_after_partial_exit")
@@ -4109,6 +4224,7 @@ INDEX_HTML = r"""<!doctype html>
       const mode = String(trade?.match_mode || "").toLowerCase();
       const labels = {
         fifo: "fifo",
+        fallback_cost_basis: "fallback_cost",
         fallback_entry_price: "fallback_entry",
         fallback_realized_hint: "fallback_realized",
         fallback_neutral: "fallback_neutral",
