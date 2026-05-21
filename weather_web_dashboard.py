@@ -71,17 +71,17 @@ LIVE_LOG_CANDIDATES = [
 
 VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
-    "old": "Старые города",
-    "new": "Новые города",
-    "all": "Все города",
-    "watchlist": "Избранные",
+    "old": "Old Cities",
+    "new": "New Cities",
+    "all": "All Cities",
+    "watchlist": "Watchlist",
 }
 
 SOURCE_ORDER = ("paper", "direct_paper", "live")
 SOURCE_LABELS = {
-    "paper": "Бумага",
+    "paper": "Paper",
     "direct_paper": "Direct Paper",
-    "live": "Лайв",
+    "live": "Live",
 }
 
 EXIT_MODE_ORDER = ("tp40", "tp40_runner")
@@ -106,18 +106,18 @@ STRATEGY_ORDER = (
 
 STRATEGY_KEYS = dict(zip("abcdefghijk", STRATEGY_ORDER))
 STRATEGY_LABELS = {
-    "baseline": "Базовая",
-    "stop20_early": "Стоп 20 Early",
-    "no_reentry_after_stop": "Без повторного входа",
-    "no_reentry_watchlist": "C + избранные",
-    "early_only": "Только early",
-    "low_risk_cities_only": "Низкий риск",
-    "no_early_stop": "Без early stop",
-    "watchlist_no_reentry": "Избранные без reentry",
-    "watchlist_early_central": "Избранные early",
-    "watchlist_no_early_stop": "Избранные без early stop",
-    "celsius_exact_direct": "C точные",
-    "compare": "Сравнить все",
+    "baseline": "Baseline",
+    "stop20_early": "Stop20 Early",
+    "no_reentry_after_stop": "No Reentry",
+    "no_reentry_watchlist": "C + Watchlist",
+    "early_only": "Early Only",
+    "low_risk_cities_only": "Low Risk",
+    "no_early_stop": "No Early Stop",
+    "watchlist_no_reentry": "WL No Re",
+    "watchlist_early_central": "WL Early",
+    "watchlist_no_early_stop": "WL No Estop",
+    "celsius_exact_direct": "C Exact",
+    "compare": "Compare All",
 }
 
 OLD_CITY_ALIASES = {
@@ -1513,6 +1513,7 @@ def live_leg_from_trade(trade: dict) -> dict:
         "pnl": pnl,
         "final_value": (stake + pnl) if stake is not None else live_trade_amount(trade),
         "exit_reason": trade_exit_reason(trade),
+        "match_mode": trade.get("match_mode"),
     }
 
 
@@ -1621,15 +1622,25 @@ def build_live_trade_summaries(
             if lot["remaining_shares"] <= 1e-9:
                 lots[key].popleft()
 
+        match_mode = "fifo"
         if matched_cost <= 0 and shares > 0:
             fallback_entry = trade_price(trade, ("entry_price", "avg_cost", "avg_price", "buy_price"))
             if fallback_entry is not None:
                 matched_cost = shares * fallback_entry
                 matched_shares = shares
+                match_mode = "fallback_entry_price"
             else:
                 # If the matching buy is outside the fetched activity window,
-                # avoid fake green PnL: proceeds alone are not profit.
-                matched_cost = proceeds
+                # prefer Simmer's explicit realized PnL if available.
+                realized_hint = to_float(trade.get("realized_pnl"))
+                if realized_hint is not None:
+                    matched_cost = max(0.0, proceeds - realized_hint)
+                    match_mode = "fallback_realized_hint"
+                else:
+                    # Last-resort neutral fallback: treat proceeds as cost to
+                    # avoid fake green PnL when we cannot reconstruct entry.
+                    matched_cost = proceeds
+                    match_mode = "fallback_neutral"
                 matched_shares = shares
 
         avg_entry = matched_cost / matched_shares if matched_shares > 0 and matched_cost > 0 else None
@@ -1663,6 +1674,7 @@ def build_live_trade_summaries(
             "partial_exit": partial_exit,
             "runner_after_partial_exit": runner_close,
             "exit_reason": "tp40_half" if partial_exit else inferred_reason,
+            "match_mode": match_mode,
             "_live_grouped": True,
         }
         if partial_exit:
@@ -1763,12 +1775,23 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         (
             "original_shares",
             "originalShares",
+            "initial_shares",
+            "initialShares",
+            "initial_quantity",
+            "initialQuantity",
+            "order_shares",
+            "orderShares",
             "original_size",
             "originalSize",
+            "order_size_shares",
+            "orderSizeShares",
             "shares",
+            "size_shares",
+            "sizeShares",
             "size",
             "quantity",
             "qty",
+            "contracts",
             "order_size",
             "orderSize",
         ),
@@ -1805,9 +1828,15 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         filled = max(0.0, shares - remaining)
     if remaining is None and shares is not None and filled is not None:
         remaining = max(0.0, shares - filled)
+    if (shares is None or shares <= 0) and remaining is not None and remaining > 0:
+        shares = remaining
     amount = first_float(order, ("amount", "amount_usd", "cost", "cost_usd", "value", "notional"))
     if amount is None and price is not None and shares is not None:
         amount = price * shares
+    if (shares is None or shares <= 0) and amount is not None and price is not None and price > 0:
+        shares = amount / price
+    if remaining is None and shares is not None and shares > 0:
+        remaining = max(0.0, shares - (filled or 0.0))
     status = clean_text(order.get("status") or order.get("order_status") or order.get("orderStatus") or "open").lower()
     if failure_status:
         status = failure_status
@@ -3747,11 +3776,11 @@ INDEX_HTML = r"""<!doctype html>
         <div><strong>Weather Bot</strong><span>Web Control</span></div>
       </div>
       <nav class="nav">
-        <div class="nav-item active" data-mode="paper" title="Бумажный режим"><span class="nav-icon">▣</span>Бумага</div>
-        <div class="nav-item" data-mode="direct_paper" title="Бумага по Polymarket orderbook"><span class="nav-icon">◇</span>Direct Paper</div>
-        <div class="nav-item" data-mode="charts" title="Графики стратегий"><span class="nav-icon">▥</span>Графики</div>
-        <div class="nav-item" data-mode="live" title="Лайв сделки"><span class="nav-icon">●</span>Лайв</div>
-        <div class="nav-item" data-mode="live_logs" title="Логи live-бота"><span class="nav-icon">⌁</span>Логи</div>
+        <div class="nav-item active" data-mode="paper" title="Paper mode"><span class="nav-icon">▣</span>Paper</div>
+        <div class="nav-item" data-mode="direct_paper" title="Direct Polymarket paper mode"><span class="nav-icon">◇</span>Direct Paper</div>
+        <div class="nav-item" data-mode="charts" title="Strategy graphs"><span class="nav-icon">▥</span>Graphs</div>
+        <div class="nav-item" data-mode="live" title="Live trading ledger"><span class="nav-icon">●</span>Live</div>
+        <div class="nav-item" data-mode="live_logs" title="Live terminal logs"><span class="nav-icon">⌁</span>Live Logs</div>
       </nav>
       <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
     </aside>
@@ -3795,24 +3824,24 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="toolbar">
-        <div class="control city-control" id="view-buttons"><span class="selectlike"><span class="control-icon">▥</span>Города</span></div>
-        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike"><span class="control-icon">⌁</span>Стратегии</span></div>
-        <div class="control exit-control" id="exit-buttons"><span class="selectlike"><span class="control-icon">◷</span>Режим выхода</span></div>
+        <div class="control city-control" id="view-buttons"><span class="selectlike"><span class="control-icon">▥</span>Cities</span></div>
+        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike"><span class="control-icon">⌁</span>Strategies</span></div>
+        <div class="control exit-control" id="exit-buttons"><span class="selectlike"><span class="control-icon">◷</span>Market Regime</span></div>
         <div class="control stake-control">
-          <span class="selectlike"><span class="control-icon">$</span>Симулятор ставки</span>
+          <span class="selectlike"><span class="control-icon">$</span>Stake Simulator</span>
           <div class="stake-sim" title="Empty = real historical stake. Fill values to recalculate PnL as if every YES/NO trade used that stake.">
             <label>YES $<input id="yes-stake" data-stake-side="yes" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
             <label>NO $<input id="no-stake" data-stake-side="no" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
           </div>
-          <div class="stake-total-card"><span>Всего</span><strong id="stake-total">real</strong></div>
+          <div class="stake-total-card"><span>Total stake</span><strong id="stake-total">real</strong></div>
         </div>
         <div class="control search-control">
-          <span class="selectlike"><span class="control-icon">⌕</span>Поиск / сравнение</span>
+          <span class="selectlike"><span class="control-icon">⌕</span>Search / Compare</span>
           <div class="search-wrap">
             <span class="action-icon">⌕</span>
-            <input class="search" id="search" placeholder="Поиск рынка/города..." />
+            <input class="search" id="search" placeholder="Search market/city..." />
           </div>
-          <button id="compare-btn" data-strategy="compare">⌘ Сравнить</button>
+          <button id="compare-btn" data-strategy="compare">⌘ Compare</button>
         </div>
       </section>
 
@@ -3855,7 +3884,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Закрытые сделки</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Время</th><th>Сторона</th><th>Режим</th><th class="runner-col">Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Город</th><th>Рынок</th><th>Прогноз</th></tr></thead>
+                <thead><tr><th>Время</th><th>Сторона</th><th>Режим</th><th class="runner-col">Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Город</th><th>Рынок</th><th>Прогноз</th><th>Причина</th><th>Расчет</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -3887,7 +3916,7 @@ INDEX_HTML = r"""<!doctype html>
       <section class="charts-view">
         <div class="panel">
           <div class="panel-head">
-            <h2>Графики стратегий</h2>
+            <h2>Strategy Metric Plots</h2>
             <span class="hint" id="charts-subtitle"></span>
           </div>
           <div class="charts-grid">
@@ -3925,7 +3954,7 @@ INDEX_HTML = r"""<!doctype html>
       <section class="live-logs-view">
         <div class="live-logs-terminal">
           <div class="live-log-head">
-          <span>Лайв-логи Weather Bot</span>
+          <span>Weather Bot Live Logs</span>
             <span class="hint" id="live-log-status">tail</span>
           </div>
           <span class="live-log-path" id="live-log-path">live_bot.log</span>
@@ -3988,7 +4017,7 @@ INDEX_HTML = r"""<!doctype html>
       if (state.source === "live") return " · реальные fills";
       return state.yesStake || state.noStake ? ` · сим YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
     };
-    const sourceLabel = () => state.source === "live" ? "Лайв" : state.source === "direct_paper" ? "Direct Paper" : "Бумага";
+    const sourceLabel = () => state.source === "live" ? "Live" : state.source === "direct_paper" ? "Direct Paper" : "Paper";
     const CITY_FLAGS = {
       "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
       "Austin": "🇺🇸", "Denver": "🇺🇸", "Houston": "🇺🇸", "Los Angeles": "🇺🇸", "San Francisco": "🇺🇸",
@@ -4063,6 +4092,28 @@ INDEX_HTML = r"""<!doctype html>
       if (reason === "edge_invalidated") return `<span class="mode-chip stop">Edge сломан</span>`;
       if (reason === "max_age_exit") return `<span class="mode-chip">Срок вышел</span>`;
       return reason ? `<span class="mode-chip">${esc(reason)}</span>` : `<span class="neutral">-</span>`;
+    }
+    function exitReasonLabel(trade) {
+      const reason = String(trade?.exit_reason || "").toLowerCase();
+      const labels = {
+        stop_loss: "stop_loss",
+        take_profit: "take_profit",
+        edge_invalidated: "edge_invalidated",
+        market_settlement: "settlement",
+        max_age_exit: "max_age",
+        tp40_half: "tp40_half",
+      };
+      return labels[reason] || (reason || "-");
+    }
+    function matchModeLabel(trade) {
+      const mode = String(trade?.match_mode || "").toLowerCase();
+      const labels = {
+        fifo: "fifo",
+        fallback_entry_price: "fallback_entry",
+        fallback_realized_hint: "fallback_realized",
+        fallback_neutral: "fallback_neutral",
+      };
+      return labels[mode] || (mode || "fifo");
     }
 
     function runnerLegLine(label, leg, missingText) {
@@ -4535,9 +4586,11 @@ INDEX_HTML = r"""<!doctype html>
           <td class="city-col">${cityChip(t.city)}</td>
           <td class="market">${marketLink(t)}${runnerBreakdown(t)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
+          <td><span class="hint">${esc(exitReasonLabel(t))}</span></td>
+          <td><span class="hint">${esc(matchModeLabel(t))}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="12"><div class="empty">Нет закрытых сделок для этого фильтра.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="14"><div class="empty">Нет закрытых сделок для этого фильтра.</div></td></tr>`);
     }
 
     function renderCities(rows) {
@@ -4629,9 +4682,11 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num ${cls(t.pnl)}">${money(t.pnl)}</td>
           <td class="num ${cls(t.final_value)}">${money(t.final_value)}</td>
           <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${marketLink(t)}</td>
+          <td>${esc(exitReasonLabel(t))}</td>
+          <td>${esc(matchModeLabel(t))}</td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="11" class="terminal-market">Нет закрытых сделок для этого фильтра.</td></tr>`;
+      }).join("") : `<tr><td colspan="13" class="terminal-market">Нет закрытых сделок для этого фильтра.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -4666,7 +4721,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">ПОСЛЕДНИЕ 20 ЗАКРЫТЫХ / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th></tr></thead>
+                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th><th>Причина</th><th>Расчет</th></tr></thead>
                 <tbody>${terminalClosedRows(left)}</tbody>
               </table>
             </div>
@@ -4675,7 +4730,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="terminal-title">СЛЕДУЮЩИЕ 20</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th></tr></thead>
+                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th><th>Причина</th><th>Расчет</th></tr></thead>
                 <tbody>${terminalClosedRows(right)}</tbody>
               </table>
             </div>
