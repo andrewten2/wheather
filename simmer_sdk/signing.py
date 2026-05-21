@@ -137,10 +137,11 @@ def build_and_sign_order(
     if order_type in ("FAK", "FOK"):
         maker_raw = _to_token_decimals(_round_normal(maker_raw / 1e6, 2))
 
-    # Check minimum order size
+    # Keep the exchange-size guard for opening BUY orders, but allow SELL
+    # orders below 5 shares so bots can close small leftovers/partial exits.
     shares_raw = taker_raw if side == "BUY" else maker_raw
     effective_shares = shares_raw / POLYMARKET_DECIMAL_FACTOR
-    if effective_shares < MIN_ORDER_SIZE_SHARES:
+    if side == "BUY" and effective_shares < MIN_ORDER_SIZE_SHARES:
         raise ValueError(
             f"Order too small: {effective_shares:.2f} shares after rounding "
             f"is below minimum ({MIN_ORDER_SIZE_SHARES})"

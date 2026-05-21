@@ -4855,7 +4855,7 @@ INDEX_HTML = r"""<!doctype html>
         const res = await fetch("/api/live/close", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({market_id: marketId, side, shares}),
+          body: JSON.stringify({market_id: marketId, side}),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.success) {
@@ -5352,10 +5352,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 status=404,
             )
 
-        shares = to_float(payload.get("shares")) or to_float(position.get("shares")) or 0.0
         held_shares = to_float(position.get("shares")) or 0.0
-        if held_shares > 0:
-            shares = min(shares, held_shares)
+        shares = held_shares
         if shares <= 0:
             return self.send_json({"success": False, "error": "position has no shares to close"}, status=400)
 

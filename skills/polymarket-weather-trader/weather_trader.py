@@ -3699,11 +3699,6 @@ def check_exit_opportunities(
                     continue
             runner_after_partial_exit = bool(partial_exit or hold_runner_to_settlement)
             print(f"  📤 {question}...")
-            exit_label = "take_profit_partial" if partial_exit else exit_reason
-            print(
-                f"     {position_side.upper()} entry ${entry_price:.2f} -> current ${current_price:.2f} "
-                f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_label}"
-            )
 
             # Check safeguards before selling
             if use_safeguards and execution_mode != ExecutionMode.PAPER and exit_reason != "market_settlement":
@@ -3737,8 +3732,33 @@ def check_exit_opportunities(
                 else:
                     shares_to_sell = shares
 
+            if (
+                partial_exit
+                and execution_mode != ExecutionMode.PAPER
+                and shares_to_sell < MIN_SHARES_PER_ORDER
+            ):
+                if shares >= MIN_SHARES_PER_ORDER:
+                    print(
+                        f"     ℹ️  Partial TP size {shares_to_sell:.2f} shares is below "
+                        f"minimum {MIN_SHARES_PER_ORDER:.0f}; selling full position instead"
+                    )
+                    partial_exit = False
+                    runner_after_partial_exit = False
+                    shares_to_sell = shares
+                else:
+                    print(
+                        f"     ⏭️  Skipped: sell size {shares_to_sell:.2f} shares below "
+                        f"minimum {MIN_SHARES_PER_ORDER:.0f}"
+                    )
+                    continue
+
             tag = "PAPER" if execution_mode == ExecutionMode.PAPER else ("SIMULATED" if dry_run else "LIVE")
             side_label = position_side.upper()
+            exit_label = "take_profit_partial" if partial_exit else exit_reason
+            print(
+                f"     {position_side.upper()} entry ${entry_price:.2f} -> current ${current_price:.2f} "
+                f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_label}"
+            )
             print(f"     Selling {side_label} {shares_to_sell:.1f} shares ({tag})...")
             result = execute_sell(
                 market_id,
