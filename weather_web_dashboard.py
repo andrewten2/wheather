@@ -1722,9 +1722,10 @@ def build_live_trade_summaries(
                 match_mode = "fallback_entry_price"
             else:
                 # If the matching buy is outside the fetched activity window,
-                # prefer Simmer's explicit realized PnL if available.
+                # only trust an explicit realized PnL when it looks like PnL,
+                # not the full SELL proceeds reported by some activity feeds.
                 realized_hint = to_float(trade.get("realized_pnl"))
-                if realized_hint is not None:
+                if realized_hint is not None and abs(realized_hint) < max(0.01, proceeds * 0.95):
                     matched_cost = max(0.0, proceeds - realized_hint)
                     match_mode = "fallback_realized_hint"
                 else:
@@ -2057,7 +2058,17 @@ def normalize_state(
             enrich_live_sell_from_context(trade, local_by_key, exit_checks_by_key)
             for trade in raw_trades
         ]
-        matching_trades = raw_trades
+        remote_buy_keys = {
+            trade_market_key(trade)
+            for trade in raw_trades
+            if trade.get("action") == "buy"
+        }
+        local_buy_context = [
+            trade
+            for trade in local_live_trades
+            if trade.get("action") == "buy" and trade_market_key(trade) not in remote_buy_keys
+        ]
+        matching_trades = [*local_buy_context, *raw_trades]
         question_lookup = {
             clean_text(item.get("market_id")): clean_text(item.get("question"))
             for item in [*raw_positions, *matching_trades]
@@ -3932,9 +3943,9 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="metrics">
-        <div class="metric-card"><div><div class="label">Общий PnL</div><div class="value" id="m-total">...</div></div><canvas class="mini-spark" id="spark-total"></canvas></div>
-        <div class="metric-card"><div><div class="label">Закрытый PnL</div><div class="value" id="m-realized">...</div></div><canvas class="mini-spark" id="spark-realized"></canvas></div>
-        <div class="metric-card"><div><div class="label">Открытый PnL</div><div class="value" id="m-unrealized">...</div></div><canvas class="mini-spark" id="spark-unrealized"></canvas></div>
+        <div class="metric-card"><div><div class="label">Total PnL</div><div class="value" id="m-total">...</div></div><canvas class="mini-spark" id="spark-total"></canvas></div>
+        <div class="metric-card"><div><div class="label">Realized PnL</div><div class="value" id="m-realized">...</div></div><canvas class="mini-spark" id="spark-realized"></canvas></div>
+        <div class="metric-card"><div><div class="label">Unrealized PnL</div><div class="value" id="m-unrealized">...</div></div><canvas class="mini-spark" id="spark-unrealized"></canvas></div>
         <div class="metric-card"><div><div class="label">Winrate</div><div class="value neutral" id="m-winrate">...</div></div><canvas class="mini-spark" id="spark-winrate"></canvas></div>
       </section>
 
@@ -3963,43 +3974,43 @@ INDEX_HTML = r"""<!doctype html>
       <section class="grid standard-view">
         <aside class="stack">
           <div class="panel">
-            <div class="panel-head"><h2>Пульс портфеля</h2><span class="hint" id="lookback-label">24h closed</span></div>
+            <div class="panel-head"><h2>Portfolio Pulse</h2><span class="hint" id="lookback-label">24h closed</span></div>
             <div class="stats-list" id="stats"></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Кривая PnL</h2><span class="hint">Закрытые сделки</span></div>
+            <div class="panel-head"><h2>Realized Curve</h2><span class="hint">Closed trades</span></div>
             <div class="chart-box"><canvas id="curve"></canvas></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Топ городов</h2><span class="hint">Закрытый PnL</span></div>
+            <div class="panel-head"><h2>Top Cities</h2><span class="hint">Realized PnL</span></div>
             <div id="cities"></div>
           </div>
         </aside>
 
         <section class="stack">
           <div class="panel orders-panel" id="orders-panel">
-	            <div class="panel-head"><h2>Открытые заявки на покупку</h2><span class="hint" id="orders-count">...</span></div>
+	            <div class="panel-head"><h2>Open Orders / Bid Fills</h2><span class="hint" id="orders-count">...</span></div>
 	            <div class="table-wrap">
 	              <table>
-	                <thead><tr><th>Время</th><th>Сторона</th><th>Статус</th><th class="num">Bid</th><th class="num">Ставка</th><th class="num">Shares</th><th class="num">Заполнено</th><th class="num">Осталось</th><th class="num">Fill</th><th>Город</th><th>Рынок</th></tr></thead>
+	                <thead><tr><th>Placed</th><th>Side</th><th>Status</th><th class="num">Bid</th><th class="num">Stake</th><th class="num">Shares</th><th class="num">Filled</th><th class="num">Left</th><th class="num">Fill</th><th>City</th><th>Market</th></tr></thead>
 	                <tbody id="orders"></tbody>
 	              </table>
 	            </div>
 	          </div>
           <div class="panel">
-            <div class="panel-head"><h2>Открытые позиции</h2><span class="hint" id="open-count">...</span></div>
+            <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Сторона</th><th>Режим</th><th class="runner-col">Тип</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Сейчас</th><th class="num">PnL</th><th class="num">Итог</th><th class="num">PnL %</th><th>Время</th><th>Город</th><th>Рынок</th><th>Прогноз</th><th>Действие</th></tr></thead>
+                <thead><tr><th>Side</th><th>Regime</th><th class="runner-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th><th>Action</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Закрытые сделки</h2><span class="hint" id="closed-count">...</span></div>
+            <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Время</th><th>Сторона</th><th>Режим</th><th class="runner-col">Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Город</th><th>Рынок</th><th>Прогноз</th><th>Причина</th><th>Расчет</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>City</th><th>Market</th><th>Forecast</th><th>Reason</th><th>Calc</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -4008,15 +4019,15 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="panel compare-view">
-        <div class="panel-head"><h2>Сравнение стратегий</h2><span class="hint" id="compare-subtitle"></span></div>
+        <div class="panel-head"><h2>Strategy Compare</h2><span class="hint" id="compare-subtitle"></span></div>
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th class="sortable" data-compare-sort="key">Клавиша</th>
-              <th class="sortable" data-compare-sort="label">Стратегия</th>
-              <th class="num sortable" data-compare-sort="open_positions">Открыто</th>
-              <th class="num sortable" data-compare-sort="buys">Покупки</th>
-              <th class="num sortable" data-compare-sort="sells">Продажи</th>
+              <th class="sortable" data-compare-sort="key">Key</th>
+              <th class="sortable" data-compare-sort="label">Strategy</th>
+              <th class="num sortable" data-compare-sort="open_positions">Open</th>
+              <th class="num sortable" data-compare-sort="buys">Buys</th>
+              <th class="num sortable" data-compare-sort="sells">Sells</th>
               <th class="num sortable" data-compare-sort="total">Total</th>
               <th class="num sortable" data-compare-sort="realized">Realized</th>
               <th class="num sortable" data-compare-sort="unrealized">Unrealized</th>
@@ -4038,17 +4049,17 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel strategy-chart">
               <div class="panel-head"><h2>Realized PnL</h2><span class="hint" id="chart-realized-leader"></span></div>
               <canvas id="chart-realized"></canvas>
-              <div class="chart-note">PnL закрытых сделок по тестируемым стратегиям.</div>
+              <div class="chart-note">Closed-trade PnL across tested strategies.</div>
             </div>
             <div class="panel strategy-chart">
               <div class="panel-head"><h2>Unrealized PnL</h2><span class="hint" id="chart-unrealized-leader"></span></div>
               <canvas id="chart-unrealized"></canvas>
-              <div class="chart-note">Mark-to-market PnL открытых позиций.</div>
+              <div class="chart-note">Mark-to-market PnL for open positions.</div>
             </div>
             <div class="panel strategy-chart">
               <div class="panel-head"><h2>Winrate</h2><span class="hint" id="chart-winrate-leader"></span></div>
               <canvas id="chart-winrate"></canvas>
-              <div class="chart-note">Доля прибыльных закрытых сделок среди продаж.</div>
+              <div class="chart-note">Share of profitable closed sells.</div>
             </div>
           </div>
         </div>
@@ -4073,13 +4084,13 @@ INDEX_HTML = r"""<!doctype html>
             <span class="hint" id="live-log-status">tail</span>
           </div>
           <span class="live-log-path" id="live-log-path">live_bot.log</span>
-          <pre class="live-log-lines" id="live-log-lines">Загружаю live log...</pre>
+          <pre class="live-log-lines" id="live-log-lines">Loading live log...</pre>
         </div>
       </section>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Горячие клавиши: 1-4 города · 5 TP40 · 6 runner · a-k стратегии · x сравнение · t период · m терминал/веб · d тема · p бумага · l лайв · o логи</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-k strategy · x compare · t period · m terminal/web · d theme · p paper · l live · o logs</span>
       </div>
     </main>
   </div>
@@ -4115,10 +4126,10 @@ INDEX_HTML = r"""<!doctype html>
     const lookbackDays = () => Number(state.lookback) > 0 && Number(state.lookback) % 24 === 0 ? Number(state.lookback) / 24 : null;
     const lookbackLabel = () => {
       const days = lookbackDays();
-      if (Number(state.lookback) === 0) return "вся история";
-      if (Number(state.lookback) === 24) return "24ч закрытые";
-      if (days) return `${days}д закрытые`;
-      return `${state.lookback}ч закрытые`;
+      if (Number(state.lookback) === 0) return "all history";
+      if (Number(state.lookback) === 24) return "24h closed";
+      if (days) return `${days}d closed`;
+      return `${state.lookback}h closed`;
     };
     const lookbackShort = () => {
       const days = lookbackDays();
@@ -4129,8 +4140,8 @@ INDEX_HTML = r"""<!doctype html>
     };
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
     const stakeLabel = () => {
-      if (state.source === "live") return " · реальные fills";
-      return state.yesStake || state.noStake ? ` · сим YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
+      if (state.source === "live") return " · real fills";
+      return state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
     };
     const sourceLabel = () => state.source === "live" ? "Live" : state.source === "direct_paper" ? "Direct Paper" : "Paper";
     const CITY_FLAGS = {
@@ -4161,7 +4172,7 @@ INDEX_HTML = r"""<!doctype html>
       if (state.source !== "live" || !position?.market_id || !Number.isFinite(shares) || shares <= 0) {
         return `<span class="neutral">-</span>`;
       }
-      return `<button class="close-position-btn" data-close-market="${esc(position.market_id)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Закрыть</button>`;
+      return `<button class="close-position-btn" data-close-market="${esc(position.market_id)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Close</button>`;
     }
 	    const orderStatusClass = status => {
 	      const text = String(status || "").toLowerCase();
@@ -4173,17 +4184,17 @@ INDEX_HTML = r"""<!doctype html>
 	    const orderStatusChip = order => {
 	      const raw = String(order?.status || (order?.is_pending ? "pending" : "filled")).replace(/_/g, " ").toLowerCase();
 	      const labels = {
-	        open: "ОТКРЫТ",
-	        pending: "ОЖИДАЕТ",
-	        live: "ОТКРЫТ",
-	        active: "ОТКРЫТ",
-	        partial: "ЧАСТИЧНО",
-	        filled: "ИСПОЛНЕН",
-	        matched: "ИСПОЛНЕН",
-	        canceled: "ОТМЕНЕН",
-	        cancelled: "ОТМЕНЕН",
-	        failed: "ОШИБКА",
-	        rejected: "ОТКЛОНЕН",
+	        open: "OPEN",
+	        pending: "PENDING",
+	        live: "OPEN",
+	        active: "OPEN",
+	        partial: "PARTIAL",
+	        filled: "FILLED",
+	        matched: "FILLED",
+	        canceled: "CANCELED",
+	        cancelled: "CANCELED",
+	        failed: "FAILED",
+	        rejected: "REJECTED",
 	      };
 	      return `<span class="order-status ${orderStatusClass(raw)}">${esc(labels[raw] || raw.toUpperCase())}</span>`;
 	    };
@@ -4195,17 +4206,17 @@ INDEX_HTML = r"""<!doctype html>
     function openModeChip(position) {
       if (!isRunnerMode()) return `<span class="neutral">-</span>`;
       if (position.runner) return `<span class="mode-chip runner">Runner</span>`;
-      return `<span class="mode-chip partial">До TP40</span>`;
+      return `<span class="mode-chip partial">Pre-TP40</span>`;
     }
     function closedModeChip(trade) {
       if (trade.runner_legs && !trade.partial_exit) return `<span class="mode-chip combo">TP40 + Runner</span>`;
-      if (trade.partial_exit) return `<span class="mode-chip partial">TP40 половина</span>`;
+      if (trade.partial_exit) return `<span class="mode-chip partial">TP40 half</span>`;
       const reason = String(trade.exit_reason || "").toLowerCase();
-      if (reason === "market_settlement") return `<span class="mode-chip settlement">Расчет</span>`;
+      if (reason === "market_settlement") return `<span class="mode-chip settlement">Settlement</span>`;
       if (reason === "stop_loss") return `<span class="mode-chip stop">Stop loss</span>`;
       if (reason === "take_profit") return `<span class="mode-chip runner">TP</span>`;
-      if (reason === "edge_invalidated") return `<span class="mode-chip stop">Edge сломан</span>`;
-      if (reason === "max_age_exit") return `<span class="mode-chip">Срок вышел</span>`;
+      if (reason === "edge_invalidated") return `<span class="mode-chip stop">Edge invalid</span>`;
+      if (reason === "max_age_exit") return `<span class="mode-chip">Max age</span>`;
       return reason ? `<span class="mode-chip">${esc(reason)}</span>` : `<span class="neutral">-</span>`;
     }
     function exitReasonLabel(trade) {
@@ -4608,14 +4619,14 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderStats(s) {
       const rows = [
-        ["↱", "Открытые", s.open_positions],
-        ["↗", "Покупки", s.buys],
-        ["↘", "Продажи", s.sells],
-        ["✣", "Плюсы", s.wins],
-        ["✕", "Минусы", s.losses],
+        ["↱", "Open Trades", s.open_positions],
+        ["↗", "Buys", s.buys],
+        ["↘", "Sells", s.sells],
+        ["✣", "Wins", s.wins],
+        ["✕", "Losses", s.losses],
         ["◎", "Winrate", `${s.winrate.toFixed(1)}%`],
-        ["⌘", "Экспозиция", money(s.exposure)],
-        ["◷", "Старые цены", s.stale],
+        ["⌘", "Exposure", money(s.exposure)],
+        ["◷", "Stale Prices", s.stale],
       ];
       setHTML("stats", rows.map(([ic, k, v]) => `<div class="stat"><span><span class="stat-icon">${esc(ic)}</span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join(""));
     }
@@ -4651,7 +4662,7 @@ INDEX_HTML = r"""<!doctype html>
 	          <td class="city-col">${cityChip(o.city)}</td>
 	          <td class="market">${marketLink(o)}</td>
 	        </tr>
-	      `).join("") : `<tr><td colspan="11"><div class="empty">Нет открытых заявок для этого фильтра.</div></td></tr>`);
+	      `).join("") : `<tr><td colspan="11"><div class="empty">No open orders for this filter.</div></td></tr>`);
 	    }
 
     function renderPositions(rows) {
@@ -4675,7 +4686,7 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
           <td>${closePositionButton(p)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="14"><div class="empty">Нет открытых позиций для этого фильтра.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="14"><div class="empty">No open positions for this filter.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -4706,13 +4717,13 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="hint">${esc(matchModeLabel(t))}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="14"><div class="empty">Нет закрытых сделок для этого фильтра.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="14"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
       setHTML("cities", rows.length ? rows.map(c => `
-        <div class="stat"><span>${cityName(c.city)} · ${c.sells} продаж</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
-      `).join("") : `<div class="empty">Пока нет PnL по городам.</div>`);
+        <div class="stat"><span>${cityName(c.city)} · ${c.sells} sells</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
+      `).join("") : `<div class="empty">No city PnL yet.</div>`);
     }
 
     function terminalStatusDot(value) {
@@ -4734,16 +4745,16 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderTerminalStats(s) {
       const rows = [
-        ["▣", "Открытые", s.open_positions],
-        ["↔", "Всего сделок", s.buys + s.sells],
-        ["↗", "Покупки", s.buys],
-        ["↘", "Продажи", s.sells],
-        ["✣", "Плюсы", s.wins],
-        ["◇", "Минусы", s.losses],
+        ["▣", "Open Trades", s.open_positions],
+        ["↔", "Total Trades", s.buys + s.sells],
+        ["↗", "Buys", s.buys],
+        ["↘", "Sells", s.sells],
+        ["✣", "Wins", s.wins],
+        ["◇", "Losses", s.losses],
         ["⌁", "Winrate", `${s.winrate.toFixed(1)}%`],
-        ["◆", "Экспозиция", money(s.exposure)],
-        ["▣", "Закрытый PnL", money(s.realized)],
-        ["●", "Открытый PnL", money(s.unrealized)],
+        ["◆", "Exposure", money(s.exposure)],
+        ["▣", "Realized PnL", money(s.realized)],
+        ["●", "Open PnL", money(s.unrealized)],
       ];
       return `
         <div class="terminal-stats">
@@ -4755,8 +4766,8 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           `).join("")}
         </div>
-        <div class="terminal-total"><span>ИТОГО PnL</span><strong class="${cls(s.total)}">${money(s.total)}</strong></div>
-        <div class="terminal-note">старые цены: ${s.stale}</div>
+        <div class="terminal-total"><span>TOTAL PnL</span><strong class="${cls(s.total)}">${money(s.total)}</strong></div>
+        <div class="terminal-note">stale prices: ${s.stale}</div>
       `;
     }
 
@@ -4779,7 +4790,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${marketLink(p)}</td>
           <td>${closePositionButton(p)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="13" class="terminal-market">Нет открытых позиций для этого фильтра.</td></tr>`;
+      `).join("") : `<tr><td colspan="13" class="terminal-market">No open positions for this filter.</td></tr>`;
     }
 
     function terminalClosedRows(rows) {
@@ -4802,7 +4813,7 @@ INDEX_HTML = r"""<!doctype html>
           <td>${esc(matchModeLabel(t))}</td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="13" class="terminal-market">Нет закрытых сделок для этого фильтра.</td></tr>`;
+      }).join("") : `<tr><td colspan="13" class="terminal-market">No closed trades for this filter.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -4819,14 +4830,14 @@ INDEX_HTML = r"""<!doctype html>
       setHTML("terminal-body", `
         <div class="terminal-main">
           <div class="terminal-panel accent-green">
-            <div class="terminal-title">PnL / СТАТИСТИКА</div>
+            <div class="terminal-title">PnL / STATS</div>
             ${renderTerminalStats(s)}
           </div>
           <div class="terminal-panel">
-            <div class="terminal-title">ОТКРЫТЫЕ ПОЗИЦИИ (${data.positions.length})</div>
+            <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Сторона</th><th>Режим</th><th>Тип</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Сейчас</th><th class="num">PnL</th><th class="num">Итог</th><th class="num">PnL%</th><th>Время</th><th>Рынок</th><th>Действие</th></tr></thead>
+                <thead><tr><th></th><th>Side</th><th>Regime</th><th>Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th><th>Action</th></tr></thead>
                 <tbody>${terminalOpenRows(data.positions)}</tbody>
               </table>
             </div>
@@ -4834,19 +4845,19 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="terminal-closed">
           <div class="terminal-panel">
-            <div class="terminal-title">ПОСЛЕДНИЕ 20 ЗАКРЫТЫХ / ${lookbackShort().toUpperCase()}</div>
+            <div class="terminal-title">LATEST 20 CLOSED / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th><th>Причина</th><th>Расчет</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th>Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th><th>Reason</th><th>Calc</th></tr></thead>
                 <tbody>${terminalClosedRows(left)}</tbody>
               </table>
             </div>
           </div>
           <div class="terminal-panel">
-            <div class="terminal-title">СЛЕДУЮЩИЕ 20</div>
+            <div class="terminal-title">NEXT 20</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th><th>Причина</th><th>Расчет</th></tr></thead>
+                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th>Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th><th>Reason</th><th>Calc</th></tr></thead>
                 <tbody>${terminalClosedRows(right)}</tbody>
               </table>
             </div>
