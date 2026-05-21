@@ -2303,12 +2303,12 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
     if best_ask is None:
         return None, book, "missing_best_ask"
 
-    # Rule:
-    # - spread <= 1c: place at bid (do not overpay)
-    # - spread >= 2c: place at bid + 1c (capped by ask)
-    # If spread is between 1c and 2c, stay conservative and use bid.
+    # Rule (tick-based to avoid float precision drift):
+    # - spread <= 1 tick: place at bid (do not overpay)
+    # - spread >= 2 ticks: place at bid + 1 tick (capped by ask)
     spread = float(best_ask) - float(best_bid)
-    if spread >= 0.02:
+    spread_ticks = int(round(spread / MIN_TICK_SIZE))
+    if spread_ticks >= 2:
         improved_price = min(float(best_ask), float(best_bid) + 0.01)
         return round(max(0.001, min(0.999, improved_price)), 4), book, "wide_spread_bid_plus_1c"
 

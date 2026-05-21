@@ -71,17 +71,17 @@ LIVE_LOG_CANDIDATES = [
 
 VIEW_ORDER = ("old", "new", "all", "watchlist")
 VIEW_LABELS = {
-    "old": "Old Cities",
-    "new": "New Cities",
-    "all": "All Cities",
-    "watchlist": "Watchlist",
+    "old": "Старые города",
+    "new": "Новые города",
+    "all": "Все города",
+    "watchlist": "Избранные",
 }
 
 SOURCE_ORDER = ("paper", "direct_paper", "live")
 SOURCE_LABELS = {
-    "paper": "Paper",
+    "paper": "Бумага",
     "direct_paper": "Direct Paper",
-    "live": "Live",
+    "live": "Лайв",
 }
 
 EXIT_MODE_ORDER = ("tp40", "tp40_runner")
@@ -106,18 +106,18 @@ STRATEGY_ORDER = (
 
 STRATEGY_KEYS = dict(zip("abcdefghijk", STRATEGY_ORDER))
 STRATEGY_LABELS = {
-    "baseline": "Baseline",
-    "stop20_early": "Stop20 Early",
-    "no_reentry_after_stop": "No Reentry",
-    "no_reentry_watchlist": "C + Watchlist",
-    "early_only": "Early Only",
-    "low_risk_cities_only": "Low Risk",
-    "no_early_stop": "No Early Stop",
-    "watchlist_no_reentry": "WL No Re",
-    "watchlist_early_central": "WL Early",
-    "watchlist_no_early_stop": "WL No Estop",
-    "celsius_exact_direct": "C Exact",
-    "compare": "Compare All",
+    "baseline": "Базовая",
+    "stop20_early": "Стоп 20 Early",
+    "no_reentry_after_stop": "Без повторного входа",
+    "no_reentry_watchlist": "C + избранные",
+    "early_only": "Только early",
+    "low_risk_cities_only": "Низкий риск",
+    "no_early_stop": "Без early stop",
+    "watchlist_no_reentry": "Избранные без reentry",
+    "watchlist_early_central": "Избранные early",
+    "watchlist_no_early_stop": "Избранные без early stop",
+    "celsius_exact_direct": "C точные",
+    "compare": "Сравнить все",
 }
 
 OLD_CITY_ALIASES = {
@@ -311,13 +311,15 @@ def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
     """Fetch actual live positions from Simmer so live dashboard matches agent PnL."""
     now = time.time()
     cached_positions = LIVE_POSITIONS_CACHE.get("positions")
+    stale_cached = cached_positions
     if cached_positions is not None and now - float(LIVE_POSITIONS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
         return cached_positions, LIVE_POSITIONS_CACHE.get("error")
 
     api_key = simmer_api_key()
     if not api_key:
-        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": None, "error": "SIMMER_API_KEY missing"})
-        return None, LIVE_POSITIONS_CACHE["error"]
+        error = "SIMMER_API_KEY missing"
+        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": stale_cached, "error": error})
+        return stale_cached, error
 
     try:
         from simmer_sdk import SimmerClient
@@ -333,21 +335,24 @@ def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
         LIVE_POSITIONS_CACHE.update({"ts": now, "positions": rows, "error": None})
         return rows, None
     except Exception as exc:
-        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": None, "error": str(exc)})
-        return None, str(exc)
+        error = str(exc)
+        LIVE_POSITIONS_CACHE.update({"ts": now, "positions": stale_cached, "error": error})
+        return stale_cached, error
 
 
 def fetch_simmer_live_portfolio() -> tuple[dict | None, str | None]:
     """Fetch Simmer's own portfolio summary. In live mode this is the source of truth."""
     now = time.time()
     cached = LIVE_PORTFOLIO_CACHE.get("portfolio")
+    stale_cached = cached
     if cached is not None and now - float(LIVE_PORTFOLIO_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
         return cached, LIVE_PORTFOLIO_CACHE.get("error")
 
     api_key = simmer_api_key()
     if not api_key:
-        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": None, "error": "SIMMER_API_KEY missing"})
-        return None, LIVE_PORTFOLIO_CACHE["error"]
+        error = "SIMMER_API_KEY missing"
+        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": stale_cached, "error": error})
+        return stale_cached, error
 
     try:
         from simmer_sdk import SimmerClient
@@ -357,8 +362,9 @@ def fetch_simmer_live_portfolio() -> tuple[dict | None, str | None]:
         LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": dict_from_obj(portfolio), "error": None})
         return LIVE_PORTFOLIO_CACHE["portfolio"], None
     except Exception as exc:
-        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": None, "error": str(exc)})
-        return None, str(exc)
+        error = str(exc)
+        LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": stale_cached, "error": error})
+        return stale_cached, error
 
 
 def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
@@ -398,9 +404,10 @@ def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
     except Exception as exc:
         errors.append(str(exc))
 
-    error = "; ".join(errors) or "Simmer activity endpoint unavailable"
-    LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": error})
-    return stale_cached, error
+    # Activity endpoints vary by Simmer deployment; they enrich closed rows but
+    # should not make the live dashboard look broken.
+    LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": None})
+    return stale_cached, None
 
 
 def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
@@ -1852,59 +1859,24 @@ def build_live_order_rows(
     failed_activity_rows: list[dict],
     question_lookup: dict[str, str],
     lookback_hours: float,
+    open_positions: list[dict] | None = None,
 ) -> list[dict]:
+    open_position_keys = {
+        key
+        for key in (live_primary_key(position) for position in values(open_positions or []))
+        if key[0] and key[1] != "?"
+    }
     rows = [
         order
         for order in (normalize_simmer_open_order(row, question_lookup) for row in values(open_order_rows))
         if order is not None
+        and order.get("is_pending")
+        and live_primary_key(order) not in open_position_keys
     ]
-    failed_orders = [
-        order
-        for order in (normalize_simmer_failed_activity_order(row, question_lookup) for row in values(failed_activity_rows))
-        if order is not None
-    ]
-    if lookback_hours and lookback_hours > 0:
-        cutoff = datetime.now(DISPLAY_TZ) - timedelta(hours=lookback_hours)
-        failed_orders = [
-            order
-            for order in failed_orders
-            if (parse_dt(order.get("timestamp")) or datetime.max.replace(tzinfo=DISPLAY_TZ)) >= cutoff
-        ]
-    rows.extend(failed_orders)
-    recent_activity = filter_recent_trades(activity_trades, lookback_hours)
-    for trade in recent_activity:
-        if trade.get("action") != "buy":
-            continue
-        amount = live_trade_amount(trade)
-        filled_shares = to_float(trade.get("filled_shares"))
-        fill_price = price_value(trade.get("simulated_fill_price"))
-        if amount is None or amount <= 0 or filled_shares is None or filled_shares <= 0 or fill_price is None:
-            continue
-        rows.append(
-            {
-                "timestamp": trade.get("timestamp"),
-                "time": format_time(trade.get("timestamp")),
-                "age": age_label(trade.get("timestamp")),
-                "market_id": trade.get("market_id"),
-                "question": clean_text(trade.get("question") or trade.get("market_id")),
-                "city": city_for_question(trade.get("question") or trade.get("market_id")),
-                "side": (trade.get("side") or "?").upper(),
-                "status": "filled",
-                "price": fill_price,
-                "shares": filled_shares,
-                "filled_shares": filled_shares,
-                "remaining_shares": 0.0,
-                "fill_pct": 1.0,
-                "amount_usd": amount,
-                "market_url": trade.get("market_url"),
-                "is_pending": False,
-                "row_kind": "recent_fill",
-            }
-        )
     def order_sort_key(item: dict):
         parsed = parse_dt(item.get("timestamp"))
         timestamp = parsed.timestamp() if parsed else 0.0
-        return (0 if item.get("is_pending") else 1, -timestamp)
+        return -timestamp
 
     rows.sort(key=order_sort_key)
     return rows[:30]
@@ -1971,6 +1943,7 @@ def normalize_state(
             failed_activity_rows,
             question_lookup,
             lookback_hours,
+            raw_positions,
         )
         raw_positions = maybe_filter_live_by_view(raw_positions, view)
         raw_trades = maybe_filter_live_by_view(raw_trades, view)
@@ -3774,11 +3747,11 @@ INDEX_HTML = r"""<!doctype html>
         <div><strong>Weather Bot</strong><span>Web Control</span></div>
       </div>
       <nav class="nav">
-        <div class="nav-item active" data-mode="paper" title="Paper mode"><span class="nav-icon">▣</span>Paper</div>
-        <div class="nav-item" data-mode="direct_paper" title="Direct Polymarket paper mode"><span class="nav-icon">◇</span>Direct Paper</div>
-        <div class="nav-item" data-mode="charts" title="Strategy graphs"><span class="nav-icon">▥</span>Graphs</div>
-        <div class="nav-item" data-mode="live" title="Live trading ledger"><span class="nav-icon">●</span>Live</div>
-        <div class="nav-item" data-mode="live_logs" title="Live terminal logs"><span class="nav-icon">⌁</span>Live Logs</div>
+        <div class="nav-item active" data-mode="paper" title="Бумажный режим"><span class="nav-icon">▣</span>Бумага</div>
+        <div class="nav-item" data-mode="direct_paper" title="Бумага по Polymarket orderbook"><span class="nav-icon">◇</span>Direct Paper</div>
+        <div class="nav-item" data-mode="charts" title="Графики стратегий"><span class="nav-icon">▥</span>Графики</div>
+        <div class="nav-item" data-mode="live" title="Лайв сделки"><span class="nav-icon">●</span>Лайв</div>
+        <div class="nav-item" data-mode="live_logs" title="Логи live-бота"><span class="nav-icon">⌁</span>Логи</div>
       </nav>
       <div class="connection"><span class="dot-live"></span>Connected<br><span id="sidebar-meta">v1.3.0</span></div>
     </aside>
@@ -3815,74 +3788,74 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="metrics">
-        <div class="metric-card"><div><div class="label">Total PnL</div><div class="value" id="m-total">...</div></div><canvas class="mini-spark" id="spark-total"></canvas></div>
-        <div class="metric-card"><div><div class="label">Realized</div><div class="value" id="m-realized">...</div></div><canvas class="mini-spark" id="spark-realized"></canvas></div>
-        <div class="metric-card"><div><div class="label">Unrealized</div><div class="value" id="m-unrealized">...</div></div><canvas class="mini-spark" id="spark-unrealized"></canvas></div>
+        <div class="metric-card"><div><div class="label">Общий PnL</div><div class="value" id="m-total">...</div></div><canvas class="mini-spark" id="spark-total"></canvas></div>
+        <div class="metric-card"><div><div class="label">Закрытый PnL</div><div class="value" id="m-realized">...</div></div><canvas class="mini-spark" id="spark-realized"></canvas></div>
+        <div class="metric-card"><div><div class="label">Открытый PnL</div><div class="value" id="m-unrealized">...</div></div><canvas class="mini-spark" id="spark-unrealized"></canvas></div>
         <div class="metric-card"><div><div class="label">Winrate</div><div class="value neutral" id="m-winrate">...</div></div><canvas class="mini-spark" id="spark-winrate"></canvas></div>
       </section>
 
       <section class="toolbar">
-        <div class="control city-control" id="view-buttons"><span class="selectlike"><span class="control-icon">▥</span>Cities</span></div>
-        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike"><span class="control-icon">⌁</span>Strategies</span></div>
-        <div class="control exit-control" id="exit-buttons"><span class="selectlike"><span class="control-icon">◷</span>Market Regime</span></div>
+        <div class="control city-control" id="view-buttons"><span class="selectlike"><span class="control-icon">▥</span>Города</span></div>
+        <div class="control strategy-control" id="strategy-buttons"><span class="selectlike"><span class="control-icon">⌁</span>Стратегии</span></div>
+        <div class="control exit-control" id="exit-buttons"><span class="selectlike"><span class="control-icon">◷</span>Режим выхода</span></div>
         <div class="control stake-control">
-          <span class="selectlike"><span class="control-icon">$</span>Stake Simulator</span>
+          <span class="selectlike"><span class="control-icon">$</span>Симулятор ставки</span>
           <div class="stake-sim" title="Empty = real historical stake. Fill values to recalculate PnL as if every YES/NO trade used that stake.">
             <label>YES $<input id="yes-stake" data-stake-side="yes" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
             <label>NO $<input id="no-stake" data-stake-side="no" type="number" min="0" step="0.01" placeholder="real" inputmode="decimal"></label>
           </div>
-          <div class="stake-total-card"><span>Total stake</span><strong id="stake-total">real</strong></div>
+          <div class="stake-total-card"><span>Всего</span><strong id="stake-total">real</strong></div>
         </div>
         <div class="control search-control">
-          <span class="selectlike"><span class="control-icon">⌕</span>Search / Compare</span>
+          <span class="selectlike"><span class="control-icon">⌕</span>Поиск / сравнение</span>
           <div class="search-wrap">
             <span class="action-icon">⌕</span>
-            <input class="search" id="search" placeholder="Search market/city..." />
+            <input class="search" id="search" placeholder="Поиск рынка/города..." />
           </div>
-          <button id="compare-btn" data-strategy="compare">⌘ Compare</button>
+          <button id="compare-btn" data-strategy="compare">⌘ Сравнить</button>
         </div>
       </section>
 
       <section class="grid standard-view">
         <aside class="stack">
           <div class="panel">
-            <div class="panel-head"><h2>Portfolio Pulse</h2><span class="hint" id="lookback-label">24h closed</span></div>
+            <div class="panel-head"><h2>Пульс портфеля</h2><span class="hint" id="lookback-label">24h closed</span></div>
             <div class="stats-list" id="stats"></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Realized Curve</h2><span class="hint">Closed trades</span></div>
+            <div class="panel-head"><h2>Кривая PnL</h2><span class="hint">Закрытые сделки</span></div>
             <div class="chart-box"><canvas id="curve"></canvas></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Top Cities</h2><span class="hint">Realized</span></div>
+            <div class="panel-head"><h2>Топ городов</h2><span class="hint">Закрытый PnL</span></div>
             <div id="cities"></div>
           </div>
         </aside>
 
         <section class="stack">
           <div class="panel orders-panel" id="orders-panel">
-	            <div class="panel-head"><h2>Open Orders / Bid Fills</h2><span class="hint" id="orders-count">...</span></div>
+	            <div class="panel-head"><h2>Открытые заявки на покупку</h2><span class="hint" id="orders-count">...</span></div>
 	            <div class="table-wrap">
 	              <table>
-	                <thead><tr><th>Placed</th><th>Side</th><th>Status</th><th class="num">Bid</th><th class="num">Stake</th><th class="num">Shares</th><th class="num">Filled</th><th class="num">Left</th><th class="num">Fill</th><th>City</th><th>Market</th></tr></thead>
+	                <thead><tr><th>Время</th><th>Сторона</th><th>Статус</th><th class="num">Bid</th><th class="num">Ставка</th><th class="num">Shares</th><th class="num">Заполнено</th><th class="num">Осталось</th><th class="num">Fill</th><th>Город</th><th>Рынок</th></tr></thead>
 	                <tbody id="orders"></tbody>
 	              </table>
 	            </div>
 	          </div>
           <div class="panel">
-            <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
+            <div class="panel-head"><h2>Открытые позиции</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="runner-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th><th>Action</th></tr></thead>
+                <thead><tr><th>Сторона</th><th>Режим</th><th class="runner-col">Тип</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Сейчас</th><th class="num">PnL</th><th class="num">Итог</th><th class="num">PnL %</th><th>Время</th><th>Город</th><th>Рынок</th><th>Прогноз</th><th>Действие</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
+            <div class="panel-head"><h2>Закрытые сделки</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>City</th><th>Market</th><th>Forecast</th></tr></thead>
+                <thead><tr><th>Время</th><th>Сторона</th><th>Режим</th><th class="runner-col">Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Город</th><th>Рынок</th><th>Прогноз</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -3891,15 +3864,15 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="panel compare-view">
-        <div class="panel-head"><h2>Strategy Comparison</h2><span class="hint" id="compare-subtitle"></span></div>
+        <div class="panel-head"><h2>Сравнение стратегий</h2><span class="hint" id="compare-subtitle"></span></div>
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th class="sortable" data-compare-sort="key">Key</th>
-              <th class="sortable" data-compare-sort="label">Strategy</th>
-              <th class="num sortable" data-compare-sort="open_positions">Open</th>
-              <th class="num sortable" data-compare-sort="buys">Buys</th>
-              <th class="num sortable" data-compare-sort="sells">Sells</th>
+              <th class="sortable" data-compare-sort="key">Клавиша</th>
+              <th class="sortable" data-compare-sort="label">Стратегия</th>
+              <th class="num sortable" data-compare-sort="open_positions">Открыто</th>
+              <th class="num sortable" data-compare-sort="buys">Покупки</th>
+              <th class="num sortable" data-compare-sort="sells">Продажи</th>
               <th class="num sortable" data-compare-sort="total">Total</th>
               <th class="num sortable" data-compare-sort="realized">Realized</th>
               <th class="num sortable" data-compare-sort="unrealized">Unrealized</th>
@@ -3914,24 +3887,24 @@ INDEX_HTML = r"""<!doctype html>
       <section class="charts-view">
         <div class="panel">
           <div class="panel-head">
-            <h2>Strategy Metric Plots</h2>
+            <h2>Графики стратегий</h2>
             <span class="hint" id="charts-subtitle"></span>
           </div>
           <div class="charts-grid">
             <div class="panel strategy-chart">
               <div class="panel-head"><h2>Realized PnL</h2><span class="hint" id="chart-realized-leader"></span></div>
               <canvas id="chart-realized"></canvas>
-              <div class="chart-note">Closed-trade PnL by tested strategy.</div>
+              <div class="chart-note">PnL закрытых сделок по тестируемым стратегиям.</div>
             </div>
             <div class="panel strategy-chart">
               <div class="panel-head"><h2>Unrealized PnL</h2><span class="hint" id="chart-unrealized-leader"></span></div>
               <canvas id="chart-unrealized"></canvas>
-              <div class="chart-note">Open-position mark-to-market PnL.</div>
+              <div class="chart-note">Mark-to-market PnL открытых позиций.</div>
             </div>
             <div class="panel strategy-chart">
               <div class="panel-head"><h2>Winrate</h2><span class="hint" id="chart-winrate-leader"></span></div>
               <canvas id="chart-winrate"></canvas>
-              <div class="chart-note">Winning closed trades as a share of all sells.</div>
+              <div class="chart-note">Доля прибыльных закрытых сделок среди продаж.</div>
             </div>
           </div>
         </div>
@@ -3952,17 +3925,17 @@ INDEX_HTML = r"""<!doctype html>
       <section class="live-logs-view">
         <div class="live-logs-terminal">
           <div class="live-log-head">
-            <span>Weather Bot Live Logs</span>
+          <span>Лайв-логи Weather Bot</span>
             <span class="hint" id="live-log-status">tail</span>
           </div>
           <span class="live-log-path" id="live-log-path">live_bot.log</span>
-          <pre class="live-log-lines" id="live-log-lines">Loading live log...</pre>
+          <pre class="live-log-lines" id="live-log-lines">Загружаю live log...</pre>
         </div>
       </section>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-k strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light · p paper · l live · o logs</span>
+        <span>Горячие клавиши: 1-4 города · 5 TP40 · 6 runner · a-k стратегии · x сравнение · t период · m терминал/веб · d тема · p бумага · l лайв · o логи</span>
       </div>
     </main>
   </div>
@@ -3998,10 +3971,10 @@ INDEX_HTML = r"""<!doctype html>
     const lookbackDays = () => Number(state.lookback) > 0 && Number(state.lookback) % 24 === 0 ? Number(state.lookback) / 24 : null;
     const lookbackLabel = () => {
       const days = lookbackDays();
-      if (Number(state.lookback) === 0) return "all closed";
-      if (Number(state.lookback) === 24) return "24h closed";
-      if (days) return `${days}d closed`;
-      return `${state.lookback}h closed`;
+      if (Number(state.lookback) === 0) return "вся история";
+      if (Number(state.lookback) === 24) return "24ч закрытые";
+      if (days) return `${days}д закрытые`;
+      return `${state.lookback}ч закрытые`;
     };
     const lookbackShort = () => {
       const days = lookbackDays();
@@ -4012,10 +3985,10 @@ INDEX_HTML = r"""<!doctype html>
     };
     const nextLookback = () => Number(state.lookback) === 24 ? 168 : Number(state.lookback) === 168 ? 0 : 24;
     const stakeLabel = () => {
-      if (state.source === "live") return " · real fills";
-      return state.yesStake || state.noStake ? ` · sim YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
+      if (state.source === "live") return " · реальные fills";
+      return state.yesStake || state.noStake ? ` · сим YES $${state.yesStake || "real"} / NO $${state.noStake || "real"}` : "";
     };
-    const sourceLabel = () => state.source === "live" ? "Live" : state.source === "direct_paper" ? "Direct Paper" : "Paper";
+    const sourceLabel = () => state.source === "live" ? "Лайв" : state.source === "direct_paper" ? "Direct Paper" : "Бумага";
     const CITY_FLAGS = {
       "NYC": "🇺🇸", "Chicago": "🇺🇸", "Seattle": "🇺🇸", "Atlanta": "🇺🇸", "Dallas": "🇺🇸", "Miami": "🇺🇸",
       "Austin": "🇺🇸", "Denver": "🇺🇸", "Houston": "🇺🇸", "Los Angeles": "🇺🇸", "San Francisco": "🇺🇸",
@@ -4044,7 +4017,7 @@ INDEX_HTML = r"""<!doctype html>
       if (state.source !== "live" || !position?.market_id || !Number.isFinite(shares) || shares <= 0) {
         return `<span class="neutral">-</span>`;
       }
-      return `<button class="close-position-btn" data-close-market="${esc(position.market_id)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Close</button>`;
+      return `<button class="close-position-btn" data-close-market="${esc(position.market_id)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Закрыть</button>`;
     }
 	    const orderStatusClass = status => {
 	      const text = String(status || "").toLowerCase();
@@ -4054,8 +4027,21 @@ INDEX_HTML = r"""<!doctype html>
 	      return "pending";
 	    };
 	    const orderStatusChip = order => {
-	      const status = String(order?.status || (order?.is_pending ? "pending" : "filled")).replace(/_/g, " ").toUpperCase();
-	      return `<span class="order-status ${orderStatusClass(status)}">${esc(status)}</span>`;
+	      const raw = String(order?.status || (order?.is_pending ? "pending" : "filled")).replace(/_/g, " ").toLowerCase();
+	      const labels = {
+	        open: "ОТКРЫТ",
+	        pending: "ОЖИДАЕТ",
+	        live: "ОТКРЫТ",
+	        active: "ОТКРЫТ",
+	        partial: "ЧАСТИЧНО",
+	        filled: "ИСПОЛНЕН",
+	        matched: "ИСПОЛНЕН",
+	        canceled: "ОТМЕНЕН",
+	        cancelled: "ОТМЕНЕН",
+	        failed: "ОШИБКА",
+	        rejected: "ОТКЛОНЕН",
+	      };
+	      return `<span class="order-status ${orderStatusClass(raw)}">${esc(labels[raw] || raw.toUpperCase())}</span>`;
 	    };
 	    const qty = v => v === null || v === undefined ? "n/a" : Number(v).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 	    const fillPct = v => v === null || v === undefined ? "n/a" : `${(Number(v) * 100).toFixed(0)}%`;
@@ -4065,17 +4051,17 @@ INDEX_HTML = r"""<!doctype html>
     function openModeChip(position) {
       if (!isRunnerMode()) return `<span class="neutral">-</span>`;
       if (position.runner) return `<span class="mode-chip runner">Runner</span>`;
-      return `<span class="mode-chip partial">Pre TP40</span>`;
+      return `<span class="mode-chip partial">До TP40</span>`;
     }
     function closedModeChip(trade) {
       if (trade.runner_legs && !trade.partial_exit) return `<span class="mode-chip combo">TP40 + Runner</span>`;
-      if (trade.partial_exit) return `<span class="mode-chip partial">TP40 half</span>`;
+      if (trade.partial_exit) return `<span class="mode-chip partial">TP40 половина</span>`;
       const reason = String(trade.exit_reason || "").toLowerCase();
-      if (reason === "market_settlement") return `<span class="mode-chip settlement">Settlement</span>`;
-      if (reason === "stop_loss") return `<span class="mode-chip stop">Stop</span>`;
+      if (reason === "market_settlement") return `<span class="mode-chip settlement">Расчет</span>`;
+      if (reason === "stop_loss") return `<span class="mode-chip stop">Stop loss</span>`;
       if (reason === "take_profit") return `<span class="mode-chip runner">TP</span>`;
-      if (reason === "edge_invalidated") return `<span class="mode-chip stop">Edge invalidated</span>`;
-      if (reason === "max_age_exit") return `<span class="mode-chip">Max age</span>`;
+      if (reason === "edge_invalidated") return `<span class="mode-chip stop">Edge сломан</span>`;
+      if (reason === "max_age_exit") return `<span class="mode-chip">Срок вышел</span>`;
       return reason ? `<span class="mode-chip">${esc(reason)}</span>` : `<span class="neutral">-</span>`;
     }
 
@@ -4455,14 +4441,14 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderStats(s) {
       const rows = [
-        ["↱", "Open Trades", s.open_positions],
-        ["↗", "Buys", s.buys],
-        ["↘", "Sells", s.sells],
-        ["✣", "Wins", s.wins],
-        ["✕", "Losses", s.losses],
+        ["↱", "Открытые", s.open_positions],
+        ["↗", "Покупки", s.buys],
+        ["↘", "Продажи", s.sells],
+        ["✣", "Плюсы", s.wins],
+        ["✕", "Минусы", s.losses],
         ["◎", "Winrate", `${s.winrate.toFixed(1)}%`],
-        ["⌘", "Exposure", money(s.exposure)],
-        ["◷", "Stale Prices", s.stale],
+        ["⌘", "Экспозиция", money(s.exposure)],
+        ["◷", "Старые цены", s.stale],
       ];
       setHTML("stats", rows.map(([ic, k, v]) => `<div class="stat"><span><span class="stat-icon">${esc(ic)}</span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join(""));
     }
@@ -4498,7 +4484,7 @@ INDEX_HTML = r"""<!doctype html>
 	          <td class="city-col">${cityChip(o.city)}</td>
 	          <td class="market">${marketLink(o)}</td>
 	        </tr>
-	      `).join("") : `<tr><td colspan="11"><div class="empty">No resting bids/orders for this filter.</div></td></tr>`);
+	      `).join("") : `<tr><td colspan="11"><div class="empty">Нет открытых заявок для этого фильтра.</div></td></tr>`);
 	    }
 
     function renderPositions(rows) {
@@ -4522,7 +4508,7 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="forecast-chip">${esc(p.forecast)}</span></td>
           <td>${closePositionButton(p)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="14"><div class="empty">No open positions for this filter.</div></td></tr>`);
+      `).join("") : `<tr><td colspan="14"><div class="empty">Нет открытых позиций для этого фильтра.</div></td></tr>`);
     }
 
     function renderClosed(rows) {
@@ -4551,13 +4537,13 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="12"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="12"><div class="empty">Нет закрытых сделок для этого фильтра.</div></td></tr>`);
     }
 
     function renderCities(rows) {
       setHTML("cities", rows.length ? rows.map(c => `
-        <div class="stat"><span>${cityName(c.city)} · ${c.sells} sells</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
-      `).join("") : `<div class="empty">No city PnL yet.</div>`);
+        <div class="stat"><span>${cityName(c.city)} · ${c.sells} продаж</span><strong class="${cls(c.pnl)}">${money(c.pnl)}</strong></div>
+      `).join("") : `<div class="empty">Пока нет PnL по городам.</div>`);
     }
 
     function terminalStatusDot(value) {
@@ -4579,16 +4565,16 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderTerminalStats(s) {
       const rows = [
-        ["▣", "Open Trades", s.open_positions],
-        ["↔", "Total Trades", s.buys + s.sells],
-        ["↗", "Buys", s.buys],
-        ["↘", "Sells", s.sells],
-        ["✣", "Wins", s.wins],
-        ["◇", "Losses", s.losses],
+        ["▣", "Открытые", s.open_positions],
+        ["↔", "Всего сделок", s.buys + s.sells],
+        ["↗", "Покупки", s.buys],
+        ["↘", "Продажи", s.sells],
+        ["✣", "Плюсы", s.wins],
+        ["◇", "Минусы", s.losses],
         ["⌁", "Winrate", `${s.winrate.toFixed(1)}%`],
-        ["◆", "Exposure", money(s.exposure)],
-        ["▣", "Realized", money(s.realized)],
-        ["●", "Unrealized", money(s.unrealized)],
+        ["◆", "Экспозиция", money(s.exposure)],
+        ["▣", "Закрытый PnL", money(s.realized)],
+        ["●", "Открытый PnL", money(s.unrealized)],
       ];
       return `
         <div class="terminal-stats">
@@ -4600,8 +4586,8 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           `).join("")}
         </div>
-        <div class="terminal-total"><span>TOTAL PnL</span><strong class="${cls(s.total)}">${money(s.total)}</strong></div>
-        <div class="terminal-note">stale prices: ${s.stale}</div>
+        <div class="terminal-total"><span>ИТОГО PnL</span><strong class="${cls(s.total)}">${money(s.total)}</strong></div>
+        <div class="terminal-note">старые цены: ${s.stale}</div>
       `;
     }
 
@@ -4624,7 +4610,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="terminal-market"><span class="terminal-forecast">${esc(p.forecast)}</span> <span class="flag">${cityFlag(p.city)}</span> ${esc(p.city)} · ${marketLink(p)}</td>
           <td>${closePositionButton(p)}</td>
         </tr>
-      `).join("") : `<tr><td colspan="13" class="terminal-market">No open positions for this filter.</td></tr>`;
+      `).join("") : `<tr><td colspan="13" class="terminal-market">Нет открытых позиций для этого фильтра.</td></tr>`;
     }
 
     function terminalClosedRows(rows) {
@@ -4645,7 +4631,7 @@ INDEX_HTML = r"""<!doctype html>
           <td class="terminal-market"><span class="terminal-forecast">${esc(t.forecast)}</span> <span class="flag">${cityFlag(t.city)}</span> ${esc(t.city)} · ${marketLink(t)}</td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="11" class="terminal-market">No closed trades for this filter.</td></tr>`;
+      }).join("") : `<tr><td colspan="11" class="terminal-market">Нет закрытых сделок для этого фильтра.</td></tr>`;
     }
 
     function renderTerminalStandard(data) {
@@ -4662,14 +4648,14 @@ INDEX_HTML = r"""<!doctype html>
       setHTML("terminal-body", `
         <div class="terminal-main">
           <div class="terminal-panel accent-green">
-            <div class="terminal-title">P&L / STATS</div>
+            <div class="terminal-title">PnL / СТАТИСТИКА</div>
             ${renderTerminalStats(s)}
           </div>
           <div class="terminal-panel">
-            <div class="terminal-title">OPEN POSITIONS (${data.positions.length})</div>
+            <div class="terminal-title">ОТКРЫТЫЕ ПОЗИЦИИ (${data.positions.length})</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Side</th><th>Regime</th><th>Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL%</th><th>Held</th><th>Market</th><th>Action</th></tr></thead>
+                <thead><tr><th></th><th>Сторона</th><th>Режим</th><th>Тип</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Сейчас</th><th class="num">PnL</th><th class="num">Итог</th><th class="num">PnL%</th><th>Время</th><th>Рынок</th><th>Действие</th></tr></thead>
                 <tbody>${terminalOpenRows(data.positions)}</tbody>
               </table>
             </div>
@@ -4677,19 +4663,19 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="terminal-closed">
           <div class="terminal-panel">
-            <div class="terminal-title">LATEST 20 CLOSED / ${lookbackShort().toUpperCase()}</div>
+            <div class="terminal-title">ПОСЛЕДНИЕ 20 ЗАКРЫТЫХ / ${lookbackShort().toUpperCase()}</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th>Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th></tr></thead>
                 <tbody>${terminalClosedRows(left)}</tbody>
               </table>
             </div>
           </div>
           <div class="terminal-panel">
-            <div class="terminal-title">NEXT 20</div>
+            <div class="terminal-title">СЛЕДУЮЩИЕ 20</div>
             <div class="terminal-table-wrap">
               <table class="terminal-table">
-                <thead><tr><th></th><th>Time</th><th>Side</th><th>Regime</th><th>Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>Market</th></tr></thead>
+                <thead><tr><th></th><th>Время</th><th>Сторона</th><th>Режим</th><th>Выход</th><th class="num">Ставка</th><th class="num">Вход</th><th class="num">Цена выхода</th><th class="num">PnL</th><th class="num">Итог</th><th>Рынок</th></tr></thead>
                 <tbody>${terminalClosedRows(right)}</tbody>
               </table>
             </div>
@@ -4826,7 +4812,7 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error, meta.live_activity_error, meta.live_orders_error].filter(Boolean).join(" · ");
+      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error].filter(Boolean).join(" · ");
       setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · Simmer error: ${liveErrors}` : ""}`);
       renderStats(s);
       renderOrders(data.orders || []);
@@ -5464,7 +5450,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Weather bot web dashboard")
-    parser.add_argument("--host", default=os.environ.get("WEATHER_DASHBOARD_HOST", "127.0.0.1"))
+    parser.add_argument("--host", default=os.environ.get("WEATHER_DASHBOARD_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("WEATHER_DASHBOARD_PORT", "8080")))
     args = parser.parse_args()
 
