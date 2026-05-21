@@ -23,6 +23,7 @@ import re
 import json
 import argparse
 import time
+import math
 from pathlib import Path
 from dataclasses import asdict
 from typing import Optional
@@ -2284,7 +2285,7 @@ def _extract_clob_token_id(raw_market: dict, side: str) -> Optional[str]:
 
 
 def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[float], Optional[dict], Optional[str]]:
-    """Choose the live entry limit: buy only at the current bid for the traded side."""
+    """Choose the live entry limit with a spread-aware bid improvement rule."""
     token_id = _extract_clob_token_id(raw_market, side)
     if not token_id:
         return None, None, "missing_clob_token_id"
@@ -2294,12 +2295,24 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
         return None, None, "orderbook_unavailable"
 
     best_bid = book.get("best_bid")
+    best_ask = book.get("best_ask")
     if best_bid is None:
         return None, book, "missing_best_bid"
     if best_bid < MIN_TICK_SIZE:
         return None, book, "bid_below_min_tick"
+    if best_ask is None:
+        return None, book, "missing_best_ask"
 
-    return round(max(0.001, min(0.999, float(best_bid))), 4), book, None
+    # Rule:
+    # - spread <= 1c: place at bid (do not overpay)
+    # - spread >= 2c: place at bid + 1c (capped by ask)
+    # If spread is between 1c and 2c, stay conservative and use bid.
+    spread = float(best_ask) - float(best_bid)
+    if spread >= 0.02:
+        improved_price = min(float(best_ask), float(best_bid) + 0.01)
+        return round(max(0.001, min(0.999, improved_price)), 4), book, "wide_spread_bid_plus_1c"
+
+    return round(max(0.001, min(0.999, float(best_bid))), 4), book, "bid_only"
 
 
 def build_direct_polymarket_bid_snapshot(raw_market: dict) -> Optional[dict]:
@@ -3022,6 +3035,24 @@ def get_position_side(pos) -> str:
     return "yes"
 
 
+def is_valid_polymarket_price(value) -> bool:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(price) and 0.001 <= price <= 0.999
+
+
+def round_float_or_none(value, digits: int = 6) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return round(parsed, digits)
+
+
 def get_position_entry_price(pos, execution_mode: ExecutionMode) -> float:
     if execution_mode == ExecutionMode.PAPER:
         position_state = get_paper_trader().get_open_position_state(pos.market_id)
@@ -3719,6 +3750,41 @@ def check_exit_opportunities(
                     except Exception:
                         position_age_hours = None
 
+            local_entry_price = position_state.get("entry_price") if position_state else None
+            if not is_valid_polymarket_price(entry_price):
+                if is_valid_polymarket_price(local_entry_price):
+                    entry_price = float(local_entry_price)
+                    print(
+                        f"     ℹ️  Recovered entry price from local state: ${entry_price:.4f} "
+                        f"(sdk avg_cost was {pos.avg_cost})"
+                    )
+                    if logger is not None:
+                        logger.event(
+                            "live_entry_price_recovered_from_local_state",
+                            market_id=market_id,
+                            side=position_side,
+                            sdk_avg_cost=round_float_or_none(pos.avg_cost),
+                            local_entry_price=round(entry_price, 6),
+                            current_price=round(current_price, 6),
+                        )
+                else:
+                    print(f"  📊 {question}...")
+                    print(
+                        "     ⏭️  Skip exit: invalid live entry price "
+                        f"(sdk avg_cost={pos.avg_cost}, local entry={local_entry_price})"
+                    )
+                    if logger is not None:
+                        logger.event(
+                            "skip_exit_invalid_live_entry_price",
+                            market_id=market_id,
+                            side=position_side,
+                            sdk_avg_cost=round_float_or_none(pos.avg_cost),
+                            local_entry_price=round_float_or_none(local_entry_price),
+                            current_price=round(current_price, 6),
+                            reason="invalid_entry_price",
+                        )
+                    continue
+
         entry_regime = position_state.get("entry_regime") if position_state else None
         take_profit, stop_loss = get_exit_targets(
             entry_price,
@@ -3751,10 +3817,14 @@ def check_exit_opportunities(
             if exit_edge is not None:
                 current_edge = exit_edge.get("edge_no") if position_side == "no" else exit_edge.get("edge_yes")
                 if current_edge is not None and current_edge < 0:
+                    # Match paper behavior by default: negative edge is informative,
+                    # but should not force a live exit unless explicitly enabled.
                     if (
-                        execution_mode == ExecutionMode.PAPER
-                        or not strategy_config.get("edge_invalidated_exit_enabled", True)
+                        execution_mode in {ExecutionMode.PAPER, ExecutionMode.LIVE_ENABLED}
+                        and not strategy_config.get("edge_invalidated_exit_enabled", False)
                     ):
+                        ignored_edge_invalidated = True
+                    elif execution_mode == ExecutionMode.PAPER:
                         ignored_edge_invalidated = True
                     else:
                         exit_reason = "edge_invalidated"
@@ -3812,7 +3882,11 @@ def check_exit_opportunities(
             print(f"  📤 {question}...")
 
             # Check safeguards before selling
-            if use_safeguards and execution_mode != ExecutionMode.PAPER and exit_reason != "market_settlement":
+            if (
+                use_safeguards
+                and execution_mode != ExecutionMode.PAPER
+                and exit_reason not in {"market_settlement", "stop_loss"}
+            ):
                 context = get_market_context(market_id)
                 should_trade, reasons = check_context_safeguards(context)
                 if not should_trade:
@@ -4651,26 +4725,32 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
             limit_price = None
             if execution_mode == ExecutionMode.LIVE_ENABLED:
-                limit_price, orderbook, bid_skip_reason = resolve_live_bid_entry_limit(
+                limit_price, orderbook, bid_mode = resolve_live_bid_entry_limit(
                     candidate.market.raw_market,
                     selected_side,
                 )
                 if limit_price is None:
-                    log(f"  ⏸️  Live bid-only entry skipped: {bid_skip_reason}")
-                    skip_reasons.append(f"live_bid_only_{bid_skip_reason}")
+                    log(f"  ⏸️  Live entry skipped: {bid_mode}")
+                    skip_reasons.append(f"live_entry_{bid_mode}")
                     continue
 
                 signal.metadata["live_entry_order_type"] = ORDER_TYPE
                 signal.metadata["live_entry_limit_price"] = round(limit_price, 6)
+                signal.metadata["live_entry_mode"] = bid_mode
                 if orderbook:
                     signal.metadata["live_entry_best_bid"] = round(float(orderbook["best_bid"]), 6)
                     signal.metadata["live_entry_best_ask"] = round(float(orderbook["best_ask"]), 6)
                     signal.metadata["live_entry_spread"] = round(float(orderbook["spread"]), 6)
                     signal.metadata["live_entry_spread_pct"] = round(float(orderbook["spread_pct"]), 6)
+                    entry_hint = (
+                        "placing BUY @ bid+1c (wide spread)"
+                        if bid_mode == "wide_spread_bid_plus_1c"
+                        else "placing BUY @ bid"
+                    )
                     log(
-                        "  📚 Live bid-only entry: "
+                        "  📚 Live entry: "
                         f"bid ${orderbook['best_bid']:.4f} / ask ${orderbook['best_ask']:.4f}; "
-                        f"placing {ORDER_TYPE} BUY @ bid ${limit_price:.4f}",
+                        f"{entry_hint} ${limit_price:.4f} ({ORDER_TYPE})",
                         force=True,
                     )
             result = execute_trade(

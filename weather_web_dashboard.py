@@ -370,13 +370,15 @@ def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
     """
     now = time.time()
     cached = LIVE_ACTIVITY_CACHE.get("activity")
+    stale_cached = cached
     if cached is not None and now - float(LIVE_ACTIVITY_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
         return cached, LIVE_ACTIVITY_CACHE.get("error")
 
     api_key = simmer_api_key()
     if not api_key:
-        LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": None, "error": "SIMMER_API_KEY missing"})
-        return None, LIVE_ACTIVITY_CACHE["error"]
+        error = "SIMMER_API_KEY missing"
+        LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": error})
+        return stale_cached, error
 
     errors = []
     try:
@@ -397,21 +399,23 @@ def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
         errors.append(str(exc))
 
     error = "; ".join(errors) or "Simmer activity endpoint unavailable"
-    LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": None, "error": error})
-    return None, error
+    LIVE_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": error})
+    return stale_cached, error
 
 
 def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
     """Fetch currently resting live orders from Simmer/Polymarket."""
     now = time.time()
     cached = LIVE_ORDERS_CACHE.get("orders")
+    stale_cached = cached
     if cached is not None and now - float(LIVE_ORDERS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
         return cached, LIVE_ORDERS_CACHE.get("error")
 
     api_key = simmer_api_key()
     if not api_key:
-        LIVE_ORDERS_CACHE.update({"ts": now, "orders": None, "error": "SIMMER_API_KEY missing"})
-        return None, LIVE_ORDERS_CACHE["error"]
+        error = "SIMMER_API_KEY missing"
+        LIVE_ORDERS_CACHE.update({"ts": now, "orders": stale_cached, "error": error})
+        return stale_cached, error
 
     errors = []
     try:
@@ -441,8 +445,8 @@ def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
         errors.append(str(exc))
 
     error = "; ".join(errors) or "Simmer open orders endpoint unavailable"
-    LIVE_ORDERS_CACHE.update({"ts": now, "orders": None, "error": error})
-    return None, error
+    LIVE_ORDERS_CACHE.update({"ts": now, "orders": stale_cached, "error": error})
+    return stale_cached, error
 
 
 def reset_live_caches():
@@ -4064,13 +4068,14 @@ INDEX_HTML = r"""<!doctype html>
       return `<span class="mode-chip partial">Pre TP40</span>`;
     }
     function closedModeChip(trade) {
-      if (!isRunnerMode()) return `<span class="neutral">-</span>`;
       if (trade.runner_legs && !trade.partial_exit) return `<span class="mode-chip combo">TP40 + Runner</span>`;
       if (trade.partial_exit) return `<span class="mode-chip partial">TP40 half</span>`;
       const reason = String(trade.exit_reason || "").toLowerCase();
       if (reason === "market_settlement") return `<span class="mode-chip settlement">Settlement</span>`;
       if (reason === "stop_loss") return `<span class="mode-chip stop">Stop</span>`;
       if (reason === "take_profit") return `<span class="mode-chip runner">TP</span>`;
+      if (reason === "edge_invalidated") return `<span class="mode-chip stop">Edge invalidated</span>`;
+      if (reason === "max_age_exit") return `<span class="mode-chip">Max age</span>`;
       return reason ? `<span class="mode-chip">${esc(reason)}</span>` : `<span class="neutral">-</span>`;
     }
 
