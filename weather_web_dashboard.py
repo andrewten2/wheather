@@ -90,6 +90,7 @@ STRATEGY_ORDER = (
     "baseline",
     "stop20_early",
     "no_reentry_after_stop",
+    "no_reentry_watchlist",
     "early_only",
     "low_risk_cities_only",
     "no_early_stop",
@@ -99,11 +100,12 @@ STRATEGY_ORDER = (
     "celsius_exact_direct",
 )
 
-STRATEGY_KEYS = dict(zip("abcdefghij", STRATEGY_ORDER))
+STRATEGY_KEYS = dict(zip("abcdefghijk", STRATEGY_ORDER))
 STRATEGY_LABELS = {
     "baseline": "Baseline",
     "stop20_early": "Stop20 Early",
     "no_reentry_after_stop": "No Reentry",
+    "no_reentry_watchlist": "C + Watchlist",
     "early_only": "Early Only",
     "low_risk_cities_only": "Low Risk",
     "no_early_stop": "No Early Stop",
@@ -3929,7 +3931,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-j strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light · p paper · l live · o logs</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-k strategy · x compare · t 24h/7d/all · m terminal/web · d dark/light · p paper · l live · o logs</span>
       </div>
     </main>
   </div>
@@ -4379,9 +4381,9 @@ INDEX_HTML = r"""<!doctype html>
         setState({
           source: "live",
           page: "dashboard",
-          view: "watchlist",
-          exit_mode: "tp40_runner",
-          strategy: "watchlist_no_reentry",
+          view: "all",
+          exit_mode: "tp40",
+          strategy: "no_reentry_after_stop",
         });
         return;
       }
@@ -4389,9 +4391,9 @@ INDEX_HTML = r"""<!doctype html>
         setState({
           source: "live",
           page: "logs",
-          view: "watchlist",
-          exit_mode: "tp40_runner",
-          strategy: "watchlist_no_reentry",
+          view: "all",
+          exit_mode: "tp40",
+          strategy: "no_reentry_after_stop",
         });
         return;
       }
@@ -4994,7 +4996,7 @@ INDEX_HTML = r"""<!doctype html>
       if (key === "p") applyMode("paper");
       if (key === "l") applyMode("live");
       if (key === "o") applyMode("live_logs");
-      if ("abcdefghij".includes(key) && state.options) {
+      if ("abcdefghijk".includes(key) && state.options) {
         const found = state.options.strategies.find(s => s.key === key);
         if (found) setState({strategy: found.id});
       }

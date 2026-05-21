@@ -15,6 +15,8 @@ Requires:
     SIMMER_API_KEY environment variable (get from simmer.markets/dashboard)
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import re
@@ -223,6 +225,12 @@ STRATEGY_VARIANTS = {
         "forecast_mode": "primary",
         "block_reentry_after_stop_loss": True,
     },
+    "no_reentry_watchlist": {
+        "label": "No Reentry Watchlist",
+        "forecast_mode": "primary",
+        "allowed_cities": WATCHLIST_STRATEGY_CITIES,
+        "block_reentry_after_stop_loss": True,
+    },
     "wunderground_only": {
         "label": "Wunderground Only",
         "forecast_mode": "wunderground",
@@ -302,6 +310,7 @@ TP40_RUNNER_BASE_STRATEGIES = (
     "baseline",
     "stop20_early",
     "no_reentry_after_stop",
+    "no_reentry_watchlist",
     "early_only",
     "low_risk_cities_only",
     "no_early_stop",
@@ -3731,6 +3740,15 @@ def check_exit_opportunities(
                     shares_to_sell = max(0.0, shares * min(1.0, max(0.0, partial_tp_fraction)))
                 else:
                     shares_to_sell = shares
+
+            if partial_exit and execution_mode != ExecutionMode.PAPER and shares < MIN_SHARES_PER_ORDER:
+                print(
+                    f"     ℹ️  Remaining live position is only {shares:.2f} shares; "
+                    "selling the full TP remainder instead of splitting it again"
+                )
+                partial_exit = False
+                runner_after_partial_exit = False
+                shares_to_sell = shares
 
             tag = "PAPER" if execution_mode == ExecutionMode.PAPER else ("SIMULATED" if dry_run else "LIVE")
             side_label = position_side.upper()
