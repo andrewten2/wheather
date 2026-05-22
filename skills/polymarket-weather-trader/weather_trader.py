@@ -183,10 +183,21 @@ def _get_non_negative_int_env(name: str, default: int) -> int:
     return default
 
 
+def _get_positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, ""))
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
 WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
 WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_SECONDS", 30)
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
 LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 600)
+LIVE_ENTRY_MAX_SPREAD = _get_positive_float_env("WEATHER_BOT_LIVE_MAX_ENTRY_SPREAD", 0.03)
 
 # SDK adapter / execution singletons
 _adapter = None
@@ -214,7 +225,7 @@ STRATEGY_VARIANTS = {
     "baseline": {
         "label": "Baseline",
         "forecast_mode": "primary",
-        "early_yes_stop_loss_pct": STRATEGY_V1_YES_STOP_LOSS_PCT if "STRATEGY_V1_YES_STOP_LOSS_PCT" in globals() else 0.10,
+        "early_yes_stop_loss_pct": 0.15,
     },
     "stop20_early": {
         "label": "Early Stop 20%",
@@ -835,7 +846,7 @@ STRATEGY_V1_MAX_PRICE = 0.80
 STRATEGY_V1_NO_EDGE_THRESHOLD = 0.10
 STRATEGY_V1_YES_EDGE_THRESHOLD = 0.15
 STRATEGY_V1_YES_TAKE_PROFIT_PCT = 0.40
-STRATEGY_V1_YES_STOP_LOSS_PCT = 0.10
+STRATEGY_V1_YES_STOP_LOSS_PCT = 0.15
 STRATEGY_V1_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EARLY_YES_MAX_PRICE = 0.35
 STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
@@ -2304,12 +2315,21 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
         return None, book, "missing_best_ask"
 
     # Rule (tick-based to avoid float precision drift):
+    # - spread above max: skip, weather books are too thin/expensive
     # - spread <= 1 tick: place at bid (do not overpay)
-    # - spread >= 2 ticks: place at bid + 1 tick (capped by ask)
+    # - spread >= 2 ticks: place at bid + 1 tick, capped below mid/ask
     spread = float(best_ask) - float(best_bid)
+    if spread - float(LIVE_ENTRY_MAX_SPREAD) > 1e-9:
+        return None, book, "spread_too_wide"
+
     spread_ticks = int(round(spread / MIN_TICK_SIZE))
     if spread_ticks >= 2:
-        improved_price = min(float(best_ask), float(best_bid) + 0.01)
+        mid = (float(best_ask) + float(best_bid)) / 2.0
+        improved_price = min(
+            float(best_bid) + MIN_TICK_SIZE,
+            mid,
+            float(best_ask) - MIN_TICK_SIZE,
+        )
         return round(max(0.001, min(0.999, improved_price)), 4), book, "wide_spread_bid_plus_1c"
 
     return round(max(0.001, min(0.999, float(best_bid))), 4), book, "bid_only"
@@ -4094,6 +4114,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
             yes_take_profit_pct=STRATEGY_V1_YES_TAKE_PROFIT_PCT,
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
+            live_entry_max_spread=LIVE_ENTRY_MAX_SPREAD,
             early_yes_stop_loss_pct=get_active_strategy_config().get(
                 "early_yes_stop_loss_pct",
                 STRATEGY_V1_YES_STOP_LOSS_PCT,
@@ -4730,13 +4751,21 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     selected_side,
                 )
                 if limit_price is None:
-                    log(f"  ⏸️  Live entry skipped: {bid_mode}")
+                    if orderbook and bid_mode == "spread_too_wide":
+                        log(
+                            "  ⏸️  Live entry skipped: "
+                            f"spread ${orderbook['spread']:.4f} > max ${LIVE_ENTRY_MAX_SPREAD:.4f} "
+                            f"(bid ${orderbook['best_bid']:.4f} / ask ${orderbook['best_ask']:.4f})"
+                        )
+                    else:
+                        log(f"  ⏸️  Live entry skipped: {bid_mode}")
                     skip_reasons.append(f"live_entry_{bid_mode}")
                     continue
 
                 signal.metadata["live_entry_order_type"] = ORDER_TYPE
                 signal.metadata["live_entry_limit_price"] = round(limit_price, 6)
                 signal.metadata["live_entry_mode"] = bid_mode
+                signal.metadata["live_entry_max_spread"] = round(float(LIVE_ENTRY_MAX_SPREAD), 6)
                 if orderbook:
                     signal.metadata["live_entry_best_bid"] = round(float(orderbook["best_bid"]), 6)
                     signal.metadata["live_entry_best_ask"] = round(float(orderbook["best_ask"]), 6)
