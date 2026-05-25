@@ -1878,6 +1878,7 @@ def live_leg_from_trade(trade: dict) -> dict:
 def build_live_trade_summaries(
     raw_trades: list[dict],
     raw_positions: list[dict],
+    runner_mode: bool = False,
 ) -> tuple[list[dict], dict[tuple[str, str], dict]]:
     """Convert Simmer BUY/SELL activity into net sell rows and open runner hints.
 
@@ -1887,8 +1888,57 @@ def build_live_trade_summaries(
     """
     lots: dict[tuple[str, str], deque] = defaultdict(deque)
     partial_by_key: dict[tuple[str, str], dict] = {}
-    closed: list[dict] = []
+    closed_by_key: dict[tuple[str, str], dict] = {}
     position_by_key = {live_primary_key(position): position for position in raw_positions}
+
+    def merge_closed_row(key: tuple[str, str], sell_row: dict) -> dict:
+        existing = closed_by_key.get(key)
+        if existing is None:
+            sell_row["close_legs"] = [live_leg_from_trade(sell_row)]
+            closed_by_key[key] = sell_row
+            return sell_row
+
+        existing_shares = to_float(existing.get("filled_shares")) or 0.0
+        next_shares = to_float(sell_row.get("filled_shares")) or 0.0
+        total_shares = existing_shares + next_shares
+        existing_cost = to_float(existing.get("cost_basis")) or 0.0
+        next_cost = to_float(sell_row.get("cost_basis")) or 0.0
+        total_cost = existing_cost + next_cost
+        existing_proceeds = to_float(existing.get("amount_usd")) or live_trade_amount(existing) or 0.0
+        next_proceeds = to_float(sell_row.get("amount_usd")) or live_trade_amount(sell_row) or 0.0
+        total_proceeds = existing_proceeds + next_proceeds
+        existing_pnl = to_float(existing.get("realized_pnl")) or 0.0
+        next_pnl = to_float(sell_row.get("realized_pnl")) or 0.0
+
+        existing["filled_shares"] = total_shares
+        existing["requested_shares"] = total_shares
+        existing["cost_basis"] = total_cost
+        existing["amount_usd"] = total_proceeds
+        existing["realized_pnl"] = existing_pnl + next_pnl
+        existing["entry_price"] = total_cost / total_shares if total_shares > 0 and total_cost > 0 else existing.get("entry_price")
+        existing["simulated_fill_price"] = (
+            total_proceeds / total_shares if total_shares > 0 and total_proceeds > 0 else existing.get("simulated_fill_price")
+        )
+        existing["match_mode"] = (
+            existing.get("match_mode") if existing.get("match_mode") == sell_row.get("match_mode") else "mixed"
+        )
+        if sell_row.get("exit_reason"):
+            existing["exit_reason"] = sell_row.get("exit_reason")
+        if sell_row.get("runner_legs"):
+            existing["runner_legs"] = sell_row.get("runner_legs")
+        existing["partial_exit"] = bool(existing.get("partial_exit") or sell_row.get("partial_exit"))
+        existing["runner_after_partial_exit"] = bool(
+            existing.get("runner_after_partial_exit") or sell_row.get("runner_after_partial_exit")
+        )
+        existing.setdefault("close_legs", []).append(live_leg_from_trade(sell_row))
+
+        existing_ts = parse_dt(existing.get("timestamp"))
+        next_ts = parse_dt(sell_row.get("timestamp"))
+        if next_ts and (existing_ts is None or next_ts >= existing_ts):
+            for field in ("timestamp", "question", "market_url", "slug", "event_slug", "entry_regime", "forecast_label"):
+                if sell_row.get(field):
+                    existing[field] = sell_row.get(field)
+        return existing
 
     ordered = sorted(
         raw_trades,
@@ -2020,8 +2070,12 @@ def build_live_trade_summaries(
             pnl,
             trade_exit_reason(trade),
         )
-        partial_exit = bool(has_open_runner and inferred_reason in {"take_profit", "tp40_half", "partial_take_profit"})
-        runner_close = key in partial_by_key and not partial_exit
+        partial_exit = bool(
+            runner_mode
+            and has_open_runner
+            and inferred_reason in {"take_profit", "tp40_half", "partial_take_profit"}
+        )
+        runner_close = bool(runner_mode and key in partial_by_key and not partial_exit)
 
         sell_row = {
             **trade,
@@ -2062,7 +2116,30 @@ def build_live_trade_summaries(
                 "total_final": sum(leg.get("final_value") or 0.0 for leg in legs),
                 "tp40_filled": True,
             }
-        closed.append(sell_row)
+        merge_closed_row(key, sell_row)
+
+    closed: list[dict] = []
+    for key, row in closed_by_key.items():
+        closed_shares = to_float(row.get("filled_shares")) or 0.0
+        remaining_lot_shares = sum(float(lot.get("remaining_shares") or 0.0) for lot in lots.get(key, []))
+        open_position = position_by_key.get(key)
+        open_position_shares = to_float(open_position.get("shares")) if isinstance(open_position, dict) else None
+        remaining_shares = remaining_lot_shares if remaining_lot_shares > 1e-9 else (open_position_shares or 0.0)
+        total_shares = closed_shares + max(0.0, remaining_shares)
+        if total_shares > 1e-9:
+            row["closed_shares"] = closed_shares
+            row["remaining_shares"] = max(0.0, remaining_shares)
+            row["closed_pct"] = min(1.0, max(0.0, closed_shares / total_shares))
+            row["remaining_pct"] = min(1.0, max(0.0, remaining_shares / total_shares))
+        else:
+            row["closed_shares"] = closed_shares
+            row["remaining_shares"] = None
+            row["closed_pct"] = None
+            row["remaining_pct"] = None
+        if runner_mode and row.get("runner_legs"):
+            row["partial_exit"] = bool((row.get("remaining_shares") or 0.0) > 1e-9)
+            row["runner_after_partial_exit"] = not row["partial_exit"]
+        closed.append(row)
 
     annotations: dict[tuple[str, str], dict] = {}
     for key, queue in lots.items():
@@ -2417,7 +2494,11 @@ def normalize_state(
             for item in [*raw_positions, *matching_trades]
             if clean_text(item.get("market_id")) and clean_text(item.get("question"))
         }
-        live_closed_summaries, live_position_annotations = build_live_trade_summaries(matching_trades, raw_positions)
+        live_closed_summaries, live_position_annotations = build_live_trade_summaries(
+            matching_trades,
+            raw_positions,
+            runner_mode=exit_mode == "tp40_runner",
+        )
         failed_activity_rows = [row for row in values(activity_rows or []) if simmer_failure_status(row)]
         open_orders = build_live_order_rows(
             open_order_rows or [],
@@ -2542,7 +2623,10 @@ def normalize_state(
             return None
         entry, _, _, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
-        stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
+        if source == "live":
+            stake = to_float(trade.get("cost_basis")) or original_cost
+        else:
+            stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
         pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source)
         return {
             "time": format_time(trade.get("timestamp")),
@@ -2555,10 +2639,10 @@ def normalize_state(
         }
 
     def runner_leg_summary(trade: dict) -> dict | None:
-        if isinstance(trade.get("runner_legs"), dict):
-            return trade.get("runner_legs")
         if exit_mode != "tp40_runner":
             return None
+        if isinstance(trade.get("runner_legs"), dict):
+            return trade.get("runner_legs")
         if not (is_partial_exit_trade(trade) or is_runner_trade(trade)):
             return None
         group = all_sells_by_key.get(trade_market_key(trade), [])
@@ -2591,7 +2675,10 @@ def normalize_state(
     for trade in display_closed_source[:80]:
         entry, regime, forecast, original_cost = closed_entry_info(trade, buy_history)
         side = (trade.get("side") or "?").upper()
-        stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
+        if source == "live":
+            stake = to_float(trade.get("cost_basis")) or original_cost
+        else:
+            stake = partial_trade_target_stake(trade, stake_for_side(side, yes_stake, no_stake)) or original_cost
         pnl = adjusted_trade_pnl(trade, buy_history, yes_stake, no_stake, source)
         proceeds = live_trade_amount(trade) if source == "live" else None
         if stake is None and proceeds is not None and pnl is not None:
@@ -2624,6 +2711,10 @@ def normalize_state(
                     trade.get("exit_reason") or nested_signal(trade).get("exit_reason"),
                 ),
                 "match_mode": trade.get("match_mode"),
+                "closed_shares": to_float(trade.get("closed_shares")),
+                "remaining_shares": to_float(trade.get("remaining_shares")),
+                "closed_pct": to_float(trade.get("closed_pct")),
+                "remaining_pct": to_float(trade.get("remaining_pct")),
                 "partial_exit": bool(trade.get("partial_exit") or nested_signal(trade).get("partial_exit")),
                 "runner_after_partial_exit": bool(
                     trade.get("runner_after_partial_exit") or nested_signal(trade).get("runner_after_partial_exit")
@@ -4447,7 +4538,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th>City</th><th>Market</th><th>Forecast</th><th>Reason</th><th>Calc</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th class="num">Closed</th><th class="num">Left</th><th>City</th><th>Market</th><th>Forecast</th><th>Reason</th><th>Calc</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -4677,8 +4768,14 @@ INDEX_HTML = r"""<!doctype html>
         fallback_entry_price: "fallback_entry",
         fallback_realized_hint: "fallback_realized",
         fallback_neutral: "fallback_neutral",
+        mixed: "mixed",
       };
       return labels[mode] || (mode || "fifo");
+    }
+
+    function closePct(value, fallback) {
+      const next = value === null || value === undefined ? fallback : value;
+      return next === null || next === undefined ? "-" : pct(next);
     }
 
     function runnerLegLine(label, leg, missingText) {
@@ -5154,6 +5251,8 @@ INDEX_HTML = r"""<!doctype html>
         const displayPnl = t.runner_legs && !t.partial_exit ? t.runner_legs.total_pnl : t.pnl;
         const displayFinal = t.runner_legs && !t.partial_exit ? t.runner_legs.total_final : t.final_value;
         const displayExit = t.runner_legs && !t.partial_exit && t.runner_legs.runner ? t.runner_legs.runner.exit_price : t.exit_price;
+        const closedPct = t.closed_pct === null || t.closed_pct === undefined ? 1 : t.closed_pct;
+        const leftPct = t.remaining_pct === null || t.remaining_pct === undefined ? 0 : t.remaining_pct;
         const rowClass = Number(displayPnl || 0) > 0 ? "closed-profit" : Number(displayPnl || 0) < 0 ? "closed-loss" : "";
         return `
         <tr class="${rowClass}">
@@ -5166,6 +5265,8 @@ INDEX_HTML = r"""<!doctype html>
           <td class="num">${price(displayExit)}</td>
           <td class="num ${cls(displayPnl)}">${money(displayPnl)}</td>
           <td class="num ${cls(displayFinal)}">${money(displayFinal)}</td>
+          <td class="num">${closePct(closedPct, 1)}</td>
+          <td class="num ${Number(leftPct || 0) > 0 ? "neutral" : ""}">${closePct(leftPct, 0)}</td>
           <td class="city-col">${cityChip(t.city)}</td>
           <td class="market">${marketLink(t)}${runnerBreakdown(t)}</td>
           <td><span class="forecast-chip">${esc(t.forecast)}</span></td>
@@ -5173,7 +5274,7 @@ INDEX_HTML = r"""<!doctype html>
           <td><span class="hint">${esc(matchModeLabel(t))}</span></td>
         </tr>
       `;
-      }).join("") : `<tr><td colspan="14"><div class="empty">No closed trades for this filter.</div></td></tr>`);
+      }).join("") : `<tr><td colspan="16"><div class="empty">No closed trades for this filter.</div></td></tr>`);
     }
 
     function renderCities(rows) {
