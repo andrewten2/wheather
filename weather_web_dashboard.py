@@ -237,6 +237,8 @@ LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
 LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
 LIVE_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
+LIVE_CLOB_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
+LIVE_SETTINGS_CACHE = {"ts": 0.0, "settings": None, "error": None}
 SIMMER_READONLY_CLIENT_LOCK = threading.Lock()
 
 
@@ -324,6 +326,54 @@ def create_simmer_readonly_client(api_key: str):
             return SimmerClient(api_key=api_key, venue="polymarket", live=True)
         finally:
             os.environ.update(saved)
+
+
+def fetch_simmer_live_settings() -> tuple[dict | None, str | None]:
+    now = time.time()
+    cached = LIVE_SETTINGS_CACHE.get("settings")
+    stale_cached = cached
+    if cached is not None and now - float(LIVE_SETTINGS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_SETTINGS_CACHE.get("error")
+
+    api_key = simmer_api_key()
+    if not api_key:
+        error = "SIMMER_API_KEY missing"
+        LIVE_SETTINGS_CACHE.update({"ts": now, "settings": stale_cached, "error": error})
+        return stale_cached, error
+
+    try:
+        client = create_simmer_readonly_client(api_key)
+        settings = client._request("GET", "/api/sdk/settings") or {}
+        LIVE_SETTINGS_CACHE.update({"ts": now, "settings": dict_from_obj(settings), "error": None})
+        return LIVE_SETTINGS_CACHE["settings"], None
+    except Exception as exc:
+        error = str(exc)
+        LIVE_SETTINGS_CACHE.update({"ts": now, "settings": stale_cached, "error": error})
+        return stale_cached, error
+
+
+def live_private_key() -> str | None:
+    return (
+        os.environ.get("WALLET_PRIVATE_KEY")
+        or os.environ.get("SIMMER_PRIVATE_KEY")
+        or os.environ.get("POLYMARKET_PRIVATE_KEY")
+    )
+
+
+def private_key_address(private_key: str | None) -> str | None:
+    if not private_key:
+        return None
+    try:
+        from eth_account import Account
+
+        return Account.from_key(private_key).address
+    except Exception:
+        try:
+            from simmer_sdk.signing import get_wallet_address
+
+            return get_wallet_address(private_key)
+        except Exception:
+            return None
 
 
 def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
@@ -467,9 +517,191 @@ def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
     return stale_cached, error
 
 
+def first_text(row: dict | None, fields: tuple[str, ...]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    for field in fields:
+        value = clean_text(row.get(field))
+        if value:
+            return value
+    return ""
+
+
+def build_open_order_hint_maps(rows: list[dict]) -> dict[str, dict[str, str]]:
+    hints = {"order": {}, "market": {}, "token": {}}
+    for raw in values(rows):
+        row = dict_from_obj(raw)
+        question = clean_text(row.get("question") or row.get("market_question") or row.get("title"))
+        if not question:
+            continue
+        order_id = first_text(row, ("order_id", "orderId", "id", "hash"))
+        market_id = first_text(row, ("market_id", "marketId", "condition_id", "conditionId", "market"))
+        token_ids = [
+            first_text(row, ("asset_id", "assetId", "token_id", "tokenId")),
+            first_text(row, ("token_id_yes", "tokenIdYes", "yes_token_id", "yesTokenId")),
+            first_text(row, ("token_id_no", "tokenIdNo", "no_token_id", "noTokenId")),
+        ]
+        if order_id:
+            hints["order"][order_id.lower()] = question
+        if market_id:
+            hints["market"][market_id.lower()] = question
+        for token_id in token_ids:
+            if token_id:
+                hints["token"][token_id.lower()] = question
+    return hints
+
+
+def clob_signature_type_candidates() -> list[int]:
+    configured = os.environ.get("POLYMARKET_CLOB_SIGNATURE_TYPE")
+    if configured is not None:
+        parsed = to_float(configured)
+        if parsed is not None:
+            return [int(parsed)]
+    return [0, 1, 2]
+
+
+def unique_clean_values(values_: list[str | None]) -> list[str | None]:
+    seen = set()
+    out = []
+    for value in values_:
+        key = clean_text(value).lower() if value is not None else ""
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean_text(value) if value is not None and clean_text(value) else None)
+    return out
+
+
+def normalize_clob_open_order(row: dict, hints: dict[str, dict[str, str]]) -> dict:
+    order = dict_from_obj(row)
+    order_id = first_text(order, ("id", "order_id", "orderId", "hash"))
+    market_id = first_text(order, ("market", "market_id", "marketId", "condition_id", "conditionId"))
+    token_id = first_text(order, ("asset_id", "assetId", "token_id", "tokenId"))
+    question = (
+        first_text(order, ("question", "market_question", "title"))
+        or hints.get("order", {}).get(order_id.lower(), "")
+        or hints.get("token", {}).get(token_id.lower(), "")
+        or hints.get("market", {}).get(market_id.lower(), "")
+        or market_id
+        or token_id
+    )
+    outcome = first_text(order, ("outcome", "token_side", "tokenSide", "asset_outcome", "assetOutcome")).lower()
+    side = "YES" if outcome == "yes" else "NO" if outcome == "no" else first_text(order, ("side",)).upper()
+    if side in {"BUY", "SELL"}:
+        side = "YES"
+
+    price = first_price(order, ("price", "limit_price", "limitPrice"))
+    remaining = first_float(order, ("size", "remaining_size", "remainingSize", "size_remaining", "sizeRemaining"))
+    filled = first_float(order, ("size_matched", "sizeMatched", "matched_size", "matchedSize", "filled_size", "filledSize"))
+    shares = first_float(order, ("original_size", "originalSize", "total_size", "totalSize", "order_size", "orderSize"))
+    if shares is None and remaining is not None and filled is not None:
+        shares = remaining + filled
+    if remaining is None and shares is not None:
+        remaining = max(0.0, shares - (filled or 0.0))
+    if filled is None and shares is not None and remaining is not None:
+        filled = max(0.0, shares - remaining)
+    amount = price * shares if price is not None and shares is not None else None
+
+    return {
+        **order,
+        "order_id": order_id,
+        "market_id": market_id or token_id,
+        "question": question,
+        "side": side if side in {"YES", "NO"} else "YES",
+        "status": first_text(order, ("status", "order_status", "orderStatus")) or "open",
+        "price": price,
+        "total_shares": shares,
+        "filled_shares": filled,
+        "remaining_shares": remaining,
+        "amount_usd": amount,
+        "created_at": order.get("created_at") or order.get("createdAt") or order.get("created_at_iso"),
+        "asset_id": token_id,
+        "row_source": "polymarket_clob",
+    }
+
+
+def fetch_polymarket_clob_open_orders(hint_rows: list[dict]) -> tuple[list[dict] | None, str | None]:
+    """Fetch true live open orders from Polymarket CLOB.
+
+    Simmer's open-orders endpoint is useful as a ledger but can lag after fills
+    or cancels. The live dashboard should mirror Polymarket's own Open orders tab.
+    """
+    now = time.time()
+    cached = LIVE_CLOB_ORDERS_CACHE.get("orders")
+    stale_cached = cached
+    if cached is not None and now - float(LIVE_CLOB_ORDERS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_CLOB_ORDERS_CACHE.get("error")
+
+    private_key = live_private_key()
+    if not private_key:
+        error = "WALLET_PRIVATE_KEY missing for direct CLOB open orders"
+        LIVE_CLOB_ORDERS_CACHE.update({"ts": now, "orders": stale_cached, "error": error})
+        return None, error
+
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OpenOrderParams
+    except Exception as exc:
+        error = f"py_clob_client unavailable: {exc}"
+        LIVE_CLOB_ORDERS_CACHE.update({"ts": now, "orders": stale_cached, "error": error})
+        return None, error
+
+    settings, _ = fetch_simmer_live_settings()
+    wallet_address = private_key_address(private_key)
+    funders = unique_clean_values(
+        [
+            os.environ.get("POLYMARKET_CLOB_FUNDER"),
+            os.environ.get("POLYMARKET_FUNDER_ADDRESS"),
+            os.environ.get("POLYMARKET_DEPOSIT_WALLET"),
+            settings.get("deposit_wallet_address") if isinstance(settings, dict) else None,
+            settings.get("wallet_address") if isinstance(settings, dict) else None,
+            wallet_address,
+            None,
+        ]
+    )
+    hints = build_open_order_hint_maps(hint_rows)
+    errors = []
+    best_rows: list[dict] | None = None
+
+    for signature_type in clob_signature_type_candidates():
+        for funder in funders:
+            try:
+                client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=private_key,
+                    chain_id=137,
+                    signature_type=signature_type,
+                    funder=funder,
+                )
+                client.set_api_creds(client.create_or_derive_api_creds())
+                payload = client.get_orders(OpenOrderParams())
+                rows = extract_rows(payload, ("orders", "data", "results", "items")) if isinstance(payload, dict) else payload
+                normalized = [normalize_clob_open_order(dict_from_obj(row), hints) for row in values(rows or [])]
+                if best_rows is None or len(normalized) > len(best_rows):
+                    best_rows = normalized
+            except Exception as exc:
+                label = f"sig={signature_type}, funder={funder or 'none'}"
+                errors.append(f"{label}: {exc}")
+
+    if best_rows is not None:
+        LIVE_CLOB_ORDERS_CACHE.update({"ts": now, "orders": best_rows, "error": None})
+        return best_rows, None
+
+    error = "; ".join(errors) or "direct CLOB open orders unavailable"
+    LIVE_CLOB_ORDERS_CACHE.update({"ts": now, "orders": stale_cached, "error": error})
+    return None, error
+
+
 def reset_live_caches():
     """Force the next dashboard refresh to re-read live data from Simmer."""
-    for cache in (LIVE_POSITIONS_CACHE, LIVE_PORTFOLIO_CACHE, LIVE_ACTIVITY_CACHE, LIVE_ORDERS_CACHE):
+    for cache in (
+        LIVE_POSITIONS_CACHE,
+        LIVE_PORTFOLIO_CACHE,
+        LIVE_ACTIVITY_CACHE,
+        LIVE_ORDERS_CACHE,
+        LIVE_CLOB_ORDERS_CACHE,
+        LIVE_SETTINGS_CACHE,
+    ):
         cache["ts"] = 0.0
 
 
@@ -2153,6 +2385,12 @@ def normalize_state(
         remote_positions, live_positions_error = fetch_simmer_live_positions()
         activity_rows, live_activity_error = fetch_simmer_live_activity()
         open_order_rows, live_orders_error = fetch_simmer_live_open_orders()
+        clob_open_order_rows, clob_orders_error = fetch_polymarket_clob_open_orders(open_order_rows or [])
+        if clob_open_order_rows is not None:
+            open_order_rows = clob_open_order_rows
+            live_orders_error = None
+        elif clob_orders_error:
+            live_orders_error = f"direct CLOB unavailable ({clob_orders_error}); Simmer fallback: {live_orders_error or 'ok'}"
         local_live_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
         local_by_key = local_trade_index(local_live_trades)
         exit_checks_by_key = parse_recent_exit_checks()
