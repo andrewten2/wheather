@@ -2121,12 +2121,16 @@ def build_live_trade_summaries(
     closed: list[dict] = []
     for key, row in closed_by_key.items():
         closed_shares = to_float(row.get("filled_shares")) or 0.0
-        remaining_lot_shares = sum(float(lot.get("remaining_shares") or 0.0) for lot in lots.get(key, []))
         open_position = position_by_key.get(key)
         open_position_shares = to_float(open_position.get("shares")) if isinstance(open_position, dict) else None
-        remaining_shares = remaining_lot_shares if remaining_lot_shares > 1e-9 else (open_position_shares or 0.0)
+        # Activity FIFO can be incomplete/stale; only a real current position
+        # should count as "left" in the live dashboard.
+        remaining_shares = open_position_shares or 0.0
         total_shares = closed_shares + max(0.0, remaining_shares)
         if total_shares > 1e-9:
+            if remaining_shares <= max(1e-6, total_shares * 0.005):
+                remaining_shares = 0.0
+                total_shares = closed_shares
             row["closed_shares"] = closed_shares
             row["remaining_shares"] = max(0.0, remaining_shares)
             row["closed_pct"] = min(1.0, max(0.0, closed_shares / total_shares))
@@ -3973,6 +3977,9 @@ INDEX_HTML = r"""<!doctype html>
     .runner-col {
       min-width: 92px;
     }
+    .live-source .live-hide-col {
+      display: none;
+    }
     .runner-breakdown {
       display: flex;
       flex-wrap: wrap;
@@ -4464,7 +4471,6 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="live-mode-chips">
           <span class="live-mode-chip">Strategy <strong id="live-chip-strategy">No Reentry</strong></span>
-          <span class="live-mode-chip">Regime <strong id="live-chip-exit">TP40</strong></span>
           <span class="live-mode-chip">Open bids <strong id="live-chip-orders">0</strong></span>
           <span class="live-mode-chip">Positions <strong id="live-chip-positions">0</strong></span>
         </div>
@@ -4529,7 +4535,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Open Positions</h2><span class="hint" id="open-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Side</th><th>Regime</th><th class="runner-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th><th>Action</th></tr></thead>
+                <thead><tr><th>Side</th><th class="live-hide-col">Regime</th><th class="runner-col live-hide-col">Mode</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Current</th><th class="num">PnL</th><th class="num">Final</th><th class="num">PnL %</th><th>Held</th><th>City</th><th>Market</th><th>Forecast</th><th>Action</th></tr></thead>
                 <tbody id="positions"></tbody>
               </table>
             </div>
@@ -4538,7 +4544,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="panel-head"><h2>Closed Trades</h2><span class="hint" id="closed-count">...</span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Time</th><th>Side</th><th>Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th class="num">Closed</th><th class="num">Left</th><th>City</th><th>Market</th><th>Forecast</th><th>Reason</th><th>Calc</th></tr></thead>
+                <thead><tr><th>Time</th><th>Side</th><th class="live-hide-col">Regime</th><th class="runner-col">Exit</th><th class="num">Stake</th><th class="num">Entry</th><th class="num">Exit Px</th><th class="num">PnL</th><th class="num">Final</th><th class="num">Closed</th><th class="num">Left</th><th>City</th><th>Market</th><th>Forecast</th><th>Reason</th><th>Calc</th></tr></thead>
                 <tbody id="closed"></tbody>
               </table>
             </div>
@@ -5179,7 +5185,6 @@ INDEX_HTML = r"""<!doctype html>
         `Real account view: open bids from Simmer/Polymarket only. ${filledNote}`
       );
       setText("live-chip-strategy", meta.strategy_label || "No Reentry");
-      setText("live-chip-exit", meta.exit_mode_label || "TP40");
       setText("live-chip-orders", String(orders.length));
       setText("live-chip-positions", String(positions.length));
     }
@@ -5225,8 +5230,8 @@ INDEX_HTML = r"""<!doctype html>
       setHTML("positions", filtered.length ? filtered.slice(0, 30).map(p => `
         <tr>
           <td><span class="pill ${p.side === "YES" ? "yes" : "no"}">${esc(p.side)}</span></td>
-          <td class="regime">${esc(p.regime)}</td>
-          <td>${openModeChip(p)}</td>
+          <td class="regime live-hide-col">${esc(p.regime)}</td>
+          <td class="live-hide-col">${openModeChip(p)}</td>
           <td class="num">${money(p.cost_basis)}</td>
           <td class="num">${price(p.entry_price)}</td>
           <td class="num ${p.stale ? "neutral" : cls(p.pnl)}">${p.stale ? "stale" : price(p.current_price)}</td>
@@ -5258,7 +5263,7 @@ INDEX_HTML = r"""<!doctype html>
         <tr class="${rowClass}">
           <td>${esc(t.time)}</td>
           <td><span class="pill ${t.side === "YES" ? "yes" : "no"}">${esc(t.side)}</span></td>
-          <td class="regime">${esc(t.regime)}</td>
+          <td class="regime live-hide-col">${esc(t.regime)}</td>
           <td>${closedModeChip(t)}</td>
           <td class="num">${money(displayStake)}</td>
           <td class="num">${price(t.entry_price)}</td>
@@ -5543,7 +5548,7 @@ INDEX_HTML = r"""<!doctype html>
       const filterNote = meta.source === "live" && meta.view !== "all" ? " · city-filtered rows" : "";
       const globalNote = meta.source === "live" && s.global_total !== undefined ? ` · Simmer global ${money(s.global_total)}` : "";
       setText("subtitle", isLive ? `Clean live view · open bids → positions after fill${liveDataLabel}${filterNote}${globalNote}` : `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", isLive ? `${meta.source_label} · ${meta.strategy_label} · ${meta.exit_mode_label} · actual stake · real open orders` : `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", isLive ? `${meta.source_label} · ${meta.strategy_label} · actual stake · real open orders` : `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
       setText("sidebar-meta", `${meta.source_label} · ${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", lookbackLabel());
