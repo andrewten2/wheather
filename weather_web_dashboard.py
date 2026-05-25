@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict, is_dataclass
@@ -236,6 +237,7 @@ LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
 LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
 LIVE_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
+SIMMER_READONLY_CLIENT_LOCK = threading.Lock()
 
 
 def tp40_runner_strategy_id(strategy: str) -> str:
@@ -307,6 +309,23 @@ def dict_from_obj(value) -> dict:
     return {}
 
 
+def create_simmer_readonly_client(api_key: str):
+    """Create a live Simmer client for GET calls without triggering SDK risk exits.
+
+    The SDK auto-processes risk alerts during live external-wallet client init.
+    Dashboard refreshes are read-only, so they must not trigger sell attempts.
+    """
+    from simmer_sdk import SimmerClient
+
+    private_key_env_names = ("WALLET_PRIVATE_KEY", "SIMMER_PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY")
+    with SIMMER_READONLY_CLIENT_LOCK:
+        saved = {name: os.environ.pop(name) for name in private_key_env_names if name in os.environ}
+        try:
+            return SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        finally:
+            os.environ.update(saved)
+
+
 def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
     """Fetch actual live positions from Simmer so live dashboard matches agent PnL."""
     now = time.time()
@@ -322,9 +341,7 @@ def fetch_simmer_live_positions() -> tuple[list[dict] | None, str | None]:
         return stale_cached, error
 
     try:
-        from simmer_sdk import SimmerClient
-
-        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        client = create_simmer_readonly_client(api_key)
         if LIVE_POSITION_SOURCE_FILTER:
             positions = client.get_positions(venue="polymarket", source=LIVE_POSITION_SOURCE_FILTER)
         else:
@@ -355,9 +372,7 @@ def fetch_simmer_live_portfolio() -> tuple[dict | None, str | None]:
         return stale_cached, error
 
     try:
-        from simmer_sdk import SimmerClient
-
-        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        client = create_simmer_readonly_client(api_key)
         portfolio = client.get_portfolio() or {}
         LIVE_PORTFOLIO_CACHE.update({"ts": now, "portfolio": dict_from_obj(portfolio), "error": None})
         return LIVE_PORTFOLIO_CACHE["portfolio"], None
@@ -388,9 +403,7 @@ def fetch_simmer_live_activity() -> tuple[list[dict] | None, str | None]:
 
     errors = []
     try:
-        from simmer_sdk import SimmerClient
-
-        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        client = create_simmer_readonly_client(api_key)
         for path in ("/api/sdk/activity", "/api/sdk/trades", "/api/sdk/transactions"):
             try:
                 data = client._request("GET", path, params={"venue": "polymarket"})
@@ -426,9 +439,7 @@ def fetch_simmer_live_open_orders() -> tuple[list[dict] | None, str | None]:
 
     errors = []
     try:
-        from simmer_sdk import SimmerClient
-
-        client = SimmerClient(api_key=api_key, venue="polymarket", live=True)
+        client = create_simmer_readonly_client(api_key)
         try:
             payload = client.get_open_orders()
             rows = extract_rows(payload, ("orders", "open_orders", "openOrders", "items", "data", "results"))
