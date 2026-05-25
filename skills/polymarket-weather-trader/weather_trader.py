@@ -981,6 +981,9 @@ def log_strategy_v1_decision(
     last_buy_price: float = None,
     position_cost_usd: float = None,
     current_side_price: float = None,
+    event_open_position_exists: bool = None,
+    event_open_order_exists: bool = None,
+    blocking_market_id: str = None,
 ) -> None:
     bucket_type = getattr(candidate.bucket, "bucket_type", None) if candidate and candidate.bucket else None
     logger.event(
@@ -1005,6 +1008,9 @@ def log_strategy_v1_decision(
         last_buy_price=round(last_buy_price, 6) if last_buy_price is not None else None,
         position_cost_usd=round(position_cost_usd, 6) if position_cost_usd is not None else None,
         current_side_price=round(current_side_price, 6) if current_side_price is not None else None,
+        event_open_position_exists=event_open_position_exists,
+        event_open_order_exists=event_open_order_exists,
+        blocking_market_id=blocking_market_id,
     )
 
 
@@ -1604,6 +1610,46 @@ def select_strategy_v1_event_trade(
             "edge_yes": first["edge_yes"],
             "edge_no": first["edge_no"],
         }
+
+    if execution_mode != ExecutionMode.PAPER:
+        event_market_ids = {
+            item["candidate"].market_id
+            for item in ranked_candidates
+            if item.get("candidate") is not None and getattr(item["candidate"], "market_id", None)
+        }
+        live_positions_by_market = live_positions_by_market or {}
+        blocking_position = next(
+            (
+                position
+                for market_id, position in live_positions_by_market.items()
+                if market_id in event_market_ids and _position_total_shares(position) > 0
+            ),
+            None,
+        )
+        open_order_market_ids = live_open_order_market_ids()
+        blocking_order_market_id = next(
+            (market_id for market_id in event_market_ids if market_id in open_order_market_ids),
+            None,
+        )
+        if blocking_position is not None or blocking_order_market_id is not None:
+            first = ranked_candidates[0]
+            return {
+                "action": "skip",
+                "reason": "event_position_exists" if blocking_position is not None else "event_open_order_pending",
+                "mode": regime_mode,
+                "forecast_fresh": forecast_fresh,
+                "candidate": first["candidate"],
+                "probability_estimate": first["probability_estimate"],
+                "bucket_relation": first["bucket_relation"],
+                "price_yes": first["yes_price"],
+                "gaussian_probability": first["gaussian_probability"],
+                "edge_yes": first["edge_yes"],
+                "edge_no": first["edge_no"],
+                "entry_bucket_relation": first.get("entry_bucket_relation"),
+                "event_open_position_exists": blocking_position is not None,
+                "event_open_order_exists": blocking_order_market_id is not None,
+                "blocking_market_id": getattr(blocking_position, "market_id", None) or blocking_order_market_id,
+            }
 
     if regime_mode == "early":
         central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
@@ -4591,6 +4637,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 last_buy_price=strategy_v1_decision.get("last_buy_price"),
                 position_cost_usd=strategy_v1_decision.get("position_cost_usd"),
                 current_side_price=strategy_v1_decision.get("current_side_price"),
+                event_open_position_exists=strategy_v1_decision.get("event_open_position_exists"),
+                event_open_order_exists=strategy_v1_decision.get("event_open_order_exists"),
+                blocking_market_id=strategy_v1_decision.get("blocking_market_id"),
             )
 
         should_trade = False

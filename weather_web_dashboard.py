@@ -1534,6 +1534,7 @@ def normalize_simmer_failed_activity_order(row: dict, question_lookup: dict[str,
         or row.get("updated_at")
     )
     return {
+        "order_id": clean_text(row.get("order_id") or row.get("orderId") or row.get("id") or row.get("hash")),
         "timestamp": timestamp,
         "time": format_time(timestamp),
         "age": age_label(timestamp),
@@ -1865,6 +1866,12 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
     shares = first_float(
         order,
         (
+            "total_shares",
+            "totalShares",
+            "total_size",
+            "totalSize",
+            "size_total",
+            "sizeTotal",
             "original_shares",
             "originalShares",
             "initial_shares",
@@ -1886,6 +1893,8 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
             "contracts",
             "order_size",
             "orderSize",
+            "order_quantity",
+            "orderQuantity",
         ),
     )
     remaining = first_float(
@@ -1899,11 +1908,21 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
             "unfilledShares",
             "open_shares",
             "openShares",
+            "open_size",
+            "openSize",
+            "size_remaining",
+            "sizeRemaining",
+            "remaining_quantity",
+            "remainingQuantity",
+            "left",
         ),
     )
     filled = first_float(
         order,
         (
+            "filled",
+            "filled_quantity",
+            "filledQuantity",
             "filled_shares",
             "filledShares",
             "filled_size",
@@ -1912,6 +1931,8 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
             "matchedShares",
             "matched_size",
             "matchedSize",
+            "size_matched",
+            "sizeMatched",
         ),
     )
     if shares is None and filled is not None and remaining is not None:
@@ -1922,13 +1943,32 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         remaining = max(0.0, shares - filled)
     if (shares is None or shares <= 0) and remaining is not None and remaining > 0:
         shares = remaining
-    amount = first_float(order, ("amount", "amount_usd", "cost", "cost_usd", "value", "notional"))
+    amount = first_float(
+        order,
+        (
+            "amount",
+            "amount_usd",
+            "amountUsd",
+            "cost",
+            "cost_usd",
+            "costUsdc",
+            "value",
+            "notional",
+            "total",
+            "total_usd",
+            "totalUsd",
+            "order_amount",
+            "orderAmount",
+        ),
+    )
     if amount is None and price is not None and shares is not None:
         amount = price * shares
     if (shares is None or shares <= 0) and amount is not None and price is not None and price > 0:
         shares = amount / price
     if remaining is None and shares is not None and shares > 0:
         remaining = max(0.0, shares - (filled or 0.0))
+    if filled is None and shares is not None and shares > 0:
+        filled = max(0.0, shares - (remaining or shares))
     status = clean_text(order.get("status") or order.get("order_status") or order.get("orderStatus") or "open").lower()
     if failure_status:
         status = failure_status
@@ -1947,6 +1987,8 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         status = "filled"
     elif status in {"filled", "matched"} and (filled or 0) <= 0 and (amount or 0) <= 0 and (shares or 0) <= 0:
         status = "failed"
+    elif status in {"open", "pending", "live", "active"} and (filled or 0) <= 0:
+        status = "open"
     fill_pct = None
     if shares and shares > 0 and filled is not None:
         fill_pct = min(1.0, max(0.0, filled / shares))
@@ -1954,6 +1996,7 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
     if not question and not market_id:
         return None
     return {
+        "order_id": clean_text(order.get("order_id") or order.get("orderId") or order.get("id") or order.get("hash")),
         "timestamp": timestamp,
         "time": format_time(timestamp),
         "age": age_label(timestamp),
@@ -1994,6 +2037,22 @@ def build_live_order_rows(
         and order.get("is_pending")
         and live_primary_key(order) not in open_position_keys
     ]
+    deduped: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        order_id = clean_text(row.get("order_id") or row.get("id"))
+        key = (order_id, "") if order_id else (
+            clean_text(row.get("market_id")),
+            f"{row.get('side')}:{row.get('price')}:{row.get('timestamp')}",
+        )
+        previous = deduped.get(key)
+        if previous is None:
+            deduped[key] = row
+            continue
+        current_ts = parse_dt(row.get("timestamp"))
+        previous_ts = parse_dt(previous.get("timestamp"))
+        if (current_ts or datetime.min.replace(tzinfo=DISPLAY_TZ)) > (previous_ts or datetime.min.replace(tzinfo=DISPLAY_TZ)):
+            deduped[key] = row
+    rows = list(deduped.values())
     def order_sort_key(item: dict):
         parsed = parse_dt(item.get("timestamp"))
         timestamp = parsed.timestamp() if parsed else 0.0
@@ -2058,17 +2117,9 @@ def normalize_state(
             enrich_live_sell_from_context(trade, local_by_key, exit_checks_by_key)
             for trade in raw_trades
         ]
-        remote_buy_keys = {
-            trade_market_key(trade)
-            for trade in raw_trades
-            if trade.get("action") == "buy"
-        }
-        local_buy_context = [
-            trade
-            for trade in local_live_trades
-            if trade.get("action") == "buy" and trade_market_key(trade) not in remote_buy_keys
-        ]
-        matching_trades = [*local_buy_context, *raw_trades]
+        # Live view should mirror the real Simmer/Polymarket account. Local live
+        # state is useful only as sell-context fallback, not as display data.
+        matching_trades = raw_trades
         question_lookup = {
             clean_text(item.get("market_id")): clean_text(item.get("question"))
             for item in [*raw_positions, *matching_trades]
@@ -2214,7 +2265,9 @@ def normalize_state(
     def runner_leg_summary(trade: dict) -> dict | None:
         if isinstance(trade.get("runner_legs"), dict):
             return trade.get("runner_legs")
-        if not (is_partial_exit_trade(trade) or is_runner_trade(trade) or trade_exit_reason(trade) == "market_settlement"):
+        if exit_mode != "tp40_runner":
+            return None
+        if not (is_partial_exit_trade(trade) or is_runner_trade(trade)):
             return None
         group = all_sells_by_key.get(trade_market_key(trade), [])
         partial_trade = next((item for item in group if is_partial_exit_trade(item)), None)
@@ -2902,6 +2955,84 @@ INDEX_HTML = r"""<!doctype html>
     }
     .top-actions > .stake-sim {
       display: none;
+    }
+    .live-mode-strip {
+      display: none;
+      margin: 0 0 18px;
+      padding: 18px;
+      border: 1px solid rgba(22,185,120,.22);
+      border-radius: 22px;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(22,185,120,.18), transparent 28%),
+        linear-gradient(135deg, rgba(255,255,255,.92), rgba(234,248,242,.82));
+      box-shadow: 0 18px 60px rgba(24,45,76,.08);
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .live-source .live-mode-strip {
+      display: flex;
+    }
+    .live-source .toolbar {
+      display: none;
+    }
+    .live-source .top-actions .stake-sim,
+    .live-source .custom-lookback {
+      display: none;
+    }
+    .live-mode-main {
+      min-width: 0;
+    }
+    .live-mode-kicker {
+      color: #0f8e58;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 950;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+    }
+    .live-mode-title {
+      margin-top: 7px;
+      font-size: clamp(24px, 1.8vw, 34px);
+      font-weight: 950;
+      letter-spacing: -.04em;
+    }
+    .live-mode-subtitle {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .live-mode-chips {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 9px;
+    }
+    .live-mode-chip {
+      padding: 10px 12px;
+      border: 1px solid rgba(22,185,120,.18);
+      border-radius: 999px;
+      background: rgba(255,255,255,.72);
+      color: #12395d;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 950;
+      white-space: nowrap;
+    }
+    .live-mode-chip strong {
+      color: #0f8e58;
+    }
+    html[data-theme="dark"] .live-mode-strip {
+      background:
+        radial-gradient(circle at 12% 0%, rgba(22,185,120,.13), transparent 30%),
+        linear-gradient(135deg, rgba(15,32,49,.94), rgba(10,28,35,.82));
+      border-color: rgba(82,240,168,.18);
+    }
+    html[data-theme="dark"] .live-mode-chip {
+      background: rgba(255,255,255,.05);
+      color: rgba(239,249,255,.86);
+      border-color: rgba(82,240,168,.15);
     }
     .stake-control {
       align-content: flex-start;
@@ -3942,6 +4073,20 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="live-mode-strip" aria-live="polite">
+        <div class="live-mode-main">
+          <div class="live-mode-kicker">Live mode selected</div>
+          <div class="live-mode-title" id="live-mode-title">Real Polymarket orders</div>
+          <div class="live-mode-subtitle" id="live-mode-subtitle">No local paper rows. Pending bids stay in orders; filled bids become positions.</div>
+        </div>
+        <div class="live-mode-chips">
+          <span class="live-mode-chip">Strategy <strong id="live-chip-strategy">No Reentry</strong></span>
+          <span class="live-mode-chip">Regime <strong id="live-chip-exit">TP40</strong></span>
+          <span class="live-mode-chip">Open bids <strong id="live-chip-orders">0</strong></span>
+          <span class="live-mode-chip">Positions <strong id="live-chip-positions">0</strong></span>
+        </div>
+      </section>
+
       <section class="metrics">
         <div class="metric-card"><div><div class="label">Total PnL</div><div class="value" id="m-total">...</div></div><canvas class="mini-spark" id="spark-total"></canvas></div>
         <div class="metric-card"><div><div class="label">Realized PnL</div><div class="value" id="m-realized">...</div></div><canvas class="mini-spark" id="spark-realized"></canvas></div>
@@ -4631,6 +4776,24 @@ INDEX_HTML = r"""<!doctype html>
       setHTML("stats", rows.map(([ic, k, v]) => `<div class="stat"><span><span class="stat-icon">${esc(ic)}</span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join(""));
     }
 
+    function renderLiveModeStrip(data) {
+      const meta = data?.meta || {};
+      const orders = data?.orders || [];
+      const positions = data?.positions || [];
+      const filledNote = positions.length
+        ? `${positions.length} filled position${positions.length === 1 ? "" : "s"} now tracked from Simmer/Polymarket.`
+        : "No filled live positions yet.";
+      setText("live-mode-title", `${meta.source_label || "Live"} · ${meta.strategy_label || "No Reentry"}`);
+      setText(
+        "live-mode-subtitle",
+        `Real account view: open bids from Simmer/Polymarket only. ${filledNote}`
+      );
+      setText("live-chip-strategy", meta.strategy_label || "No Reentry");
+      setText("live-chip-exit", meta.exit_mode_label || "TP40");
+      setText("live-chip-orders", String(orders.length));
+      setText("live-chip-positions", String(positions.length));
+    }
+
     function setText(id, text) {
       const el = document.getElementById(id);
       const next = String(text ?? "");
@@ -4979,13 +5142,14 @@ INDEX_HTML = r"""<!doctype html>
       document.body.classList.remove("charts-only");
       document.body.classList.remove("compare-only");
       const s = data.stats, meta = data.meta;
-      const titleSource = meta.source === "live" ? "Live" : meta.view_label;
-      const liveDataLabel = meta.source === "live" ? ` · ${meta.live_positions_source === "simmer" ? "Simmer positions" : "local positions"}` : "";
+      const isLive = meta.source === "live";
+      const titleSource = isLive ? "Live Polymarket" : meta.view_label;
+      const liveDataLabel = isLive ? ` · ${meta.live_positions_source === "simmer" ? "real Simmer data" : "Simmer unavailable"}` : "";
       setText("title", `${titleSource} / ${meta.strategy_label}`);
       const filterNote = meta.source === "live" && meta.view !== "all" ? " · city-filtered rows" : "";
       const globalNote = meta.source === "live" && s.global_total !== undefined ? ` · Simmer global ${money(s.global_total)}` : "";
-      setText("subtitle", `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
-      setText("status-line", `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${liveDataLabel}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
+      setText("subtitle", isLive ? `Clean live view · open bids → positions after fill${liveDataLabel}${filterNote}${globalNote}` : `${meta.source_label} · ${meta.exit_mode_label} · ${lookbackLabel()}${stakeLabel()}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
+      setText("status-line", isLive ? `${meta.source_label} · ${meta.strategy_label} · ${meta.exit_mode_label} · actual stake · real open orders` : `${meta.source_label} · ${lookbackLabel()}${stakeLabel()}${filterNote}${globalNote} · effective state: ${meta.effective_strategy}`);
       setText("date-chip", new Date(meta.server_time).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }));
       setText("sidebar-meta", `${meta.source_label} · ${meta.view_label} · ${meta.strategy_label}`);
       setText("lookback-label", lookbackLabel());
@@ -4994,8 +5158,9 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error].filter(Boolean).join(" · ");
+      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error, meta.live_orders_error].filter(Boolean).join(" · ");
       setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · Simmer error: ${liveErrors}` : ""}`);
+      if (isLive) renderLiveModeStrip(data);
       renderStats(s);
       renderOrders(data.orders || []);
       renderPositions(data.positions);
