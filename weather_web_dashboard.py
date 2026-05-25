@@ -633,6 +633,28 @@ def first_float(row: dict | None, fields: tuple[str, ...]) -> float | None:
     return None
 
 
+def live_order_amount_fallback_usd() -> float | None:
+    """Best-effort size for open CLOB bids when Simmer only reports hash/price."""
+    for name in (
+        "WEATHER_DASHBOARD_LIVE_ORDER_AMOUNT_USD",
+        "WEATHER_BOT_LIVE_MAX_POSITION_USD",
+        "SIMMER_WEATHER_MAX_POSITION_USD",
+        "SIMMER_WEATHER_MAX_POSITION",
+    ):
+        value = parse_optional_float(os.environ.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def first_live_portfolio_float(portfolio: dict | None, fields: tuple[str, ...]) -> float | None:
+    if not isinstance(portfolio, dict):
+        return None
+    polymarket = portfolio.get("polymarket")
+    nested_value = first_float(polymarket, fields) if isinstance(polymarket, dict) else None
+    return nested_value if nested_value is not None else first_float(portfolio, fields)
+
+
 def parse_optional_float(value) -> float | None:
     if value is None:
         return None
@@ -1340,7 +1362,7 @@ def apply_simmer_portfolio_summary(summary: dict, portfolio: dict | None, positi
     if not isinstance(portfolio, dict):
         return summary
 
-    total = first_float(
+    total = first_live_portfolio_float(
         portfolio,
         (
             "profit_loss",
@@ -1353,7 +1375,7 @@ def apply_simmer_portfolio_summary(summary: dict, portfolio: dict | None, positi
             "netPnl",
         ),
     )
-    realized = first_float(
+    realized = first_live_portfolio_float(
         portfolio,
         (
             "realized_pnl",
@@ -1363,7 +1385,7 @@ def apply_simmer_portfolio_summary(summary: dict, portfolio: dict | None, positi
             "closedPnl",
         ),
     )
-    unrealized = first_float(
+    unrealized = first_live_portfolio_float(
         portfolio,
         (
             "unrealized_pnl",
@@ -1373,11 +1395,14 @@ def apply_simmer_portfolio_summary(summary: dict, portfolio: dict | None, positi
             "openPnl",
         ),
     )
-    wins = first_float(portfolio, ("wins", "winning_trades", "winningTrades"))
-    losses = first_float(portfolio, ("losses", "losing_trades", "losingTrades"))
-    winrate = first_float(portfolio, ("winrate", "win_rate", "winRate"))
-    open_positions = first_float(portfolio, ("open_positions", "openPositions", "positions_count", "positionsCount"))
-    exposure = first_float(portfolio, ("exposure", "total_exposure", "totalExposure"))
+    wins = first_live_portfolio_float(portfolio, ("wins", "winning_trades", "winningTrades"))
+    losses = first_live_portfolio_float(portfolio, ("losses", "losing_trades", "losingTrades"))
+    winrate = first_live_portfolio_float(portfolio, ("winrate", "win_rate", "winRate"))
+    open_positions = first_live_portfolio_float(
+        portfolio,
+        ("open_positions", "openPositions", "positions_count", "positionsCount"),
+    )
+    exposure = first_live_portfolio_float(portfolio, ("exposure", "total_exposure", "totalExposure"))
 
     if total is not None:
         summary["total"] = total
@@ -1965,6 +1990,20 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         amount = price * shares
     if (shares is None or shares <= 0) and amount is not None and price is not None and price > 0:
         shares = amount / price
+    amount_estimated = False
+    if (
+        (amount is None or amount <= 0)
+        and (shares is None or shares <= 0)
+        and price is not None
+        and price > 0
+    ):
+        fallback_amount = live_order_amount_fallback_usd()
+        if fallback_amount is not None:
+            amount = fallback_amount
+            shares = fallback_amount / price
+            filled = max(0.0, filled or 0.0)
+            remaining = max(0.0, shares - filled)
+            amount_estimated = True
     if remaining is None and shares is not None and shares > 0:
         remaining = max(0.0, shares - (filled or 0.0))
     if filled is None and shares is not None and shares > 0:
@@ -2011,6 +2050,7 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         "remaining_shares": remaining,
         "fill_pct": fill_pct,
         "amount_usd": amount,
+        "amount_estimated": amount_estimated,
         "market_url": polymarket_market_url(order) or polymarket_market_url({"question": question}),
         "is_pending": status not in {"filled", "matched", "cancelled", "canceled", "failed", "rejected"},
         "row_kind": "resting_bid",
@@ -2192,7 +2232,7 @@ def normalize_state(
         else:
             summary["note"] = "filtered_live_rows"
             if portfolio:
-                portfolio_total = first_float(
+                portfolio_total = first_live_portfolio_float(
                     portfolio,
                     ("profit_loss", "profitLoss", "total_pnl", "totalPnL", "pnl", "pnl_usdc", "net_pnl", "netPnl"),
                 )
@@ -4264,6 +4304,7 @@ INDEX_HTML = r"""<!doctype html>
     if (state.page === "logs") state.source = "live";
 
     const money = v => v === null || v === undefined ? "n/a" : `${v < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}`;
+    const orderMoney = o => o?.amount_estimated && o?.amount_usd !== null && o?.amount_usd !== undefined ? `~${money(o.amount_usd)}` : money(o?.amount_usd);
     const price = v => v === null || v === undefined ? "n/a" : Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
     const pct = v => v === null || v === undefined ? "n/a" : `${(Number(v) * 100).toFixed(1)}%`;
     const cls = v => Number(v || 0) > 0 ? "positive" : Number(v || 0) < 0 ? "negative" : "neutral";
@@ -4817,7 +4858,7 @@ INDEX_HTML = r"""<!doctype html>
 	          <td><span class="pill ${o.side === "YES" ? "yes" : "no"}">${esc(o.side || "?")}</span></td>
 	          <td>${orderStatusChip(o)}</td>
 	          <td class="num">${price(o.price)}</td>
-	          <td class="num">${money(o.amount_usd)}</td>
+	          <td class="num">${orderMoney(o)}</td>
 	          <td class="num">${qty(o.shares)}</td>
 	          <td class="num">${qty(o.filled_shares)}</td>
 	          <td class="num">${qty(o.remaining_shares)}</td>
