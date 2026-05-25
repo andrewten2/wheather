@@ -655,7 +655,10 @@ def live_order_amount_fallback_usd() -> float | None:
         value = parse_optional_float(os.environ.get(name))
         if value is not None:
             return value
-    return None
+    # Current live weather bids are submitted as $2 GTC orders. Simmer's
+    # open-orders API can omit this notional, so keep the table useful unless
+    # the deployment overrides the value above.
+    return 2.0
 
 
 def first_live_portfolio_float(portfolio: dict | None, fields: tuple[str, ...]) -> float | None:
