@@ -196,7 +196,7 @@ def _get_positive_float_env(name: str, default: float) -> float:
 WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
 WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_SECONDS", 30)
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
-LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 120)
+LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 900)
 LIVE_ENTRY_MAX_SPREAD = _get_positive_float_env("WEATHER_BOT_LIVE_MAX_ENTRY_SPREAD", 0.03)
 
 # SDK adapter / execution singletons
