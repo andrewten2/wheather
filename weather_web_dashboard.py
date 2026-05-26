@@ -768,6 +768,49 @@ def local_trade_index(trades: list[dict]) -> dict[tuple[str, str], list[dict]]:
     return by_key
 
 
+def live_entry_metadata_index(local_by_key: dict[tuple[str, str], list[dict]]) -> dict[tuple[str, str], dict]:
+    metadata_by_key = {}
+    for key, trades in local_by_key.items():
+        buys = [trade for trade in trades if trade.get("action") == "buy"]
+        if not buys:
+            continue
+        trade = buys[-1]
+        signal = nested_signal(trade)
+        metadata_by_key[key] = {
+            "entry_regime": trade.get("entry_regime"),
+            "entry_forecast_value": trade.get("entry_forecast_value") or signal.get("entry_forecast_value"),
+            "entry_forecast_unit": trade.get("entry_forecast_unit") or signal.get("entry_forecast_unit"),
+            "entry_forecast_source": trade.get("entry_forecast_source") or signal.get("entry_forecast_source"),
+            "forecast_value": trade.get("forecast_value") or signal.get("forecast_value"),
+            "forecast_unit": trade.get("forecast_unit") or signal.get("unit_label"),
+            "forecast_source": trade.get("forecast_source") or signal.get("forecast_source"),
+            "forecast_label": forecast_label(trade),
+            "market_url": trade.get("market_url"),
+        }
+    return metadata_by_key
+
+
+def enrich_live_metadata_from_entry(trade: dict, metadata_by_key: dict[tuple[str, str], dict]) -> dict:
+    metadata = metadata_by_key.get(trade_market_key(trade))
+    if not metadata:
+        return trade
+    enriched = dict(trade)
+    for field in (
+        "entry_regime",
+        "entry_forecast_value",
+        "entry_forecast_unit",
+        "entry_forecast_source",
+        "forecast_value",
+        "forecast_unit",
+        "forecast_source",
+        "forecast_label",
+        "market_url",
+    ):
+        if enriched.get(field) in (None, "", "-"):
+            enriched[field] = metadata.get(field)
+    return enriched
+
+
 def enrich_live_sell_from_context(
     trade: dict,
     local_by_key: dict[tuple[str, str], list[dict]],
@@ -1311,6 +1354,9 @@ def annotate_runner_closes(trades: list[dict]) -> list[dict]:
 
 
 def forecast_label(item: dict) -> str:
+    direct = item.get("forecast_label") or item.get("forecast")
+    if direct not in (None, "", "-"):
+        return str(direct)
     signal = nested_signal(item)
     value = item.get("entry_forecast_value")
     if value is None:
@@ -2474,6 +2520,7 @@ def normalize_state(
             live_orders_error = f"direct CLOB unavailable ({clob_orders_error}); Simmer fallback: {live_orders_error or 'ok'}"
         local_live_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
         local_by_key = local_trade_index(local_live_trades)
+        local_entry_metadata = live_entry_metadata_index(local_by_key)
         exit_checks_by_key = parse_recent_exit_checks()
         raw_position_source = [
             position
@@ -2485,6 +2532,10 @@ def normalize_state(
             trade
             for trade in (normalize_simmer_activity_trade(row) for row in values(activity_rows or []))
             if trade is not None
+        ]
+        raw_trades = [
+            enrich_live_metadata_from_entry(trade, local_entry_metadata)
+            for trade in raw_trades
         ]
         raw_trades = [
             enrich_live_sell_from_context(trade, local_by_key, exit_checks_by_key)
@@ -2519,29 +2570,43 @@ def normalize_state(
         open_orders = maybe_filter_live_by_view(open_orders, view)
         for position in raw_positions:
             annotation = live_position_annotations.get(live_primary_key(position))
-            if not annotation:
+            local_metadata = local_entry_metadata.get(live_primary_key(position), {})
+            if not annotation and not local_metadata:
                 continue
             # When Simmer positions omit average entry/cost fields, reconstruct
             # the open lot from real activity fills instead of local paper state.
             position.update(
                 {
-                    "shares": annotation.get("shares") or position.get("shares"),
-                    "cost_basis": annotation.get("cost_basis") or position.get("cost_basis"),
-                    "entry_price": annotation.get("entry_price") or position.get("entry_price"),
-                    "avg_cost": annotation.get("entry_price") or position.get("avg_cost"),
-                    "opened_at": annotation.get("opened_at") or position.get("opened_at"),
-                    "entry_regime": annotation.get("entry_regime") or position.get("entry_regime"),
-                    "runner_after_partial_exit": annotation.get("runner_after_partial_exit")
+                    "shares": (annotation or {}).get("shares") or position.get("shares"),
+                    "cost_basis": (annotation or {}).get("cost_basis") or position.get("cost_basis"),
+                    "entry_price": (annotation or {}).get("entry_price") or position.get("entry_price"),
+                    "avg_cost": (annotation or {}).get("entry_price") or position.get("avg_cost"),
+                    "opened_at": (annotation or {}).get("opened_at") or position.get("opened_at"),
+                    "entry_regime": (annotation or {}).get("entry_regime")
+                    or local_metadata.get("entry_regime")
+                    or position.get("entry_regime"),
+                    "entry_forecast_value": local_metadata.get("entry_forecast_value")
+                    or position.get("entry_forecast_value"),
+                    "entry_forecast_unit": local_metadata.get("entry_forecast_unit")
+                    or position.get("entry_forecast_unit"),
+                    "entry_forecast_source": local_metadata.get("entry_forecast_source")
+                    or position.get("entry_forecast_source"),
+                    "forecast_label": (annotation or {}).get("forecast")
+                    or local_metadata.get("forecast_label")
+                    or position.get("forecast_label"),
+                    "runner_after_partial_exit": (annotation or {}).get("runner_after_partial_exit")
                     or position.get("runner_after_partial_exit"),
-                    "partial_take_profit_done": annotation.get("partial_take_profit_done")
+                    "partial_take_profit_done": (annotation or {}).get("partial_take_profit_done")
                     or position.get("partial_take_profit_done"),
-                    "partial_take_profit_price": annotation.get("partial_take_profit_price")
+                    "partial_take_profit_price": (annotation or {}).get("partial_take_profit_price")
                     or position.get("partial_take_profit_price"),
-                    "partial_take_profit_realized_pnl": annotation.get("partial_take_profit_realized_pnl")
+                    "partial_take_profit_realized_pnl": (annotation or {}).get("partial_take_profit_realized_pnl")
                     or position.get("partial_take_profit_realized_pnl"),
-                    "partial_take_profit_shares": annotation.get("partial_take_profit_shares")
+                    "partial_take_profit_shares": (annotation or {}).get("partial_take_profit_shares")
                     or position.get("partial_take_profit_shares"),
-                    "market_url": annotation.get("market_url") or position.get("market_url"),
+                    "market_url": (annotation or {}).get("market_url")
+                    or local_metadata.get("market_url")
+                    or position.get("market_url"),
                 }
             )
         if remote_positions is not None:
