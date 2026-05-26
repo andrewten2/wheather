@@ -2361,12 +2361,12 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
         return None, book, "missing_best_ask"
 
     # Rule (tick-based to avoid float precision drift):
-    # - spread above max: skip, weather books are too thin/expensive
+    # - spread above max: rest at best bid only; do not chase a wide book
     # - spread <= 1 tick: place at bid (do not overpay)
     # - spread >= 2 ticks: place at bid + 1 tick, capped below mid/ask
     spread = float(best_ask) - float(best_bid)
     if spread - float(LIVE_ENTRY_MAX_SPREAD) > 1e-9:
-        return None, book, "spread_too_wide"
+        return round(max(0.001, min(0.999, float(best_bid))), 4), book, "wide_spread_bid_only"
 
     spread_ticks = int(round(spread / MIN_TICK_SIZE))
     if spread_ticks >= 2:
@@ -4575,7 +4575,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                         should_trade = False
                         reasons = [slippage_reason] + list(reasons or [])
             else:
-                should_trade, reasons = check_context_safeguards(context)
+                # Live entries rest as GTC limit bids, so market-order slippage is
+                # not the relevant risk. Spread/orderbook/TTL guards handle entry.
+                should_trade, reasons = check_context_safeguards(context, ignore_slippage=True)
             if not should_trade:
                 log(f"  ⏭️  Safeguard blocked: {'; '.join(reasons)}")
                 skip_reasons.append(f"safeguard: {reasons[0]}")
