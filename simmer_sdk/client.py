@@ -836,6 +836,10 @@ class SimmerClient:
             raise ValueError("shares required for sell orders")
         if not is_sell and amount <= 0:
             raise ValueError("amount required for buy orders")
+        if is_sell:
+            # Polymarket rejects overly precise share amounts; normalize once
+            # before both local signing and the API payload.
+            shares = round(float(shares), 5)
 
         # Paper trading: simulate with real prices (no live API calls)
         if not self.live:
@@ -2266,6 +2270,7 @@ class SimmerClient:
             tick_size=tick_size,
             fee_rate_bps=fee_rate_bps,
             order_type=order_type,
+            action=action,
         )
 
         return signed.to_dict()

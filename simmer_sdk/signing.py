@@ -72,6 +72,7 @@ def build_and_sign_order(
     tick_size: float = 0.01,
     fee_rate_bps: int = 0,
     order_type: str = "FAK",  # "FAK", "FOK", "GTC", "GTD"
+    action: str = None,  # Original SDK action: "buy" or "sell"
 ) -> SignedOrder:
     """
     Build and sign a Polymarket order.
@@ -137,11 +138,14 @@ def build_and_sign_order(
     if order_type in ("FAK", "FOK"):
         maker_raw = _to_token_decimals(_round_normal(maker_raw / 1e6, 2))
 
-    # Keep the exchange-size guard for opening BUY orders, but allow SELL
-    # orders below 5 shares so bots can close small leftovers/partial exits.
+    # Keep the exchange-size guard for opening buys, but allow any sell exit
+    # below 5 shares so bots can close small leftovers/partial exits. Use the
+    # original SDK action instead of only CLOB side because some sell flows can
+    # be represented differently downstream.
     shares_raw = taker_raw if side == "BUY" else maker_raw
     effective_shares = shares_raw / POLYMARKET_DECIMAL_FACTOR
-    if side == "BUY" and effective_shares < MIN_ORDER_SIZE_SHARES:
+    is_opening_buy = action == "buy" if action in {"buy", "sell"} else side == "BUY"
+    if is_opening_buy and effective_shares < MIN_ORDER_SIZE_SHARES:
         raise ValueError(
             f"Order too small: {effective_shares:.2f} shares after rounding "
             f"is below minimum ({MIN_ORDER_SIZE_SHARES})"
