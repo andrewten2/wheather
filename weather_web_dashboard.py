@@ -1069,6 +1069,83 @@ def enrich_live_sell_from_context(
     return enriched
 
 
+def synthesize_missing_live_closes(
+    trades: list[dict],
+    positions: list[dict],
+    local_by_key: dict[tuple[str, str], list[dict]],
+    exit_checks_by_key: dict[tuple[str, str], list[dict]],
+) -> list[dict]:
+    """Add conservative fallback rows for live closes missing from activity.
+
+    Manual Polymarket UI sells do not always appear in Simmer activity and do
+    not write our local bot ledger. If a locally-known bot buy no longer has a
+    live position and no sell row exists, show a detected manual close so the
+    dashboard does not silently lose the trade.
+    """
+    enriched = list(trades)
+    position_keys = {live_primary_key(position) for position in positions if live_primary_key(position)[0]}
+    existing_sell_keys = {
+        trade_market_key(trade)
+        for trade in enriched
+        if trade.get("action") == "sell" and trade_market_key(trade)[0]
+    }
+
+    for key, local_trades in local_by_key.items():
+        if not key[0] or key in position_keys or key in existing_sell_keys:
+            continue
+        local_buys = [trade for trade in local_trades if trade.get("action") == "buy"]
+        local_sells = [trade for trade in local_trades if trade.get("action") == "sell"]
+        if local_sells:
+            for sell in local_sells:
+                fallback = dict(sell)
+                fallback.setdefault("exit_reason", trade_exit_reason(fallback) or "bot_local_close")
+                fallback["_local_activity_fallback"] = True
+                enriched.append(fallback)
+            existing_sell_keys.add(key)
+            continue
+        if not local_buys:
+            continue
+
+        bought_shares = sum(to_float(trade.get("filled_shares")) or 0.0 for trade in local_buys)
+        cost_basis = sum(live_trade_amount(trade) or trade_cost(trade, trade_price(trade, ("simulated_fill_price", "entry_price"))) or 0.0 for trade in local_buys)
+        if bought_shares <= 1e-9 or cost_basis <= 0:
+            continue
+
+        latest_buy = local_buys[-1]
+        exit_check = exit_checks_by_key.get(key, [])[-1] if exit_checks_by_key.get(key) else None
+        entry_price = cost_basis / bought_shares
+        exit_price = price_value(exit_check.get("current_price")) if exit_check else None
+        if exit_price is None:
+            exit_price = price_value(latest_buy.get("current_price")) or entry_price
+        proceeds = bought_shares * exit_price
+        enriched.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": "sell",
+                "side": key[1].lower(),
+                "market_id": key[0],
+                "question": clean_text(latest_buy.get("question")),
+                "filled_shares": bought_shares,
+                "requested_shares": bought_shares,
+                "simulated_fill_price": exit_price,
+                "entry_price": entry_price,
+                "amount_usd": proceeds,
+                "cost_basis": cost_basis,
+                "realized_pnl": proceeds - cost_basis,
+                "exit_reason": "manual_external_close",
+                "match_mode": "manual_detected",
+                "entry_regime": latest_buy.get("entry_regime"),
+                "entry_forecast_value": latest_buy.get("entry_forecast_value"),
+                "entry_forecast_unit": latest_buy.get("entry_forecast_unit"),
+                "entry_forecast_source": latest_buy.get("entry_forecast_source"),
+                "market_url": latest_buy.get("market_url"),
+                "_synthetic_manual_close": True,
+            }
+        )
+        existing_sell_keys.add(key)
+    return enriched
+
+
 def values(value):
     if isinstance(value, dict):
         return list(value.values())
@@ -2806,6 +2883,12 @@ def normalize_state(
             enrich_live_sell_from_context(trade, local_by_key, exit_checks_by_key)
             for trade in raw_trades
         ]
+        raw_trades = synthesize_missing_live_closes(
+            raw_trades,
+            raw_positions,
+            local_by_key,
+            exit_checks_by_key,
+        )
         # Live view should mirror the real Simmer/Polymarket account. Local live
         # state is useful only as sell-context fallback, not as display data.
         matching_trades = raw_trades
