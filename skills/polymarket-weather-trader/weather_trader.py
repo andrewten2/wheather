@@ -196,7 +196,7 @@ def _get_positive_float_env(name: str, default: float) -> float:
 WEATHER_BOT_LOOP_SECONDS = _get_positive_int_env("WEATHER_BOT_LOOP_SECONDS", 30)
 WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_SECONDS", 30)
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
-LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 3600)
+LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 120)
 LIVE_ENTRY_MAX_SPREAD = _get_positive_float_env("WEATHER_BOT_LIVE_MAX_ENTRY_SPREAD", 0.03)
 
 # SDK adapter / execution singletons
@@ -637,6 +637,37 @@ def record_live_mark(market_id: str, current_price: float) -> None:
     save_live_strategy_state(state)
 
 
+def load_live_positions_from_state() -> list[Position]:
+    """Fallback live positions from local bot state when Simmer omits a wallet position."""
+    positions = []
+    for market_id, stored in load_live_strategy_state().get("positions", {}).items():
+        side = stored.get("side", "yes")
+        shares = float(stored.get("shares", 0.0) or 0.0)
+        if shares <= 0:
+            continue
+        current_price = stored.get("current_price")
+        cost_basis = float(stored.get("cost_basis", 0.0) or 0.0)
+        current_value = (shares * float(current_price)) if current_price is not None else None
+        pnl = current_value - cost_basis if current_value is not None else None
+        positions.append(
+            Position(
+                market_id=market_id,
+                question=stored.get("question", market_id),
+                venue="polymarket",
+                shares_yes=shares if side == "yes" else 0.0,
+                shares_no=shares if side == "no" else 0.0,
+                avg_cost=stored.get("entry_price"),
+                current_price=current_price,
+                current_value=current_value,
+                pnl=pnl,
+                sources=[TRADE_SOURCE],
+                status="active",
+                opened_by_weather_strategy=True,
+            )
+        )
+    return positions
+
+
 def record_live_sell(
     *,
     market_id: str,
@@ -708,17 +739,20 @@ def record_live_sell(
 
 
 def sync_live_positions_with_exchange(live_positions_by_market: dict) -> None:
-    """Drop local live state for markets no longer present on the exchange."""
+    """Mark local state from exchange data without deleting on transient Simmer gaps."""
     state = load_live_strategy_state()
     if not state.get("positions"):
         return
     live_market_ids = set(live_positions_by_market or {})
-    removed = False
+    changed = False
     for market_id in list(state["positions"].keys()):
         if market_id not in live_market_ids:
-            state["positions"].pop(market_id, None)
-            removed = True
-    if removed:
+            position = state["positions"][market_id]
+            position["missing_from_simmer_positions_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+        elif state["positions"][market_id].pop("missing_from_simmer_positions_at", None) is not None:
+            changed = True
+    if changed:
         save_live_strategy_state(state)
 
 
@@ -853,9 +887,9 @@ STRATEGY_V1_ADJACENT_YES_CANDIDATE_MAX_PRICE = 0.45
 STRATEGY_V1_MID_YES_MIN_PRICE = 0.12
 STRATEGY_V1_MID_YES_MAX_PRICE = 0.30
 STRATEGY_V1_MID_YES_MIN_EDGE = 0.20
-STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE = 0.01
+STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE = 0.25
-STRATEGY_V1_EXACT_MID_YES_MIN_PRICE = 0.01
+STRATEGY_V1_EXACT_MID_YES_MIN_PRICE = 0.12
 STRATEGY_V1_EXACT_MID_YES_MAX_PRICE = 0.25
 STRATEGY_V1_EXACT_MID_YES_MIN_EDGE = 0.02
 STRATEGY_V1_LATE_FAR_MAX_PROBABILITY = 0.08
@@ -1651,6 +1685,45 @@ def select_strategy_v1_event_trade(
                 "blocking_market_id": getattr(blocking_position, "market_id", None) or blocking_order_market_id,
             }
 
+    paper_no_edge_candidates = [
+        item for item in ranked_candidates
+        if item.get("edge_no") is not None
+        and item.get("yes_price") is not None
+        and STRATEGY_V1_MIN_PRICE <= item["yes_price"] <= STRATEGY_V1_MAX_PRICE
+        and item["edge_no"] > STRATEGY_V1_NO_EDGE_THRESHOLD
+    ]
+
+    def _select_paper_no_edge_fallback(skip_reason: str) -> Optional[dict]:
+        if not paper_no_edge_candidates:
+            return None
+        selected_no = sorted(
+            paper_no_edge_candidates,
+            key=lambda item: (-item["edge_no"], item["no_price"], item["gaussian_probability"]),
+        )[0]
+        decision = _apply_strategy_v1_rebuy_guard(
+            selected_no,
+            "no",
+            execution_mode=execution_mode,
+            live_positions_by_market=live_positions_by_market,
+        )
+        decision.update({
+            "reason": "primary_no_edge_fallback" if decision["action"] == "trade" else decision["reason"],
+            "fallback_from_reason": skip_reason,
+            "threshold": STRATEGY_V1_NO_EDGE_THRESHOLD,
+            "selected_edge": selected_no["edge_no"],
+            "candidate": selected_no["candidate"],
+            "probability_estimate": selected_no["probability_estimate"],
+            "bucket_relation": selected_no["bucket_relation"],
+            "entry_bucket_relation": selected_no.get("entry_bucket_relation"),
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        })
+        return decision
+
+    no_edge_fallback = _select_paper_no_edge_fallback("paper_primary_no_edge")
+    if no_edge_fallback is not None:
+        return no_edge_fallback
+
     if regime_mode == "early":
         central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
         early_candidates = [
@@ -1680,6 +1753,9 @@ def select_strategy_v1_event_trade(
         ]
         positive_edge_candidates = [item for item in close_early_candidates if item["edge_yes"] > 0]
         if not positive_edge_candidates:
+            no_fallback = _select_paper_no_edge_fallback("early_yes_edge_too_low_or_bucket_too_far")
+            if no_fallback is not None:
+                return no_fallback
             selected = sorted(
                 close_early_candidates or central_candidates,
                 key=lambda item: (
@@ -1799,6 +1875,9 @@ def select_strategy_v1_event_trade(
                 reason = "late_no_too_expensive"
             else:
                 reason = "late_far_no_probability_too_high"
+            no_fallback = _select_paper_no_edge_fallback(reason)
+            if no_fallback is not None:
+                return no_fallback
             return {
                 "action": "skip",
                 "reason": reason,
@@ -1863,6 +1942,9 @@ def select_strategy_v1_event_trade(
                 reason = "mid_yes_too_expensive"
             else:
                 reason = "mid_yes_edge_too_low"
+            no_fallback = _select_paper_no_edge_fallback(reason)
+            if no_fallback is not None:
+                return no_fallback
             return {
                 "action": "skip",
                 "reason": reason,
@@ -2302,6 +2384,8 @@ def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
         "best_ask": best_ask,
         "spread": spread,
         "spread_pct": (spread / mid) if mid > 0 else 0.0,
+        "bids": bids,
+        "asks": asks,
         "bid_depth_usd": sum(price * size for price, size in bids[:5]),
         "ask_depth_usd": sum(price * size for price, size in asks[:5]),
     }
@@ -2361,12 +2445,12 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
         return None, book, "missing_best_ask"
 
     # Rule (tick-based to avoid float precision drift):
-    # - spread above max: rest at best bid only; do not chase a wide book
+    # - spread above max: skip; a low best bid can be far away from the strategy price
     # - spread <= 1 tick: place at bid (do not overpay)
     # - spread >= 2 ticks: place at bid + 1 tick, capped below mid/ask
     spread = float(best_ask) - float(best_bid)
     if spread - float(LIVE_ENTRY_MAX_SPREAD) > 1e-9:
-        return round(max(0.001, min(0.999, float(best_bid))), 4), book, "wide_spread_bid_only"
+        return None, book, "spread_too_wide"
 
     spread_ticks = int(round(spread / MIN_TICK_SIZE))
     if spread_ticks >= 2:
@@ -2379,6 +2463,25 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
         return round(max(0.001, min(0.999, improved_price)), 4), book, "wide_spread_bid_plus_1c"
 
     return round(max(0.001, min(0.999, float(best_bid))), 4), book, "bid_only"
+
+
+def resolve_live_market_exit_limit(raw_market: dict, side: str) -> tuple[Optional[float], Optional[dict], Optional[str]]:
+    """Choose the immediate live sell limit from the held token's executable bid."""
+    token_id = _extract_clob_token_id(raw_market, side)
+    if not token_id:
+        return None, None, "missing_clob_token_id"
+
+    book = fetch_orderbook_summary(token_id)
+    if not book:
+        return None, None, "orderbook_unavailable"
+
+    best_bid = book.get("best_bid")
+    if best_bid is None:
+        return None, book, "missing_best_bid"
+    if best_bid < MIN_TICK_SIZE:
+        return None, book, "bid_below_min_tick"
+
+    return round(max(0.001, min(0.999, float(best_bid))), 4), book, "best_bid_fak"
 
 
 def build_direct_polymarket_bid_snapshot(raw_market: dict) -> Optional[dict]:
@@ -3000,6 +3103,7 @@ def execute_sell(
     market_question: str = None,
     signal_data: dict = None,
     execution_mode: ExecutionMode = None,
+    limit_price: float = None,
 ) -> dict:
     """Execute a sell trade via execution layer with source tagging."""
     forced_mode = ExecutionMode.PAPER if execution_mode == ExecutionMode.PAPER else None
@@ -3013,6 +3117,7 @@ def execute_sell(
         market_price=market_price,
         market_question=market_question,
         signal_data=signal_data,
+        limit_price=limit_price,
     )
     filled_value_usd = execution_result_filled_value(result)
     out = {
@@ -3619,6 +3724,27 @@ def check_exit_opportunities(
             paper_trader=get_paper_trader() if execution_mode == ExecutionMode.PAPER else None,
         )
 
+    if execution_mode == ExecutionMode.LIVE_ENABLED:
+        positions_by_market = {pos.market_id: pos for pos in positions or [] if pos.market_id}
+        fallback_positions = []
+        for local_pos in load_live_positions_from_state():
+            if local_pos.market_id not in positions_by_market:
+                positions_by_market[local_pos.market_id] = local_pos
+                fallback_positions.append(local_pos)
+        if fallback_positions and logger is not None:
+            logger.event(
+                "live_exit_using_local_state_fallback",
+                markets=[pos.market_id for pos in fallback_positions],
+                count=len(fallback_positions),
+                reason="missing_from_simmer_positions",
+            )
+        if fallback_positions:
+            print(
+                "  ⚠️  Live exit fallback: "
+                f"{len(fallback_positions)} local bot position(s) missing from Simmer positions"
+            )
+        positions = list(positions_by_market.values())
+
     if not positions:
         return 0, 0
 
@@ -3645,6 +3771,9 @@ def check_exit_opportunities(
         no_price = None
         chosen_exit_price = pos.current_price
         price_snapshot = None
+        live_exit_limit_price = None
+        live_exit_orderbook = None
+        live_exit_price_reason = None
         settlement_info = None
         opened_at = None
         stored_question = pos.question
@@ -3698,13 +3827,21 @@ def check_exit_opportunities(
         else:
             context = get_market_context(market_id)
             if context and context.get("market"):
-                price_snapshot = build_market_price_snapshot(context["market"])
+                raw_market = context["market"]
+                price_snapshot = build_market_price_snapshot(raw_market)
                 if price_snapshot:
                     yes_price = price_snapshot.get("yes_price")
                     no_price = price_snapshot.get("no_price")
                     direct_exit_price = no_price if position_side == "no" else yes_price
                     if direct_exit_price is not None:
                         chosen_exit_price = direct_exit_price
+                if execution_mode == ExecutionMode.LIVE_ENABLED:
+                    live_exit_limit_price, live_exit_orderbook, live_exit_price_reason = resolve_live_market_exit_limit(
+                        raw_market,
+                        position_side,
+                    )
+                    if live_exit_limit_price is not None:
+                        chosen_exit_price = live_exit_limit_price
             if logger is not None:
                 logger.event(
                     "exit_price_check",
@@ -3714,6 +3851,18 @@ def check_exit_opportunities(
                     yes_price=round(yes_price, 6) if yes_price is not None else None,
                     no_price=round(no_price, 6) if no_price is not None else None,
                     chosen_exit_price=round(chosen_exit_price, 6) if chosen_exit_price is not None else None,
+                    live_exit_price=round(live_exit_limit_price, 6) if live_exit_limit_price is not None else None,
+                    live_exit_price_reason=live_exit_price_reason,
+                    live_exit_best_bid=(
+                        round(live_exit_orderbook.get("best_bid"), 6)
+                        if live_exit_orderbook and live_exit_orderbook.get("best_bid") is not None
+                        else None
+                    ),
+                    live_exit_best_ask=(
+                        round(live_exit_orderbook.get("best_ask"), 6)
+                        if live_exit_orderbook and live_exit_orderbook.get("best_ask") is not None
+                        else None
+                    ),
                 )
         current_price = chosen_exit_price
 
@@ -4022,8 +4171,11 @@ def check_exit_opportunities(
                     "strategy_id": ACTIVE_STRATEGY_ID,
                     "partial_exit": partial_exit,
                     "runner_after_partial_exit": runner_after_partial_exit,
+                    "live_exit_price": live_exit_limit_price,
+                    "live_exit_price_reason": live_exit_price_reason,
                 },
                 execution_mode=execution_mode,
+                limit_price=live_exit_limit_price if execution_mode == ExecutionMode.LIVE_ENABLED else None,
             )
 
             if result.get("success"):
@@ -4309,6 +4461,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         live_positions = load_positions(adapter, execution_mode=execution_mode)
         live_strategy_positions_by_market = build_live_strategy_position_map(
             filter_live_strategy_positions(live_positions)
+        )
+        live_strategy_positions_by_market.update(
+            build_live_strategy_position_map(load_live_positions_from_state())
         )
         sync_live_positions_with_exchange(build_live_strategy_position_map(live_positions))
 
