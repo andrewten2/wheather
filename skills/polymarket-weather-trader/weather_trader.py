@@ -1651,6 +1651,38 @@ def select_strategy_v1_event_trade(
                 "blocking_market_id": getattr(blocking_position, "market_id", None) or blocking_order_market_id,
             }
 
+    primary_no_candidates = [
+        item
+        for item in ranked_candidates
+        if item.get("no_price") is not None
+        and item.get("edge_no") is not None
+        and item["edge_no"] > STRATEGY_V1_NO_EDGE_THRESHOLD
+        and MIN_TICK_SIZE <= item["no_price"] <= 1.0 - MIN_TICK_SIZE
+    ]
+    if primary_no_candidates:
+        selected = sorted(
+            primary_no_candidates,
+            key=lambda item: (-item["edge_no"], item["no_price"], item["gaussian_probability"]),
+        )[0]
+        decision = _apply_strategy_v1_rebuy_guard(
+            selected,
+            "no",
+            execution_mode=execution_mode,
+            live_positions_by_market=live_positions_by_market,
+        )
+        decision.update({
+            "reason": "primary no edge" if decision["action"] == "trade" else decision["reason"],
+            "threshold": STRATEGY_V1_NO_EDGE_THRESHOLD,
+            "selected_edge": selected["edge_no"],
+            "candidate": selected["candidate"],
+            "probability_estimate": selected["probability_estimate"],
+            "bucket_relation": selected["bucket_relation"],
+            "entry_bucket_relation": selected.get("entry_bucket_relation"),
+            "mode": regime_mode,
+            "forecast_fresh": forecast_fresh,
+        })
+        return decision
+
     if regime_mode == "early":
         central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
         early_candidates = [
@@ -4664,6 +4696,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             position_size = calculate_position_size(max_position_usd, smart_sizing)
             if execution_mode == ExecutionMode.LIVE_ENABLED:
                 position_size = min(position_size, LIVE_MAX_POSITION_USD)
+            selected_side_price = (
+                strategy_v1_decision.get("current_side_price")
+                if strategy_v1_enabled(execution_mode) and strategy_v1_decision
+                else price
+            )
+            if selected_side_price is None:
+                selected_side_price = price
 
             # Apply volatility targeting
             vol_meta = None
@@ -4680,7 +4719,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 else:
                     log(f"  📊 Vol targeting: insufficient price data — using base size")
 
-            size_decision = validate_minimum_position_size(position_size, price, MIN_SHARES_PER_ORDER)
+            size_decision = validate_minimum_position_size(position_size, selected_side_price, MIN_SHARES_PER_ORDER)
             if not size_decision.allowed:
                 log(f"  ⚠️  {size_decision.reasons[0]}")
                 skip_reasons.append("position too small")
