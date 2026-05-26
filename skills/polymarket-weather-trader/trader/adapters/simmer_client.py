@@ -46,6 +46,12 @@ class SimmerAdapter:
             )
         return client.get_market_context(market_id)
 
+    def get_market_details(self, market_id: str) -> Optional[dict]:
+        client = self.get_client()
+        response = client._request("GET", f"/api/sdk/markets/{market_id}")  # noqa: SLF001
+        market = response.get("market") if isinstance(response, dict) and isinstance(response.get("market"), dict) else response
+        return market if isinstance(market, dict) else None
+
     def get_market_outcome(self, market_id: str) -> Optional[bool]:
         client = self.get_client()
         response = client._request("GET", f"/api/sdk/markets/{market_id}")  # noqa: SLF001

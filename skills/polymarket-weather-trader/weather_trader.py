@@ -210,6 +210,7 @@ _dataset_recorder = None
 _actual_temperature_cache = {}
 _weather_markets_cache = {}
 _clob_orderbook_cache = {}
+_market_clob_token_cache = {}
 _live_open_order_market_ids_cache = (datetime.min.replace(tzinfo=timezone.utc), set())
 
 BASELINE_STRATEGY_ID = "baseline"
@@ -2425,9 +2426,63 @@ def _extract_clob_token_id(raw_market: dict, side: str) -> Optional[str]:
     return None
 
 
-def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[float], Optional[dict], Optional[str]]:
-    """Choose the live entry limit with a spread-aware bid improvement rule."""
+def _market_identifier(raw_market: dict, fallback_market_id: str = None) -> Optional[str]:
+    if fallback_market_id:
+        return str(fallback_market_id)
+    if not isinstance(raw_market, dict):
+        return None
+    value = raw_market.get("id") or raw_market.get("market_id") or raw_market.get("marketId")
+    return str(value) if value else None
+
+
+def _fetch_market_clob_tokens(market_id: str) -> Optional[dict]:
+    if not market_id:
+        return None
+    cached = _market_clob_token_cache.get(str(market_id))
+    if cached:
+        fetched_at, cached_tokens = cached
+        if (datetime.now(timezone.utc) - fetched_at).total_seconds() <= 300:
+            return cached_tokens
+    try:
+        market = get_adapter().get_market_details(str(market_id))
+    except Exception:
+        return None
+    if not isinstance(market, dict):
+        return None
+
+    tokens = {
+        "yes": _extract_clob_token_id(market, "yes"),
+        "no": _extract_clob_token_id(market, "no"),
+    }
+    if tokens.get("yes") or tokens.get("no"):
+        _market_clob_token_cache[str(market_id)] = (datetime.now(timezone.utc), tokens)
+        return tokens
+    return None
+
+
+def resolve_live_clob_token_id(
+    raw_market: dict,
+    side: str,
+    market_id: str = None,
+) -> tuple[Optional[str], str]:
     token_id = _extract_clob_token_id(raw_market, side)
+    if token_id:
+        return token_id, "raw_market"
+
+    resolved_market_id = _market_identifier(raw_market, fallback_market_id=market_id)
+    token_map = _fetch_market_clob_tokens(resolved_market_id) if resolved_market_id else None
+    if token_map and token_map.get((side or "yes").lower()):
+        return str(token_map[(side or "yes").lower()]), "sdk_market"
+    return None, "missing_clob_token_id"
+
+
+def resolve_live_bid_entry_limit(
+    raw_market: dict,
+    side: str,
+    market_id: str = None,
+) -> tuple[Optional[float], Optional[dict], Optional[str]]:
+    """Choose the live entry limit with a spread-aware bid improvement rule."""
+    token_id, token_source = resolve_live_clob_token_id(raw_market, side, market_id=market_id)
     if not token_id:
         return None, None, "missing_clob_token_id"
 
@@ -2460,14 +2515,18 @@ def resolve_live_bid_entry_limit(raw_market: dict, side: str) -> tuple[Optional[
             mid,
             float(best_ask) - MIN_TICK_SIZE,
         )
-        return round(max(0.001, min(0.999, improved_price)), 4), book, "wide_spread_bid_plus_1c"
+        return round(max(0.001, min(0.999, improved_price)), 4), book, f"wide_spread_bid_plus_1c:{token_source}"
 
-    return round(max(0.001, min(0.999, float(best_bid))), 4), book, "bid_only"
+    return round(max(0.001, min(0.999, float(best_bid))), 4), book, f"bid_only:{token_source}"
 
 
-def resolve_live_market_exit_limit(raw_market: dict, side: str) -> tuple[Optional[float], Optional[dict], Optional[str]]:
+def resolve_live_market_exit_limit(
+    raw_market: dict,
+    side: str,
+    market_id: str = None,
+) -> tuple[Optional[float], Optional[dict], Optional[str]]:
     """Choose the immediate live sell limit from the held token's executable bid."""
-    token_id = _extract_clob_token_id(raw_market, side)
+    token_id, token_source = resolve_live_clob_token_id(raw_market, side, market_id=market_id)
     if not token_id:
         return None, None, "missing_clob_token_id"
 
@@ -2481,7 +2540,7 @@ def resolve_live_market_exit_limit(raw_market: dict, side: str) -> tuple[Optiona
     if best_bid < MIN_TICK_SIZE:
         return None, book, "bid_below_min_tick"
 
-    return round(max(0.001, min(0.999, float(best_bid))), 4), book, "best_bid_fak"
+    return round(max(0.001, min(0.999, float(best_bid))), 4), book, f"best_bid_fak:{token_source}"
 
 
 def build_direct_polymarket_bid_snapshot(raw_market: dict) -> Optional[dict]:
@@ -3839,6 +3898,7 @@ def check_exit_opportunities(
                     live_exit_limit_price, live_exit_orderbook, live_exit_price_reason = resolve_live_market_exit_limit(
                         raw_market,
                         position_side,
+                        market_id=market_id,
                     )
                     if live_exit_limit_price is not None:
                         chosen_exit_price = live_exit_limit_price
@@ -4962,6 +5022,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 limit_price, orderbook, bid_mode = resolve_live_bid_entry_limit(
                     candidate.market.raw_market,
                     selected_side,
+                    market_id=market_id,
                 )
                 if limit_price is None:
                     if orderbook and bid_mode == "spread_too_wide":
