@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
@@ -238,6 +239,8 @@ LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
 LIVE_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
 LIVE_CLOB_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
+LIVE_ENTRY_METADATA_CACHE = {"ts": 0.0, "size": None, "mtime": None, "metadata": None}
+POLYMARKET_MARKET_METADATA_CACHE: dict[str, dict] = {}
 LIVE_SETTINGS_CACHE = {"ts": 0.0, "settings": None, "error": None}
 SIMMER_READONLY_CLIENT_LOCK = threading.Lock()
 
@@ -527,6 +530,132 @@ def first_text(row: dict | None, fields: tuple[str, ...]) -> str:
     return ""
 
 
+def public_json(url: str, timeout: float = 4.0):
+    try:
+        req = Request(url, headers={"User-Agent": "weather-dashboard/1.0"})
+        with urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def iter_market_payloads(payload):
+    if isinstance(payload, list):
+        for item in payload:
+            yield from iter_market_payloads(item)
+        return
+    if not isinstance(payload, dict):
+        return
+    if any(payload.get(field) for field in ("question", "title", "condition_id", "conditionId", "clobTokenIds", "tokens")):
+        yield payload
+    for field in ("market", "markets", "data", "results", "items"):
+        child = payload.get(field)
+        if child is not None:
+            yield from iter_market_payloads(child)
+
+
+def market_token_ids(market: dict) -> set[str]:
+    tokens = set()
+    for field in ("clobTokenIds", "clob_token_ids", "tokenIds", "token_ids"):
+        for token in json_list(market.get(field)):
+            if token:
+                tokens.add(str(token).lower())
+    for token in json_list(market.get("tokens")):
+        if isinstance(token, dict):
+            token_id = clean_text(token.get("token_id") or token.get("tokenId") or token.get("asset_id") or token.get("assetId"))
+            if token_id:
+                tokens.add(token_id.lower())
+        elif token:
+            tokens.add(str(token).lower())
+    return tokens
+
+
+def market_event_slug(market: dict) -> str:
+    event_slug = first_text(market, ("event_slug", "eventSlug"))
+    if event_slug:
+        return event_slug
+    events = json_list(market.get("events"))
+    if events and isinstance(events[0], dict):
+        return first_text(events[0], ("slug", "event_slug", "eventSlug"))
+    return ""
+
+
+def extract_market_metadata(payload, condition_id: str = "", token_id: str = "") -> dict:
+    condition_id = clean_text(condition_id).lower()
+    token_id = clean_text(token_id).lower()
+    for market in iter_market_payloads(payload):
+        market_condition = first_text(market, ("condition_id", "conditionId", "market", "market_id", "marketId")).lower()
+        token_ids = market_token_ids(market)
+        if condition_id and market_condition and market_condition != condition_id:
+            continue
+        if token_id and token_ids and token_id not in token_ids:
+            continue
+        question = first_text(market, ("question", "title", "market_question", "marketQuestion"))
+        if not question:
+            continue
+        slug = first_text(market, ("slug", "market_slug", "marketSlug"))
+        event_slug = market_event_slug(market)
+        return {
+            "question": question,
+            "slug": slug,
+            "event_slug": event_slug,
+            "condition_id": market_condition or condition_id,
+            "market_url": polymarket_market_url({"question": question, "slug": slug, "event_slug": event_slug}),
+        }
+    return {}
+
+
+def resolve_polymarket_market_metadata(condition_id: str = "", token_id: str = "") -> dict:
+    condition_id = clean_text(condition_id)
+    token_id = clean_text(token_id)
+    cache_key = (condition_id or token_id).lower()
+    if not cache_key:
+        return {}
+    if cache_key in POLYMARKET_MARKET_METADATA_CACHE:
+        return POLYMARKET_MARKET_METADATA_CACHE[cache_key]
+
+    if token_id and not condition_id:
+        token_market = public_json(f"https://clob.polymarket.com/markets-by-token/{token_id}")
+        condition_from_token = first_text(token_market, ("condition_id", "conditionId"))
+        if condition_from_token:
+            metadata = resolve_polymarket_market_metadata(condition_from_token, token_id)
+            POLYMARKET_MARKET_METADATA_CACHE[cache_key] = metadata
+            return metadata
+
+    urls = []
+    if condition_id.startswith("0x"):
+        urls.extend(
+            [
+                f"https://clob.polymarket.com/clob-markets/{condition_id}",
+                f"https://clob.polymarket.com/markets/{condition_id}",
+                f"https://gamma-api.polymarket.com/markets?condition_ids={condition_id}",
+                f"https://gamma-api.polymarket.com/markets?condition_id={condition_id}",
+            ]
+        )
+    if token_id:
+        urls.append(f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}")
+
+    for url in urls:
+        metadata = extract_market_metadata(public_json(url), condition_id=condition_id, token_id=token_id)
+        if metadata:
+            POLYMARKET_MARKET_METADATA_CACHE[cache_key] = metadata
+            return metadata
+
+    return {}
+
+
 def build_open_order_hint_maps(rows: list[dict]) -> dict[str, dict[str, str]]:
     hints = {"order": {}, "market": {}, "token": {}}
     for raw in values(rows):
@@ -577,11 +706,13 @@ def normalize_clob_open_order(row: dict, hints: dict[str, dict[str, str]]) -> di
     order_id = first_text(order, ("id", "order_id", "orderId", "hash"))
     market_id = first_text(order, ("market", "market_id", "marketId", "condition_id", "conditionId"))
     token_id = first_text(order, ("asset_id", "assetId", "token_id", "tokenId"))
+    market_metadata = resolve_polymarket_market_metadata(market_id, token_id)
     question = (
         first_text(order, ("question", "market_question", "title"))
         or hints.get("order", {}).get(order_id.lower(), "")
         or hints.get("token", {}).get(token_id.lower(), "")
         or hints.get("market", {}).get(market_id.lower(), "")
+        or market_metadata.get("question")
         or market_id
         or token_id
     )
@@ -616,6 +747,9 @@ def normalize_clob_open_order(row: dict, hints: dict[str, dict[str, str]]) -> di
         "amount_usd": amount,
         "created_at": order.get("created_at") or order.get("createdAt") or order.get("created_at_iso"),
         "asset_id": token_id,
+        "slug": order.get("slug") or market_metadata.get("slug"),
+        "event_slug": order.get("event_slug") or order.get("eventSlug") or market_metadata.get("event_slug"),
+        "market_url": market_metadata.get("market_url") or polymarket_market_url(order) or polymarket_market_url({"question": question}),
         "row_source": "polymarket_clob",
     }
 
@@ -757,6 +891,72 @@ def parse_recent_exit_checks(lines: int = 6000) -> dict[tuple[str, str], list[di
     return by_key
 
 
+def parse_recent_entry_metadata(lines: int = 50000) -> dict[str, dict]:
+    path = live_log_path()
+    if not path:
+        return {}
+    now = time.time()
+    try:
+        stat = path.stat()
+        cached = LIVE_ENTRY_METADATA_CACHE.get("metadata")
+        if (
+            cached is not None
+            and LIVE_ENTRY_METADATA_CACHE.get("size") == stat.st_size
+            and LIVE_ENTRY_METADATA_CACHE.get("mtime") == stat.st_mtime
+            and now - float(LIVE_ENTRY_METADATA_CACHE.get("ts") or 0.0) < 60
+        ):
+            return cached
+        read_bytes = int(os.environ.get("WEATHER_DASHBOARD_LIVE_LOG_ENTRY_BYTES", "20000000"))
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - read_bytes))
+            chunk = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    by_market: dict[str, dict] = {}
+    for line in chunk.splitlines()[-lines:]:
+        text = line.strip()
+        if '"event": "entry_regime_decision"' not in text and '"event":"entry_regime_decision"' not in text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+        market_id = clean_text(payload.get("market_id"))
+        if not market_id:
+            continue
+        bucket_range = clean_text(payload.get("bucket_range"))
+        event_name = clean_text(payload.get("event_name"))
+        unit = infer_temperature_unit(bucket_range, event_name)
+        forecast_value = payload.get("forecast_value")
+        question = bucket_range if bucket_range.lower().startswith("will ") else event_name or bucket_range
+        metadata = {
+            "market_id": market_id,
+            "question": question,
+            "entry_regime": payload.get("mode"),
+            "entry_forecast_value": forecast_value,
+            "entry_forecast_unit": unit,
+            "entry_forecast_source": payload.get("forecast_source") or "forecast",
+            "forecast_value": forecast_value,
+            "forecast_unit": unit,
+            "forecast_source": payload.get("forecast_source") or "forecast",
+            "forecast_label": build_forecast_label(forecast_value, unit, payload.get("forecast_source") or "forecast")
+            if forecast_value is not None
+            else None,
+            "market_url": polymarket_market_url({"question": question}) if question else None,
+        }
+        by_market[market_id] = merged_live_metadata(by_market.get(market_id), metadata)
+    try:
+        LIVE_ENTRY_METADATA_CACHE.update(
+            {"ts": now, "size": path.stat().st_size, "mtime": path.stat().st_mtime, "metadata": by_market}
+        )
+    except Exception:
+        LIVE_ENTRY_METADATA_CACHE.update({"ts": now, "metadata": by_market})
+    return by_market
+
+
 def local_trade_index(trades: list[dict]) -> dict[tuple[str, str], list[dict]]:
     by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for trade in trades:
@@ -790,12 +990,20 @@ def live_entry_metadata_index(local_by_key: dict[tuple[str, str], list[dict]]) -
     return metadata_by_key
 
 
-def enrich_live_metadata_from_entry(trade: dict, metadata_by_key: dict[tuple[str, str], dict]) -> dict:
-    metadata = metadata_by_key.get(trade_market_key(trade))
+def enrich_live_metadata_from_entry(
+    trade: dict,
+    metadata_by_key: dict[tuple[str, str], dict],
+    metadata_by_market: dict[str, dict] | None = None,
+) -> dict:
+    metadata = merged_live_metadata(
+        (metadata_by_market or {}).get(clean_text(trade.get("market_id"))),
+        metadata_by_key.get(trade_market_key(trade)),
+    )
     if not metadata:
         return trade
     enriched = dict(trade)
     for field in (
+        "question",
         "entry_regime",
         "entry_forecast_value",
         "entry_forecast_unit",
@@ -1366,6 +1574,13 @@ def forecast_label(item: dict) -> str:
     if value is None:
         value = signal.get("forecast_value")
     if value is None:
+        inferred = infer_temperature_from_text(
+            item.get("question"),
+            item.get("market_question"),
+            item.get("title"),
+        )
+        if inferred:
+            return build_forecast_label(inferred[0], inferred[1], "market")
         return "-"
     unit = (
         item.get("entry_forecast_unit")
@@ -1375,13 +1590,57 @@ def forecast_label(item: dict) -> str:
         or ""
     )
     source = item.get("entry_forecast_source") or signal.get("entry_forecast_source") or item.get("forecast_source")
-    source_mark = "W" if source == "wunderground" else "F"
+    return build_forecast_label(value, unit, source)
+
+
+def infer_temperature_unit(*texts) -> str:
+    for text in texts:
+        match = re.search(r"°\s*([CF])\b", clean_text(text), flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
+def infer_temperature_from_text(*texts) -> tuple[float, str] | None:
+    for text in texts:
+        clean = clean_text(text)
+        if not clean:
+            continue
+        range_match = re.search(r"between\s+(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)\s*°\s*([CF])", clean, re.IGNORECASE)
+        if range_match:
+            low = float(range_match.group(1))
+            high = float(range_match.group(2))
+            return (low + high) / 2.0, range_match.group(3).upper()
+        exact_match = re.search(r"(-?\d+(?:\.\d+)?)\s*°\s*([CF])", clean, re.IGNORECASE)
+        if exact_match:
+            return float(exact_match.group(1)), exact_match.group(2).upper()
+    return None
+
+
+def build_forecast_label(value, unit: str = "", source: str = "") -> str:
+    source_key = str(source or "").lower()
+    source_mark = "W" if source_key == "wunderground" else "M" if source_key == "market" else "F"
     try:
         value = f"{float(value):g}"
     except (TypeError, ValueError):
         value = str(value)
     unit = str(unit).replace("°", "")
     return f"{source_mark}:{value}°{unit}" if unit else f"{source_mark}:{value}"
+
+
+def meaningful_metadata_value(value) -> bool:
+    return value not in (None, "", "-")
+
+
+def merged_live_metadata(*items: dict | None) -> dict:
+    merged = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if meaningful_metadata_value(value):
+                merged[key] = value
+    return merged
 
 
 def trade_cost(trade: dict, entry_price: float | None = None) -> float | None:
@@ -2252,11 +2511,14 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
     failure_status = simmer_failure_status(order)
     raw_value_text = flattened_value_text(order).lower()
     market_id = clean_text(order.get("market_id") or order.get("marketId") or order.get("condition_id") or order.get("conditionId"))
+    token_id = clean_text(order.get("asset_id") or order.get("assetId") or order.get("token_id") or order.get("tokenId"))
+    market_metadata = resolve_polymarket_market_metadata(market_id, token_id)
     question = clean_text(
         order.get("question")
         or order.get("market_question")
         or order.get("title")
         or question_lookup.get(market_id)
+        or market_metadata.get("question")
         or market_id
     )
     side = str(order.get("side") or order.get("outcome") or order.get("token_side") or "yes").upper()
@@ -2424,7 +2686,9 @@ def normalize_simmer_open_order(row: dict, question_lookup: dict[str, str]) -> d
         "fill_pct": fill_pct,
         "amount_usd": amount,
         "amount_estimated": amount_estimated,
-        "market_url": polymarket_market_url(order) or polymarket_market_url({"question": question}),
+        "slug": order.get("slug") or market_metadata.get("slug"),
+        "event_slug": order.get("event_slug") or order.get("eventSlug") or market_metadata.get("event_slug"),
+        "market_url": market_metadata.get("market_url") or polymarket_market_url(order) or polymarket_market_url({"question": question}),
         "is_pending": status not in {"filled", "matched", "cancelled", "canceled", "failed", "rejected"},
         "row_kind": "resting_bid",
     }
@@ -2521,6 +2785,7 @@ def normalize_state(
         local_live_trades = annotate_runner_closes(filter_by_view(state.get("trades") or [], view))
         local_by_key = local_trade_index(local_live_trades)
         local_entry_metadata = live_entry_metadata_index(local_by_key)
+        log_entry_metadata = parse_recent_entry_metadata()
         exit_checks_by_key = parse_recent_exit_checks()
         raw_position_source = [
             position
@@ -2534,7 +2799,7 @@ def normalize_state(
             if trade is not None
         ]
         raw_trades = [
-            enrich_live_metadata_from_entry(trade, local_entry_metadata)
+            enrich_live_metadata_from_entry(trade, local_entry_metadata, log_entry_metadata)
             for trade in raw_trades
         ]
         raw_trades = [
@@ -2549,6 +2814,10 @@ def normalize_state(
             for item in [*raw_positions, *matching_trades]
             if clean_text(item.get("market_id")) and clean_text(item.get("question"))
         }
+        for market_id, metadata in log_entry_metadata.items():
+            question = clean_text(metadata.get("question"))
+            if market_id and question:
+                question_lookup.setdefault(market_id, question)
         live_closed_summaries, live_position_annotations = build_live_trade_summaries(
             matching_trades,
             raw_positions,
@@ -2570,7 +2839,10 @@ def normalize_state(
         open_orders = maybe_filter_live_by_view(open_orders, view)
         for position in raw_positions:
             annotation = live_position_annotations.get(live_primary_key(position))
-            local_metadata = local_entry_metadata.get(live_primary_key(position), {})
+            local_metadata = merged_live_metadata(
+                log_entry_metadata.get(clean_text(position.get("market_id"))),
+                local_entry_metadata.get(live_primary_key(position), {}),
+            )
             if not annotation and not local_metadata:
                 continue
             # When Simmer positions omit average entry/cost fields, reconstruct

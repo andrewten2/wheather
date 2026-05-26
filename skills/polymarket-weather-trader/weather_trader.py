@@ -1651,38 +1651,6 @@ def select_strategy_v1_event_trade(
                 "blocking_market_id": getattr(blocking_position, "market_id", None) or blocking_order_market_id,
             }
 
-    primary_no_candidates = [
-        item
-        for item in ranked_candidates
-        if item.get("no_price") is not None
-        and item.get("edge_no") is not None
-        and item["edge_no"] > STRATEGY_V1_NO_EDGE_THRESHOLD
-        and MIN_TICK_SIZE <= item["no_price"] <= 1.0 - MIN_TICK_SIZE
-    ]
-    if primary_no_candidates:
-        selected = sorted(
-            primary_no_candidates,
-            key=lambda item: (-item["edge_no"], item["no_price"], item["gaussian_probability"]),
-        )[0]
-        decision = _apply_strategy_v1_rebuy_guard(
-            selected,
-            "no",
-            execution_mode=execution_mode,
-            live_positions_by_market=live_positions_by_market,
-        )
-        decision.update({
-            "reason": "primary no edge" if decision["action"] == "trade" else decision["reason"],
-            "threshold": STRATEGY_V1_NO_EDGE_THRESHOLD,
-            "selected_edge": selected["edge_no"],
-            "candidate": selected["candidate"],
-            "probability_estimate": selected["probability_estimate"],
-            "bucket_relation": selected["bucket_relation"],
-            "entry_bucket_relation": selected.get("entry_bucket_relation"),
-            "mode": regime_mode,
-            "forecast_fresh": forecast_fresh,
-        })
-        return decision
-
     if regime_mode == "early":
         central_candidates = [item for item in ranked_candidates if item["entry_bucket_relation"] == "central"]
         early_candidates = [
