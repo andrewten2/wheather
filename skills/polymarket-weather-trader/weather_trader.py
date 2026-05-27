@@ -222,6 +222,11 @@ WATCHLIST_STRATEGY_CITIES = {
     "Munich", "Ankara", "Tel Aviv", "Atlanta", "Chicago", "Miami",
     "Wellington", "Lucknow", "Busan", "Panama City", "Paris", "Milan",
 }
+SELECTED_NO_EARLY_CENTRAL_CITIES = {
+    "London", "Seoul", "Austin", "Munich", "San Francisco", "Miami",
+    "Los Angeles", "Ankara", "Chicago", "Dallas", "Denver", "Seattle",
+    "Atlanta", "Sao Paulo", "Buenos Aires", "Istanbul",
+}
 STRATEGY_VARIANTS = {
     "baseline": {
         "label": "Baseline",
@@ -238,6 +243,13 @@ STRATEGY_VARIANTS = {
         "label": "No Reentry After Stop",
         "forecast_mode": "primary",
         "block_reentry_after_stop_loss": True,
+    },
+    "selected_no_early_central": {
+        "label": "Selected Cities No Early Central",
+        "forecast_mode": "primary",
+        "allowed_cities": SELECTED_NO_EARLY_CENTRAL_CITIES,
+        "block_reentry_after_stop_loss": True,
+        "disabled_entry_reasons": {"early_central_yes"},
     },
     "no_reentry_watchlist": {
         "label": "No Reentry Watchlist",
@@ -997,6 +1009,22 @@ def apply_strategy_side_reversal(decision: Optional[dict]) -> Optional[dict]:
         decision["current_side_price"] = price_yes if reversed_side == "yes" else 1.0 - price_yes
     decision["reason"] = f"reverse_{decision.get('reason') or 'trade'}"
     return decision
+
+
+def apply_strategy_entry_reason_filter(decision: Optional[dict]) -> Optional[dict]:
+    if not decision or decision.get("action") != "trade":
+        return decision
+    disabled_reasons = get_active_strategy_config().get("disabled_entry_reasons")
+    if not disabled_reasons:
+        return decision
+    original_reason = decision.get("reason")
+    if original_reason not in set(disabled_reasons):
+        return decision
+    filtered_decision = dict(decision)
+    filtered_decision["action"] = "skip"
+    filtered_decision["reason"] = f"{original_reason}_disabled"
+    filtered_decision["blocked_entry_reason"] = original_reason
+    return filtered_decision
 
 
 def log_strategy_v1_decision(
@@ -4343,6 +4371,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
 
     if strategy_v1_requested:
         mode_label = "paper_only" if paper else "live_enabled"
+        active_strategy_config = get_active_strategy_config()
+        allowed_strategy_cities = active_strategy_config.get("allowed_cities")
+        disabled_entry_reasons = active_strategy_config.get("disabled_entry_reasons")
         if paper:
             log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
         else:
@@ -4351,10 +4382,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "strategy_v1_mode_enabled",
             strategy="strategy_v1",
             strategy_id=ACTIVE_STRATEGY_ID,
-            strategy_label=get_active_strategy_config().get("label"),
+            strategy_label=active_strategy_config.get("label"),
             mode=mode_label,
             strategy_style="forecast_first",
-            allowed_cities="all_active_locations",
+            allowed_cities=sorted(allowed_strategy_cities) if allowed_strategy_cities else "all_active_locations",
+            disabled_entry_reasons=sorted(disabled_entry_reasons) if disabled_entry_reasons else [],
             loop_interval_seconds=WEATHER_BOT_LOOP_SECONDS,
             exit_check_interval_seconds=WEATHER_BOT_EXIT_CHECK_SECONDS,
             forecast_cache_ttl_seconds=FORECAST_CACHE_TTL_SECONDS,
@@ -4373,7 +4405,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             yes_take_profit_pct=STRATEGY_V1_YES_TAKE_PROFIT_PCT,
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
             live_entry_max_spread=LIVE_ENTRY_MAX_SPREAD,
-            early_yes_stop_loss_pct=get_active_strategy_config().get(
+            early_yes_stop_loss_pct=active_strategy_config.get(
                 "early_yes_stop_loss_pct",
                 STRATEGY_V1_YES_STOP_LOSS_PCT,
             ),
@@ -4430,7 +4462,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         if direct_polymarket_paper_enabled():
             log("  Price source:    direct Polymarket CLOB bids")
     log(f"  Forecast TTL:    {FORECAST_CACHE_TTL_SECONDS}s")
-    log(f"  Locations:       {', '.join(ACTIVE_LOCATIONS)}")
+    active_strategy_config = get_active_strategy_config()
+    allowed_strategy_cities = active_strategy_config.get("allowed_cities")
+    locations_label = sorted(allowed_strategy_cities) if allowed_strategy_cities else ACTIVE_LOCATIONS
+    log(f"  Locations:       {', '.join(locations_label)}")
+    disabled_entry_reasons = active_strategy_config.get("disabled_entry_reasons")
+    if strategy_v1_requested and disabled_entry_reasons:
+        log(f"  Disabled entries: {', '.join(sorted(disabled_entry_reasons))}")
     log(f"  Smart sizing:    {'✓ Enabled' if smart_sizing else '✗ Disabled'}")
     log(f"  Safeguards:      {'✓ Enabled' if use_safeguards else '✗ Disabled'}")
     log(f"  Trend detection: {'✓ Enabled' if use_trends else '✗ Disabled'}")
@@ -4661,6 +4699,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 live_positions_by_market=live_strategy_positions_by_market,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
             drift_rotation_allowed = maybe_rotate_position_on_forecast_drift(
                 event_id=event_id,
                 event_markets=event_markets,
@@ -4685,6 +4724,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 live_positions_by_market=live_strategy_positions_by_market,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
             candidate = strategy_v1_decision.get("candidate") if strategy_v1_decision else None
             probability_estimate = strategy_v1_decision.get("probability_estimate") if strategy_v1_decision else None
             log_entry_regime_decision(
@@ -4837,6 +4877,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 live_positions_by_market=live_strategy_positions_by_market,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
             log_strategy_v1_decision(
                 logger=logger,
                 action=strategy_v1_decision["action"],
