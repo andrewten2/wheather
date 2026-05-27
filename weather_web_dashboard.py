@@ -70,6 +70,11 @@ LIVE_POLYMARKET_WEATHER_ONLY = os.environ.get("WEATHER_DASHBOARD_LIVE_WEATHER_ON
     "false",
     "no",
 }
+MANUAL_LIVE_CLOSE_ENABLED = os.environ.get("WEATHER_DASHBOARD_MANUAL_CLOSE_ENABLED", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 LIVE_LOG_CANDIDATES = [
     Path(os.environ["WEATHER_DASHBOARD_LIVE_LOG"]) if os.environ.get("WEATHER_DASHBOARD_LIVE_LOG") else None,
     Path("/root/wheather/live_bot.log"),
@@ -3693,6 +3698,7 @@ def normalize_state(
             "requested_yes_stake": requested_yes_stake,
             "requested_no_stake": requested_no_stake,
             "stake_simulator_enabled": source != "live",
+            "manual_live_close_enabled": MANUAL_LIVE_CLOSE_ENABLED,
             "live_positions_source": live_positions_source,
             "live_positions_error": live_positions_error,
             "live_polymarket_user": polymarket_user,
@@ -5634,6 +5640,9 @@ INDEX_HTML = r"""<!doctype html>
     };
     function closePositionButton(position) {
       const shares = Number(position?.shares || 0);
+      if (!state.lastData?.meta?.manual_live_close_enabled) {
+        return `<span class="neutral">read-only</span>`;
+      }
       const isDataApiPosition = position?.row_source === "polymarket_data_api";
       const closeMarketId = position?.close_market_id || (isDataApiPosition ? "" : position?.market_id);
       if (state.source !== "live" || !closeMarketId || !Number.isFinite(shares) || shares <= 0) {
@@ -6557,7 +6566,11 @@ INDEX_HTML = r"""<!doctype html>
     async function closeLivePosition(button) {
       const marketId = button.dataset.closeMarket;
       const side = button.dataset.closeSide;
-      const position = (state.lastData?.positions || []).find(p => String(p.market_id) === String(marketId) && String(p.side || "").toLowerCase() === side);
+      if (!state.lastData?.meta?.manual_live_close_enabled) {
+        window.alert("Manual close from dashboard is disabled. Close directly on Polymarket or enable WEATHER_DASHBOARD_MANUAL_CLOSE_ENABLED=1.");
+        return;
+      }
+      const position = (state.lastData?.positions || []).find(p => String(p.close_market_id || p.market_id) === String(marketId) && String(p.side || "").toLowerCase() === side);
       if (!position) {
         window.alert("Position not found in current live dashboard data. Refresh and try again.");
         return;
@@ -7042,6 +7055,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def handle_live_close(self):
         if auth_enabled() and not self.is_authenticated():
             return self.send_json({"success": False, "error": "unauthorized"}, status=401)
+        if not MANUAL_LIVE_CLOSE_ENABLED:
+            return self.send_json(
+                {
+                    "success": False,
+                    "error": "manual live close is disabled; set WEATHER_DASHBOARD_MANUAL_CLOSE_ENABLED=1 to enable",
+                },
+                status=403,
+            )
         length = int(self.headers.get("Content-Length", "0") or 0)
         try:
             payload = json.loads(self.rfile.read(min(length, 8192)).decode("utf-8", errors="replace") or "{}")
