@@ -244,6 +244,7 @@ DIRECT_PAPER_STATE_ROOT = resolve_direct_paper_state_root()
 LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
 LIVE_POLYMARKET_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None, "user": None}
 LIVE_POLYMARKET_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None, "user": None}
+LIVE_POLYMARKET_CLOSED_CACHE = {"ts": 0.0, "closed": None, "error": None, "user": None}
 LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
 LIVE_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
@@ -750,6 +751,78 @@ def normalize_polymarket_activity_trade(raw: dict) -> dict | None:
     }
 
 
+def normalize_polymarket_closed_position(raw: dict) -> dict | None:
+    row = dict_from_obj(raw)
+    question = clean_text(row.get("title") or row.get("question") or row.get("conditionId"))
+    if LIVE_POLYMARKET_WEATHER_ONLY and not is_weather_market_title(question):
+        return None
+
+    side = polymarket_outcome_side(row)
+    if side not in {"yes", "no"}:
+        return None
+
+    avg_price = first_price(row, ("avgPrice", "avg_price", "average_price"))
+    shares = first_float(row, ("totalBought", "total_bought", "size", "shares"))
+    realized = first_float(row, ("realizedPnl", "realized_pnl", "cashPnl", "cash_pnl"))
+    cost_basis = first_float(row, ("initialValue", "initial_value", "cost_basis"))
+    if cost_basis is None and shares is not None and avg_price is not None:
+        cost_basis = shares * avg_price
+
+    proceeds = cost_basis + realized if cost_basis is not None and realized is not None else None
+    exit_price = None
+    if proceeds is not None and shares is not None and shares > 0:
+        inferred_exit = proceeds / shares
+        if is_price(inferred_exit):
+            exit_price = inferred_exit
+    if exit_price is None:
+        exit_price = first_price(row, ("exitPrice", "exit_price", "curPrice", "currentPrice", "price"))
+    if cost_basis is None and shares is not None and exit_price is not None and realized is not None:
+        inferred_cost = shares * exit_price - realized
+        if inferred_cost > 0:
+            cost_basis = inferred_cost
+            if avg_price is None and shares > 0:
+                avg_price = cost_basis / shares
+
+    condition_id = clean_text(row.get("conditionId") or row.get("condition_id"))
+    timestamp = unix_timestamp_to_iso(row.get("timestamp")) or row.get("timestamp")
+    market_id = condition_id or clean_text(row.get("asset")) or question
+
+    return {
+        **row,
+        "action": "sell",
+        "side": side,
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "asset_id": clean_text(row.get("asset")),
+        "question": question,
+        "timestamp": timestamp,
+        "filled_shares": shares,
+        "requested_shares": shares,
+        "entry_price": avg_price,
+        "avg_price": avg_price,
+        "simulated_fill_price": exit_price,
+        "amount_usd": proceeds,
+        "cost_basis": cost_basis,
+        "realized_pnl": realized,
+        "closed_shares": shares,
+        "remaining_shares": 0.0,
+        "closed_pct": 1.0,
+        "remaining_pct": 0.0,
+        "match_mode": "polymarket_closed_positions",
+        "slug": row.get("slug"),
+        "event_slug": row.get("eventSlug") or row.get("event_slug"),
+        "market_url": polymarket_market_url(
+            {
+                "question": question,
+                "slug": row.get("slug"),
+                "event_slug": row.get("eventSlug") or row.get("event_slug"),
+            }
+        ),
+        "row_source": "polymarket_closed_positions",
+        "_polymarket_closed_position": True,
+    }
+
+
 def fetch_polymarket_data_positions(settings: dict | None = None) -> tuple[list[dict] | None, str | None, str | None]:
     """Fetch current positions from Polymarket's public Data API."""
     now = time.time()
@@ -857,6 +930,76 @@ def fetch_polymarket_data_activity(settings: dict | None = None) -> tuple[list[d
 
     error = "; ".join(errors) or "Polymarket Data API activity unavailable"
     LIVE_POLYMARKET_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": error, "user": None})
+    return stale_cached, error, None
+
+
+def fetch_polymarket_closed_positions(settings: dict | None = None) -> tuple[list[dict] | None, str | None, str | None]:
+    """Fetch closed positions from Polymarket's public Data API."""
+    now = time.time()
+    cached = LIVE_POLYMARKET_CLOSED_CACHE.get("closed")
+    stale_cached = cached
+    if cached is not None and now - float(LIVE_POLYMARKET_CLOSED_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_POLYMARKET_CLOSED_CACHE.get("error"), LIVE_POLYMARKET_CLOSED_CACHE.get("user")
+
+    if settings is None:
+        settings, _ = fetch_simmer_live_settings()
+    candidates = polymarket_user_candidates(settings)
+    if not candidates:
+        error = "Polymarket user address missing"
+        LIVE_POLYMARKET_CLOSED_CACHE.update({"ts": now, "closed": stale_cached, "error": error, "user": None})
+        return stale_cached, error, None
+
+    errors = []
+    empty_result: tuple[list[dict], str] | None = None
+    for user in candidates:
+        rows: list[dict] = []
+        for offset in (0, 50):
+            url = polymarket_data_api_url(
+                "/closed-positions",
+                {
+                    "user": user,
+                    "limit": 50,
+                    "offset": offset,
+                    "sortBy": "TIMESTAMP",
+                    "sortDirection": "DESC",
+                },
+            )
+            payload = public_json(url, timeout=6.0)
+            page_rows = extract_rows(payload, ("closed", "positions", "data", "results", "items"))
+            if page_rows is None:
+                errors.append(f"{user[:8]}... offset {offset}: closed positions unavailable")
+                rows = []
+                break
+            rows.extend(dict_from_obj(row) for row in values(page_rows))
+            if len(page_rows) < 50:
+                break
+        if not rows:
+            if empty_result is None:
+                empty_result = ([], user)
+            continue
+
+        normalized = [
+            trade
+            for trade in (normalize_polymarket_closed_position(row) for row in rows)
+            if trade is not None
+        ]
+        if normalized:
+            normalized.sort(
+                key=lambda item: parse_dt(item.get("timestamp")) or datetime.min.replace(tzinfo=DISPLAY_TZ),
+                reverse=True,
+            )
+            LIVE_POLYMARKET_CLOSED_CACHE.update({"ts": now, "closed": normalized, "error": None, "user": user})
+            return normalized, None, user
+        if empty_result is None:
+            empty_result = (normalized, user)
+
+    if empty_result is not None:
+        closed, user = empty_result
+        LIVE_POLYMARKET_CLOSED_CACHE.update({"ts": now, "closed": closed, "error": None, "user": user})
+        return closed, None, user
+
+    error = "; ".join(errors) or "Polymarket Data API closed positions unavailable"
+    LIVE_POLYMARKET_CLOSED_CACHE.update({"ts": now, "closed": stale_cached, "error": error, "user": None})
     return stale_cached, error, None
 
 
@@ -1153,6 +1296,7 @@ def reset_live_caches():
         LIVE_POSITIONS_CACHE,
         LIVE_POLYMARKET_POSITIONS_CACHE,
         LIVE_POLYMARKET_ACTIVITY_CACHE,
+        LIVE_POLYMARKET_CLOSED_CACHE,
         LIVE_PORTFOLIO_CACHE,
         LIVE_ACTIVITY_CACHE,
         LIVE_ORDERS_CACHE,
@@ -2208,7 +2352,7 @@ def adjusted_trade_pnl(
     realized = to_float(trade.get("realized_pnl"))
     entry, _, _, original_cost = closed_entry_info(trade, buy_history)
     if source == "live":
-        if trade.get("_simmer_activity") and realized is not None:
+        if (trade.get("_simmer_activity") or trade.get("_polymarket_closed_position")) and realized is not None:
             return realized
         actual = actual_trade_pnl_from_prices(trade, entry, original_cost)
         if actual is not None:
@@ -3163,6 +3307,7 @@ def normalize_state(
     live_positions_error = None
     live_portfolio_error = None
     live_activity_error = None
+    live_closed_error = None
     live_orders_error = None
     if source == "live":
         # Live must mirror real Simmer fills. Stake simulator is paper-only.
@@ -3176,6 +3321,7 @@ def normalize_state(
         portfolio, live_portfolio_error = fetch_simmer_live_portfolio()
         polymarket_positions, polymarket_positions_error, polymarket_user = fetch_polymarket_data_positions(settings)
         polymarket_activity, polymarket_activity_error, _ = fetch_polymarket_data_activity(settings)
+        polymarket_closed, polymarket_closed_error, _ = fetch_polymarket_closed_positions(settings)
         remote_positions, simmer_positions_error = fetch_simmer_live_positions()
         activity_rows, simmer_activity_error = fetch_simmer_live_activity()
         open_order_rows, live_orders_error = fetch_simmer_live_open_orders()
@@ -3245,6 +3391,11 @@ def normalize_state(
             raw_positions,
             runner_mode=exit_mode == "tp40_runner",
         )
+        if polymarket_closed is not None:
+            live_closed_summaries = values(polymarket_closed)
+            live_closed_error = polymarket_closed_error
+        else:
+            live_closed_error = polymarket_closed_error
         simmer_close_by_question_side = {
             (
                 clean_text(position.get("question")).lower(),
@@ -3547,6 +3698,7 @@ def normalize_state(
             "live_polymarket_user": polymarket_user,
             "live_portfolio_error": live_portfolio_error,
             "live_activity_error": live_activity_error,
+            "live_closed_error": live_closed_error,
             "live_orders_error": live_orders_error,
             "server_time": datetime.now(DISPLAY_TZ).isoformat(),
             "state_updated_at": state.get("updated_at"),
@@ -5550,6 +5702,7 @@ INDEX_HTML = r"""<!doctype html>
       const mode = String(trade?.match_mode || "").toLowerCase();
       const labels = {
         fifo: "fifo",
+        polymarket_closed_positions: "polymarket_closed",
         fallback_cost_basis: "fallback_cost",
         fallback_entry_price: "fallback_entry",
         fallback_realized_hint: "fallback_realized",
@@ -6347,7 +6500,7 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      const liveErrors = [meta.live_positions_error, meta.live_activity_error, meta.live_portfolio_error, meta.live_orders_error].filter(Boolean).join(" · ");
+      const liveErrors = [meta.live_positions_error, meta.live_activity_error, meta.live_closed_error, meta.live_portfolio_error, meta.live_orders_error].filter(Boolean).join(" · ");
       setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · live data warning: ${liveErrors}` : ""}`);
       if (isLive) renderLiveModeStrip(data);
       renderStats(s);
