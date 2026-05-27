@@ -1027,6 +1027,41 @@ def apply_strategy_entry_reason_filter(decision: Optional[dict]) -> Optional[dic
     return filtered_decision
 
 
+def no_entry_price_block_reason(no_price: Optional[float]) -> Optional[str]:
+    if no_price is None:
+        return "no_entry_price_missing"
+    try:
+        price = float(no_price)
+    except (TypeError, ValueError):
+        return "no_entry_price_invalid"
+    if price < STRATEGY_V1_NO_MIN_ENTRY_PRICE:
+        return "no_entry_price_below_min"
+    if price > STRATEGY_V1_NO_MAX_ENTRY_PRICE:
+        return "no_entry_price_above_max"
+    return None
+
+
+def entry_price_block_reason(side: str, current_side_price: Optional[float]) -> Optional[str]:
+    if str(side or "").lower() != "no":
+        return None
+    return no_entry_price_block_reason(current_side_price)
+
+
+def apply_strategy_entry_price_filter(decision: Optional[dict]) -> Optional[dict]:
+    if not decision or decision.get("action") != "trade":
+        return decision
+    selected_side = str(decision.get("selected_side") or "").lower()
+    block_reason = entry_price_block_reason(selected_side, decision.get("current_side_price"))
+    if not block_reason:
+        return decision
+    filtered_decision = dict(decision)
+    filtered_decision["action"] = "skip"
+    filtered_decision["reason"] = block_reason
+    filtered_decision["blocked_entry_side"] = selected_side
+    filtered_decision["blocked_entry_price"] = decision.get("current_side_price")
+    return filtered_decision
+
+
 def log_strategy_v1_decision(
     logger: StructuredLogger,
     action: str,
@@ -1465,6 +1500,24 @@ def _apply_strategy_v1_rebuy_guard(
         live_positions_by_market = live_positions_by_market or {}
         live_position = live_positions_by_market.get(market_id)
         current_side_price = entry["no_price"] if selected_side == "no" else entry["yes_price"]
+        price_block_reason = entry_price_block_reason(selected_side, current_side_price)
+        if price_block_reason:
+            return {
+                "action": "skip",
+                "reason": price_block_reason,
+                "selected_side": selected_side,
+                "price_yes": entry["yes_price"],
+                "gaussian_probability": entry["gaussian_probability"],
+                "edge_yes": entry["edge_yes"],
+                "edge_no": entry["edge_no"],
+                "open_position_exists": False,
+                "historical_trade_exists": None,
+                "buy_count": None,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "position_cost_usd": None,
+                "current_side_price": current_side_price,
+            }
         if live_position is not None and _position_total_shares(live_position) > 0:
             return {
                 "action": "skip",
@@ -1577,6 +1630,24 @@ def _apply_strategy_v1_rebuy_guard(
 
     paper_trader = get_paper_trader()
     current_side_price = entry["no_price"] if selected_side == "no" else entry["yes_price"]
+    price_block_reason = entry_price_block_reason(selected_side, current_side_price)
+    if price_block_reason:
+        return {
+            "action": "skip",
+            "reason": price_block_reason,
+            "selected_side": selected_side,
+            "price_yes": entry["yes_price"],
+            "gaussian_probability": entry["gaussian_probability"],
+            "edge_yes": entry["edge_yes"],
+            "edge_no": entry["edge_no"],
+            "open_position_exists": paper_trader.has_open_position_for_market(entry["candidate"].market_id),
+            "historical_trade_exists": paper_trader.has_trade_for_market(entry["candidate"].market_id),
+            "buy_count": None,
+            "last_buy_at": None,
+            "last_buy_price": None,
+            "position_cost_usd": None,
+            "current_side_price": current_side_price,
+        }
     rebuy_context = get_strategy_v1_rebuy_context(
         paper_trader=paper_trader,
         market_id=entry["candidate"].market_id,
@@ -1718,8 +1789,10 @@ def select_strategy_v1_event_trade(
         item for item in ranked_candidates
         if item.get("edge_no") is not None
         and item.get("yes_price") is not None
+        and item.get("no_price") is not None
         and STRATEGY_V1_MIN_PRICE <= item["yes_price"] <= STRATEGY_V1_MAX_PRICE
         and item["edge_no"] > STRATEGY_V1_NO_EDGE_THRESHOLD
+        and no_entry_price_block_reason(item["no_price"]) is None
     ]
 
     def _select_paper_no_edge_fallback(skip_reason: str) -> Optional[dict]:
@@ -4445,6 +4518,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "  Entry regimes:   early=central±1 YES, mid=strong-edge YES, "
             "late=far NO"
         )
+        log(f"  NO entry price:  ${STRATEGY_V1_NO_MIN_ENTRY_PRICE:.2f}-${STRATEGY_V1_NO_MAX_ENTRY_PRICE:.2f}")
     requested_execution_mode = (
         ExecutionMode.PAPER if paper
         else ExecutionMode.LIVE_ENABLED if not dry_run
@@ -4700,6 +4774,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_entry_price_filter(strategy_v1_decision)
             drift_rotation_allowed = maybe_rotate_position_on_forecast_drift(
                 event_id=event_id,
                 event_markets=event_markets,
@@ -4725,6 +4800,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_entry_price_filter(strategy_v1_decision)
             candidate = strategy_v1_decision.get("candidate") if strategy_v1_decision else None
             probability_estimate = strategy_v1_decision.get("probability_estimate") if strategy_v1_decision else None
             log_entry_regime_decision(
@@ -4878,6 +4954,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_entry_price_filter(strategy_v1_decision)
             log_strategy_v1_decision(
                 logger=logger,
                 action=strategy_v1_decision["action"],
@@ -4929,6 +5006,27 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
             if selected_side_price is None:
                 selected_side_price = price
+            price_block_reason = entry_price_block_reason(selected_side, selected_side_price)
+            if price_block_reason:
+                log(
+                    f"  ⏸️  NO entry price guard: ${float(selected_side_price):.4f} outside "
+                    f"${STRATEGY_V1_NO_MIN_ENTRY_PRICE:.2f}-${STRATEGY_V1_NO_MAX_ENTRY_PRICE:.2f}"
+                )
+                if logger is not None:
+                    logger.event(
+                        "strategy_v1_blocked_entry_price",
+                        strategy_id=ACTIVE_STRATEGY_ID,
+                        strategy_label=get_active_strategy_config().get("label"),
+                        market_id=market_id,
+                        outcome_name=outcome_name,
+                        selected_side=str(selected_side or "").lower(),
+                        current_side_price=round(float(selected_side_price), 6),
+                        min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
+                        max_entry_price=STRATEGY_V1_NO_MAX_ENTRY_PRICE,
+                        reason=price_block_reason,
+                    )
+                skip_reasons.append(price_block_reason)
+                continue
 
             # Apply volatility targeting
             vol_meta = None
