@@ -14,7 +14,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -65,6 +65,11 @@ AUTH_COOKIE = "weather_dashboard_session"
 AUTH_TTL_SECONDS = int(os.environ.get("WEATHER_DASHBOARD_AUTH_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 LIVE_POSITIONS_TTL_SECONDS = float(os.environ.get("WEATHER_DASHBOARD_LIVE_POSITIONS_TTL_SECONDS", "10"))
 LIVE_POSITION_SOURCE_FILTER = os.environ.get("WEATHER_DASHBOARD_LIVE_POSITION_SOURCE", "")
+LIVE_POLYMARKET_WEATHER_ONLY = os.environ.get("WEATHER_DASHBOARD_LIVE_WEATHER_ONLY", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 LIVE_LOG_CANDIDATES = [
     Path(os.environ["WEATHER_DASHBOARD_LIVE_LOG"]) if os.environ.get("WEATHER_DASHBOARD_LIVE_LOG") else None,
     Path("/root/wheather/live_bot.log"),
@@ -237,6 +242,8 @@ def resolve_direct_paper_state_root() -> Path:
 
 DIRECT_PAPER_STATE_ROOT = resolve_direct_paper_state_root()
 LIVE_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None}
+LIVE_POLYMARKET_POSITIONS_CACHE = {"ts": 0.0, "positions": None, "error": None, "user": None}
+LIVE_POLYMARKET_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None, "user": None}
 LIVE_PORTFOLIO_CACHE = {"ts": 0.0, "portfolio": None, "error": None}
 LIVE_ACTIVITY_CACHE = {"ts": 0.0, "activity": None, "error": None}
 LIVE_ORDERS_CACHE = {"ts": 0.0, "orders": None, "error": None}
@@ -541,6 +548,318 @@ def public_json(url: str, timeout: float = 4.0):
         return None
 
 
+POLYMARKET_DATA_API_BASE = "https://data-api.polymarket.com"
+ETH_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def is_polymarket_user_address(value: str | None) -> bool:
+    return bool(value and ETH_ADDRESS_RE.match(clean_text(value)))
+
+
+def is_weather_market_title(question: str | None) -> bool:
+    text = clean_text(question).lower()
+    return "temperature in" in text and ("highest" in text or "lowest" in text)
+
+
+def nested_settings_dicts(settings: dict | None) -> list[dict]:
+    if not isinstance(settings, dict):
+        return []
+    nested = [settings]
+    for field in ("polymarket", "wallet", "account", "clob", "settings"):
+        value = settings.get(field)
+        if isinstance(value, dict):
+            nested.append(value)
+    return nested
+
+
+def polymarket_user_candidates(settings: dict | None = None) -> list[str]:
+    """Return possible Polymarket profile/proxy wallets without logging secrets."""
+    fields = (
+        "proxy_wallet",
+        "proxyWallet",
+        "proxy_wallet_address",
+        "proxyWalletAddress",
+        "deposit_wallet_address",
+        "depositWalletAddress",
+        "wallet_address",
+        "walletAddress",
+        "polymarket_wallet",
+        "polymarketWallet",
+        "polymarket_funder",
+        "polymarketFunder",
+        "funder",
+    )
+    raw: list[str | None] = [
+        os.environ.get("WEATHER_DASHBOARD_POLYMARKET_USER"),
+        os.environ.get("POLYMARKET_USER_ADDRESS"),
+        os.environ.get("POLYMARKET_PROXY_WALLET"),
+        os.environ.get("POLYMARKET_WALLET_ADDRESS"),
+        os.environ.get("POLYMARKET_CLOB_FUNDER"),
+        os.environ.get("POLYMARKET_FUNDER_ADDRESS"),
+        os.environ.get("POLYMARKET_DEPOSIT_WALLET"),
+    ]
+    for payload in nested_settings_dicts(settings):
+        raw.extend(clean_text(payload.get(field)) for field in fields)
+    raw.append(private_key_address(live_private_key()))
+    return [address for address in unique_clean_values(raw) if is_polymarket_user_address(address)]
+
+
+def polymarket_data_api_url(path: str, params: dict) -> str:
+    return f"{POLYMARKET_DATA_API_BASE}/{path.lstrip('/')}?{urlencode(params, doseq=True)}"
+
+
+def unix_timestamp_to_iso(value) -> str | None:
+    timestamp = to_float(value)
+    if timestamp is None:
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def polymarket_outcome_side(row: dict) -> str | None:
+    outcome = clean_text(row.get("outcome")).lower()
+    if outcome in {"yes", "y"}:
+        return "yes"
+    if outcome in {"no", "n"}:
+        return "no"
+    opposite = clean_text(row.get("oppositeOutcome")).lower()
+    if opposite == "yes":
+        return "no"
+    if opposite == "no":
+        return "yes"
+    index = to_float(row.get("outcomeIndex"))
+    if index == 0:
+        return "yes"
+    if index == 1:
+        return "no"
+    return None
+
+
+def normalize_polymarket_data_position(raw: dict) -> dict | None:
+    position = dict_from_obj(raw)
+    condition_id = clean_text(position.get("conditionId") or position.get("condition_id"))
+    asset_id = clean_text(position.get("asset") or position.get("asset_id") or position.get("token_id"))
+    question = clean_text(position.get("title") or position.get("question") or condition_id)
+    if LIVE_POLYMARKET_WEATHER_ONLY and not is_weather_market_title(question):
+        return None
+
+    side = polymarket_outcome_side(position)
+    if side not in {"yes", "no"}:
+        return None
+
+    shares = first_float(position, ("size", "shares", "balance")) or 0.0
+    if shares <= 0:
+        return None
+
+    entry_price = first_price(position, ("avgPrice", "avg_price", "average_price"))
+    current_price = first_price(position, ("curPrice", "currentPrice", "current_price"))
+    cost_basis = first_float(position, ("initialValue", "initial_value", "cost_basis"))
+    current_value = first_float(position, ("currentValue", "current_value", "value"))
+    pnl = first_float(position, ("cashPnl", "cash_pnl", "unrealized_pnl", "pnl"))
+
+    if cost_basis is None and entry_price is not None:
+        cost_basis = shares * entry_price
+    if entry_price is None and cost_basis is not None and shares > 0:
+        entry_price = cost_basis / shares
+    if current_value is None and current_price is not None:
+        current_value = shares * current_price
+    if current_price is None and current_value is not None and shares > 0:
+        current_price = current_value / shares
+    if pnl is None and current_value is not None and cost_basis is not None:
+        pnl = current_value - cost_basis
+
+    cost_basis = cost_basis or 0.0
+    pnl_pct = pnl / cost_basis if pnl is not None and cost_basis > 0 else None
+    market_id = condition_id or asset_id or question
+
+    return {
+        **position,
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "asset_id": asset_id,
+        "question": question,
+        "side": side,
+        "shares": shares,
+        "cost_basis": cost_basis,
+        "entry_price": entry_price,
+        "avg_cost": entry_price,
+        "current_price": current_price,
+        "current_value_usd": current_value,
+        "unrealized_pnl": pnl,
+        "unrealized_pnl_pct": pnl_pct,
+        "slug": position.get("slug"),
+        "event_slug": position.get("eventSlug") or position.get("event_slug"),
+        "market_url": polymarket_market_url(
+            {
+                "question": question,
+                "slug": position.get("slug"),
+                "event_slug": position.get("eventSlug") or position.get("event_slug"),
+            }
+        ),
+        "row_source": "polymarket_data_api",
+    }
+
+
+def normalize_polymarket_activity_trade(raw: dict) -> dict | None:
+    row = dict_from_obj(raw)
+    action = clean_text(row.get("side")).lower()
+    if action not in {"buy", "sell"}:
+        return None
+    question = clean_text(row.get("title") or row.get("question") or row.get("conditionId"))
+    if LIVE_POLYMARKET_WEATHER_ONLY and not is_weather_market_title(question):
+        return None
+    position_side = polymarket_outcome_side(row)
+    if position_side not in {"yes", "no"}:
+        return None
+
+    condition_id = clean_text(row.get("conditionId") or row.get("condition_id"))
+    shares = first_float(row, ("size", "shares", "tokens"))
+    amount = first_float(row, ("usdcSize", "usdc_size", "amount_usd", "cash"))
+    price = first_price(row, ("price", "fill_price", "filled_price"))
+    if amount is None and shares is not None and price is not None:
+        amount = shares * price
+    timestamp = unix_timestamp_to_iso(row.get("timestamp")) or row.get("timestamp")
+
+    return {
+        **row,
+        "action": action,
+        "side": position_side,
+        "market_id": condition_id or clean_text(row.get("asset")) or question,
+        "condition_id": condition_id,
+        "asset_id": clean_text(row.get("asset")),
+        "question": question,
+        "timestamp": timestamp,
+        "filled_shares": shares,
+        "requested_shares": shares,
+        "simulated_fill_price": price,
+        "amount_usd": amount,
+        "slug": row.get("slug"),
+        "event_slug": row.get("eventSlug") or row.get("event_slug"),
+        "market_url": polymarket_market_url(
+            {
+                "question": question,
+                "slug": row.get("slug"),
+                "event_slug": row.get("eventSlug") or row.get("event_slug"),
+            }
+        ),
+        "row_source": "polymarket_data_api",
+    }
+
+
+def fetch_polymarket_data_positions(settings: dict | None = None) -> tuple[list[dict] | None, str | None, str | None]:
+    """Fetch current positions from Polymarket's public Data API."""
+    now = time.time()
+    cached = LIVE_POLYMARKET_POSITIONS_CACHE.get("positions")
+    stale_cached = cached
+    if cached is not None and now - float(LIVE_POLYMARKET_POSITIONS_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_POLYMARKET_POSITIONS_CACHE.get("error"), LIVE_POLYMARKET_POSITIONS_CACHE.get("user")
+
+    if settings is None:
+        settings, _ = fetch_simmer_live_settings()
+    candidates = polymarket_user_candidates(settings)
+    if not candidates:
+        error = "Polymarket user address missing"
+        LIVE_POLYMARKET_POSITIONS_CACHE.update({"ts": now, "positions": stale_cached, "error": error, "user": None})
+        return stale_cached, error, None
+
+    errors = []
+    empty_result: tuple[list[dict], str] | None = None
+    for user in candidates:
+        url = polymarket_data_api_url(
+            "/positions",
+            {
+                "user": user,
+                "sizeThreshold": 0,
+                "limit": 500,
+                "sortBy": "CURRENT",
+                "sortDirection": "DESC",
+            },
+        )
+        payload = public_json(url, timeout=6.0)
+        rows = extract_rows(payload, ("positions", "data", "results", "items"))
+        if rows is None:
+            errors.append(f"{user[:8]}...: positions unavailable")
+            continue
+        normalized = [
+            position
+            for position in (normalize_polymarket_data_position(row) for row in values(rows))
+            if position is not None
+        ]
+        if normalized:
+            LIVE_POLYMARKET_POSITIONS_CACHE.update({"ts": now, "positions": normalized, "error": None, "user": user})
+            return normalized, None, user
+        if empty_result is None:
+            empty_result = (normalized, user)
+
+    if empty_result is not None:
+        positions, user = empty_result
+        LIVE_POLYMARKET_POSITIONS_CACHE.update({"ts": now, "positions": positions, "error": None, "user": user})
+        return positions, None, user
+
+    error = "; ".join(errors) or "Polymarket Data API positions unavailable"
+    LIVE_POLYMARKET_POSITIONS_CACHE.update({"ts": now, "positions": stale_cached, "error": error, "user": None})
+    return stale_cached, error, None
+
+
+def fetch_polymarket_data_activity(settings: dict | None = None) -> tuple[list[dict] | None, str | None, str | None]:
+    """Fetch recent trades from Polymarket's public Data API."""
+    now = time.time()
+    cached = LIVE_POLYMARKET_ACTIVITY_CACHE.get("activity")
+    stale_cached = cached
+    if cached is not None and now - float(LIVE_POLYMARKET_ACTIVITY_CACHE.get("ts") or 0.0) < LIVE_POSITIONS_TTL_SECONDS:
+        return cached, LIVE_POLYMARKET_ACTIVITY_CACHE.get("error"), LIVE_POLYMARKET_ACTIVITY_CACHE.get("user")
+
+    if settings is None:
+        settings, _ = fetch_simmer_live_settings()
+    candidates = polymarket_user_candidates(settings)
+    if not candidates:
+        error = "Polymarket user address missing"
+        LIVE_POLYMARKET_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": error, "user": None})
+        return stale_cached, error, None
+
+    errors = []
+    empty_result: tuple[list[dict], str] | None = None
+    for user in candidates:
+        url = polymarket_data_api_url(
+            "/activity",
+            {
+                "user": user,
+                "limit": 500,
+                "type": "TRADE",
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC",
+            },
+        )
+        payload = public_json(url, timeout=6.0)
+        rows = extract_rows(payload, ("activity", "data", "results", "items"))
+        if rows is None:
+            errors.append(f"{user[:8]}...: activity unavailable")
+            continue
+        normalized = [
+            trade
+            for trade in (normalize_polymarket_activity_trade(row) for row in values(rows))
+            if trade is not None
+        ]
+        if normalized:
+            LIVE_POLYMARKET_ACTIVITY_CACHE.update({"ts": now, "activity": normalized, "error": None, "user": user})
+            return normalized, None, user
+        if empty_result is None:
+            empty_result = (normalized, user)
+
+    if empty_result is not None:
+        activity, user = empty_result
+        LIVE_POLYMARKET_ACTIVITY_CACHE.update({"ts": now, "activity": activity, "error": None, "user": user})
+        return activity, None, user
+
+    error = "; ".join(errors) or "Polymarket Data API activity unavailable"
+    LIVE_POLYMARKET_ACTIVITY_CACHE.update({"ts": now, "activity": stale_cached, "error": error, "user": None})
+    return stale_cached, error, None
+
+
 def json_list(value) -> list:
     if isinstance(value, list):
         return value
@@ -832,6 +1151,8 @@ def reset_live_caches():
     """Force the next dashboard refresh to re-read live data from Simmer."""
     for cache in (
         LIVE_POSITIONS_CACHE,
+        LIVE_POLYMARKET_POSITIONS_CACHE,
+        LIVE_POLYMARKET_ACTIVITY_CACHE,
         LIVE_PORTFOLIO_CACHE,
         LIVE_ACTIVITY_CACHE,
         LIVE_ORDERS_CACHE,
@@ -2851,9 +3172,12 @@ def normalize_state(
     effective = effective_strategy(strategy, exit_mode)
     state = load_state(effective, source)
     if source == "live":
+        settings, _ = fetch_simmer_live_settings()
         portfolio, live_portfolio_error = fetch_simmer_live_portfolio()
-        remote_positions, live_positions_error = fetch_simmer_live_positions()
-        activity_rows, live_activity_error = fetch_simmer_live_activity()
+        polymarket_positions, polymarket_positions_error, polymarket_user = fetch_polymarket_data_positions(settings)
+        polymarket_activity, polymarket_activity_error, _ = fetch_polymarket_data_activity(settings)
+        remote_positions, simmer_positions_error = fetch_simmer_live_positions()
+        activity_rows, simmer_activity_error = fetch_simmer_live_activity()
         open_order_rows, live_orders_error = fetch_simmer_live_open_orders()
         clob_open_order_rows, clob_orders_error = fetch_polymarket_clob_open_orders(open_order_rows or [])
         if clob_open_order_rows is not None:
@@ -2866,17 +3190,30 @@ def normalize_state(
         local_entry_metadata = live_entry_metadata_index(local_by_key)
         log_entry_metadata = parse_recent_entry_metadata()
         exit_checks_by_key = parse_recent_exit_checks()
-        raw_position_source = [
+        normalized_simmer_positions = [
             position
             for position in (normalize_simmer_live_position(row) for row in values(remote_positions or []))
             if position is not None
         ]
+        if polymarket_positions is not None:
+            raw_position_source = polymarket_positions
+            live_positions_source = "polymarket_data_api"
+            live_positions_error = polymarket_positions_error
+        else:
+            raw_position_source = normalized_simmer_positions
+            live_positions_source = "simmer" if remote_positions is not None else "simmer_unavailable"
+            live_positions_error = simmer_positions_error or polymarket_positions_error
         raw_positions = values(raw_position_source)
-        raw_trades = [
-            trade
-            for trade in (normalize_simmer_activity_trade(row) for row in values(activity_rows or []))
-            if trade is not None
-        ]
+        if polymarket_activity is not None:
+            raw_trades = values(polymarket_activity)
+            live_activity_error = polymarket_activity_error
+        else:
+            raw_trades = [
+                trade
+                for trade in (normalize_simmer_activity_trade(row) for row in values(activity_rows or []))
+                if trade is not None
+            ]
+            live_activity_error = simmer_activity_error
         raw_trades = [
             enrich_live_metadata_from_entry(trade, local_entry_metadata, log_entry_metadata)
             for trade in raw_trades
@@ -2908,6 +3245,14 @@ def normalize_state(
             raw_positions,
             runner_mode=exit_mode == "tp40_runner",
         )
+        simmer_close_by_question_side = {
+            (
+                clean_text(position.get("question")).lower(),
+                clean_text(position.get("side")).lower(),
+            ): clean_text(position.get("market_id"))
+            for position in normalized_simmer_positions
+            if clean_text(position.get("question")) and clean_text(position.get("market_id"))
+        }
         failed_activity_rows = [row for row in values(activity_rows or []) if simmer_failure_status(row)]
         open_orders = build_live_order_rows(
             open_order_rows or [],
@@ -2923,6 +3268,13 @@ def normalize_state(
         live_closed_summaries = maybe_filter_live_by_view(live_closed_summaries, view)
         open_orders = maybe_filter_live_by_view(open_orders, view)
         for position in raw_positions:
+            if live_positions_source == "polymarket_data_api":
+                position["close_market_id"] = simmer_close_by_question_side.get(
+                    (
+                        clean_text(position.get("question")).lower(),
+                        clean_text(position.get("side")).lower(),
+                    )
+                ) or position.get("close_market_id")
             annotation = live_position_annotations.get(live_primary_key(position))
             local_metadata = merged_live_metadata(
                 log_entry_metadata.get(clean_text(position.get("market_id"))),
@@ -2930,47 +3282,48 @@ def normalize_state(
             )
             if not annotation and not local_metadata:
                 continue
-            # When Simmer positions omit average entry/cost fields, reconstruct
-            # the open lot from real activity fills instead of local paper state.
-            position.update(
-                {
-                    "shares": (annotation or {}).get("shares") or position.get("shares"),
-                    "cost_basis": (annotation or {}).get("cost_basis") or position.get("cost_basis"),
-                    "entry_price": (annotation or {}).get("entry_price") or position.get("entry_price"),
-                    "avg_cost": (annotation or {}).get("entry_price") or position.get("avg_cost"),
-                    "opened_at": (annotation or {}).get("opened_at") or position.get("opened_at"),
-                    "entry_regime": (annotation or {}).get("entry_regime")
-                    or local_metadata.get("entry_regime")
-                    or position.get("entry_regime"),
-                    "entry_forecast_value": local_metadata.get("entry_forecast_value")
-                    or position.get("entry_forecast_value"),
-                    "entry_forecast_unit": local_metadata.get("entry_forecast_unit")
-                    or position.get("entry_forecast_unit"),
-                    "entry_forecast_source": local_metadata.get("entry_forecast_source")
-                    or position.get("entry_forecast_source"),
-                    "forecast_label": (annotation or {}).get("forecast")
-                    or local_metadata.get("forecast_label")
-                    or position.get("forecast_label"),
-                    "runner_after_partial_exit": (annotation or {}).get("runner_after_partial_exit")
-                    or position.get("runner_after_partial_exit"),
-                    "partial_take_profit_done": (annotation or {}).get("partial_take_profit_done")
-                    or position.get("partial_take_profit_done"),
-                    "partial_take_profit_price": (annotation or {}).get("partial_take_profit_price")
-                    or position.get("partial_take_profit_price"),
-                    "partial_take_profit_realized_pnl": (annotation or {}).get("partial_take_profit_realized_pnl")
-                    or position.get("partial_take_profit_realized_pnl"),
-                    "partial_take_profit_shares": (annotation or {}).get("partial_take_profit_shares")
-                    or position.get("partial_take_profit_shares"),
-                    "market_url": (annotation or {}).get("market_url")
-                    or local_metadata.get("market_url")
-                    or position.get("market_url"),
-                }
-            )
-        if remote_positions is not None:
-            live_positions_source = "simmer"
-        else:
-            live_positions_source = "simmer_unavailable"
+            update = {
+                "opened_at": (annotation or {}).get("opened_at") or position.get("opened_at"),
+                "entry_regime": (annotation or {}).get("entry_regime")
+                or local_metadata.get("entry_regime")
+                or position.get("entry_regime"),
+                "entry_forecast_value": local_metadata.get("entry_forecast_value")
+                or position.get("entry_forecast_value"),
+                "entry_forecast_unit": local_metadata.get("entry_forecast_unit")
+                or position.get("entry_forecast_unit"),
+                "entry_forecast_source": local_metadata.get("entry_forecast_source")
+                or position.get("entry_forecast_source"),
+                "forecast_label": (annotation or {}).get("forecast")
+                or local_metadata.get("forecast_label")
+                or position.get("forecast_label"),
+                "runner_after_partial_exit": (annotation or {}).get("runner_after_partial_exit")
+                or position.get("runner_after_partial_exit"),
+                "partial_take_profit_done": (annotation or {}).get("partial_take_profit_done")
+                or position.get("partial_take_profit_done"),
+                "partial_take_profit_price": (annotation or {}).get("partial_take_profit_price")
+                or position.get("partial_take_profit_price"),
+                "partial_take_profit_realized_pnl": (annotation or {}).get("partial_take_profit_realized_pnl")
+                or position.get("partial_take_profit_realized_pnl"),
+                "partial_take_profit_shares": (annotation or {}).get("partial_take_profit_shares")
+                or position.get("partial_take_profit_shares"),
+                "market_url": (annotation or {}).get("market_url")
+                or local_metadata.get("market_url")
+                or position.get("market_url"),
+            }
+            if live_positions_source != "polymarket_data_api":
+                # When Simmer positions omit average entry/cost fields,
+                # reconstruct the open lot from real activity fills.
+                update.update(
+                    {
+                        "shares": (annotation or {}).get("shares") or position.get("shares"),
+                        "cost_basis": (annotation or {}).get("cost_basis") or position.get("cost_basis"),
+                        "entry_price": (annotation or {}).get("entry_price") or position.get("entry_price"),
+                        "avg_cost": (annotation or {}).get("entry_price") or position.get("avg_cost"),
+                    }
+                )
+            position.update(update)
     else:
+        polymarket_user = None
         portfolio = None
         open_orders = []
         raw_position_source = state.get("positions")
@@ -2986,10 +3339,10 @@ def normalize_state(
         else summarize(raw_positions, trades, buy_history, yes_stake, no_stake, source)
     )
     if source == "live":
-        if view == "all":
+        if view == "all" and live_positions_source != "polymarket_data_api":
             summary = apply_simmer_portfolio_summary(summary, portfolio, raw_positions)
         else:
-            summary["note"] = "filtered_live_rows"
+            summary["note"] = "polymarket_data_api" if live_positions_source == "polymarket_data_api" else "filtered_live_rows"
             if portfolio:
                 portfolio_total = first_live_portfolio_float(
                     portfolio,
@@ -3027,6 +3380,8 @@ def normalize_state(
                 "partial_pnl": to_float(position.get("partial_take_profit_realized_pnl")),
                 "partial_shares": to_float(position.get("partial_take_profit_shares")),
                 "market_url": position.get("market_url") or polymarket_market_url(position),
+                "close_market_id": position.get("close_market_id"),
+                "row_source": position.get("row_source"),
             }
         )
     positions.sort(key=lambda item: (item["stale"], -(abs(item["pnl"] or 0.0)), item["city"]))
@@ -3189,6 +3544,7 @@ def normalize_state(
             "stake_simulator_enabled": source != "live",
             "live_positions_source": live_positions_source,
             "live_positions_error": live_positions_error,
+            "live_polymarket_user": polymarket_user,
             "live_portfolio_error": live_portfolio_error,
             "live_activity_error": live_activity_error,
             "live_orders_error": live_orders_error,
@@ -5126,10 +5482,12 @@ INDEX_HTML = r"""<!doctype html>
     };
     function closePositionButton(position) {
       const shares = Number(position?.shares || 0);
-      if (state.source !== "live" || !position?.market_id || !Number.isFinite(shares) || shares <= 0) {
+      const isDataApiPosition = position?.row_source === "polymarket_data_api";
+      const closeMarketId = position?.close_market_id || (isDataApiPosition ? "" : position?.market_id);
+      if (state.source !== "live" || !closeMarketId || !Number.isFinite(shares) || shares <= 0) {
         return `<span class="neutral">-</span>`;
       }
-      return `<button class="close-position-btn" data-close-market="${esc(position.market_id)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Close</button>`;
+      return `<button class="close-position-btn" data-close-market="${esc(closeMarketId)}" data-close-side="${esc(String(position.side || "").toLowerCase())}">Close</button>`;
     }
 	    const orderStatusClass = status => {
 	      const text = String(status || "").toLowerCase();
@@ -5598,8 +5956,13 @@ INDEX_HTML = r"""<!doctype html>
       const meta = data?.meta || {};
       const orders = data?.orders || [];
       const positions = data?.positions || [];
+      const sourceLabel = meta.live_positions_source === "polymarket_data_api"
+        ? "Polymarket Data API"
+        : meta.live_positions_source === "simmer"
+          ? "Simmer"
+          : "fallback/local state";
       const filledNote = positions.length
-        ? `${positions.length} filled position${positions.length === 1 ? "" : "s"} now tracked from Simmer/Polymarket.`
+        ? `${positions.length} filled position${positions.length === 1 ? "" : "s"} now tracked from ${sourceLabel}.`
         : "No filled live positions yet.";
       setText("live-mode-title", `${meta.source_label || "Live"} · ${meta.strategy_label || "No Reentry"}`);
       setText(
@@ -5965,7 +6328,12 @@ INDEX_HTML = r"""<!doctype html>
       const s = data.stats, meta = data.meta;
       const isLive = meta.source === "live";
       const titleSource = isLive ? "Live Polymarket" : meta.view_label;
-      const liveDataLabel = isLive ? ` · ${meta.live_positions_source === "simmer" ? "real Simmer data" : "Simmer unavailable"}` : "";
+      const liveSourceLabel = meta.live_positions_source === "polymarket_data_api"
+        ? "real Polymarket Data API"
+        : meta.live_positions_source === "simmer"
+          ? "real Simmer data"
+          : "Simmer unavailable";
+      const liveDataLabel = isLive ? ` · ${liveSourceLabel}` : "";
       setText("title", `${titleSource} / ${meta.strategy_label}`);
       const filterNote = meta.source === "live" && meta.view !== "all" ? " · city-filtered rows" : "";
       const globalNote = meta.source === "live" && s.global_total !== undefined ? ` · Simmer global ${money(s.global_total)}` : "";
@@ -5979,8 +6347,8 @@ INDEX_HTML = r"""<!doctype html>
       setMetric("m-unrealized", s.unrealized);
       setText("m-winrate", `${s.winrate.toFixed(1)}%`);
       document.getElementById("m-winrate").className = "value neutral";
-      const liveErrors = [meta.live_positions_error, meta.live_portfolio_error, meta.live_orders_error].filter(Boolean).join(" · ");
-      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · Simmer error: ${liveErrors}` : ""}`);
+      const liveErrors = [meta.live_positions_error, meta.live_activity_error, meta.live_portfolio_error, meta.live_orders_error].filter(Boolean).join(" · ");
+      setText("state-path", `${meta.state_exists ? "state" : "missing"}: ${meta.state_path}${liveErrors ? ` · live data warning: ${liveErrors}` : ""}`);
       if (isLive) renderLiveModeStrip(data);
       renderStats(s);
       renderOrders(data.orders || []);
