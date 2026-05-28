@@ -149,7 +149,20 @@ class ExecutionEngine:
             filled_shares = shares or getattr(result, "shares_requested", None) or 0
         filled_value_usd = getattr(result, "cost", None)
         avg_fill_price = None
-        if filled_shares and filled_value_usd is not None:
+        if (
+            action == "buy"
+            and filled_shares
+            and limit_price is not None
+            and order_status in {"live", "delayed"}
+            and not getattr(result, "fully_filled", False)
+        ):
+            # Resting GTC orders can be partially filled while the remainder stays
+            # on-book. In that state the SDK may still report the order as "live",
+            # so value the actually filled shares at the entry limit instead of the
+            # original full order amount.
+            avg_fill_price = float(limit_price)
+            filled_value_usd = abs(float(filled_shares) * avg_fill_price)
+        elif filled_shares and filled_value_usd is not None:
             avg_fill_price = abs(float(filled_value_usd)) / float(filled_shares)
         elif amount and filled_shares:
             avg_fill_price = float(amount) / float(filled_shares)

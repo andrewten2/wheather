@@ -525,6 +525,57 @@ def _cancel_live_order(order: dict) -> bool:
         return False
 
 
+def cancel_live_market_orders(market_id: str, *, reason: str = None, logger: StructuredLogger = None) -> int:
+    """Cancel any resting live orders for a market before managing an open position."""
+    global _live_open_order_market_ids_cache
+    cancelled_count = 0
+    try:
+        response = get_adapter().get_open_orders()
+        orders = response.get("orders", []) if isinstance(response, dict) else []
+    except Exception as exc:
+        orders = []
+        if logger is not None:
+            logger.event(
+                "live_open_order_cancel_scan_failed",
+                market_id=market_id,
+                reason=reason,
+                error=str(exc),
+            )
+
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        if _order_market_id(order) != market_id:
+            continue
+        if _cancel_live_order(order):
+            cancelled_count += 1
+
+    if cancelled_count == 0:
+        try:
+            result = get_adapter().cancel_market_orders(market_id)
+            if result is not None:
+                cancelled_count = 1
+        except Exception as exc:
+            if logger is not None:
+                logger.event(
+                    "live_market_order_cancel_failed",
+                    market_id=market_id,
+                    reason=reason,
+                    error=str(exc),
+                )
+
+    if cancelled_count > 0:
+        _live_open_order_market_ids_cache = (datetime.min.replace(tzinfo=timezone.utc), set())
+        if logger is not None:
+            logger.event(
+                "live_market_orders_cancelled",
+                market_id=market_id,
+                reason=reason,
+                cancelled_count=cancelled_count,
+            )
+    return cancelled_count
+
+
 def live_open_order_market_ids(ttl_seconds: int = 15) -> set[str]:
     """Return markets with already-resting Simmer/Polymarket orders to avoid duplicates."""
     global _live_open_order_market_ids_cache
@@ -4320,6 +4371,16 @@ def check_exit_opportunities(
                 f"     {position_side.upper()} entry ${entry_price:.2f} -> current ${current_price:.2f} "
                 f"(tp ${take_profit:.2f}, sl ${stop_loss:.2f}) -> {exit_label}"
             )
+            if execution_mode == ExecutionMode.LIVE_ENABLED:
+                cancelled_orders = cancel_live_market_orders(
+                    market_id,
+                    reason=f"before_{exit_label}",
+                    logger=logger,
+                )
+                if cancelled_orders:
+                    print(
+                        f"     ℹ️  Cancelled {cancelled_orders} resting order(s) before live exit"
+                    )
             print(f"     Selling {side_label} {shares_to_sell:.1f} shares ({tag})...")
             result = execute_sell(
                 market_id,
@@ -5219,20 +5280,26 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                     fill_cost_usd = float(result.get("filled_value_usd"))
                 except (TypeError, ValueError):
                     fill_cost_usd = shares * fill_entry_price
-                total_usd_spent += fill_cost_usd or position_size
+                spent_for_summary = fill_cost_usd
+                if spent_for_summary is None:
+                    spent_for_summary = 0.0 if result.get("is_submitted_only") else position_size
+                total_usd_spent += spent_for_summary
                 log(
                     f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {selected_side.upper()} "
                     f"{shares:.1f} shares @ ${fill_entry_price:.4f}",
                     force=True,
                 )
                 if execution_mode == ExecutionMode.LIVE_ENABLED:
-                    if result.get("is_submitted_only"):
-                        log("  ⚠️  Live buy is pending on-book; local live state will wait for an actual fill.", force=True)
-                    elif shares > 0:
+                    if shares > 0:
+                        if result.get("is_submitted_only"):
+                            log(
+                                "  ⚠️  Live buy partially filled; local state updated and remaining order stays on-book until TTL/cancel.",
+                                force=True,
+                            )
                         record_live_buy(
                             market_id=market_id,
                             side=selected_side,
-                            amount=fill_cost_usd or position_size,
+                            amount=fill_cost_usd if fill_cost_usd is not None else shares * fill_entry_price,
                             shares=shares,
                             entry_price=fill_entry_price,
                             question=candidate.market.question,
@@ -5252,6 +5319,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                             sources=[TRADE_SOURCE],
                             opened_by_weather_strategy=True,
                         )
+                    elif result.get("is_submitted_only"):
+                        log("  ⚠️  Live buy is pending on-book with no fill yet; local live state will wait for an actual fill.", force=True)
                     else:
                         log("  ⚠️  Live buy returned success but no filled shares; local live state was not updated.", force=True)
 
