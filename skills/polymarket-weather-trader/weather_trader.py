@@ -24,6 +24,7 @@ import json
 import argparse
 import time
 import math
+import traceback
 from pathlib import Path
 from dataclasses import asdict
 from typing import Optional
@@ -496,9 +497,13 @@ def save_live_strategy_state(state: dict, strategy_id: str = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     state["strategy_id"] = strategy_id or ACTIVE_STRATEGY_ID
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True))
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def get_live_position_state(market_id: str) -> Optional[dict]:
@@ -5580,36 +5585,47 @@ def guarded_cycle_call(fn, *args, **kwargs):
 
 def run_strategy_suite(args):
     """Run all configured paper strategy variants with separate ledgers."""
+    failed_strategies = []
     for index, strategy_id in enumerate(STRATEGY_VARIANTS):
         set_active_strategy(strategy_id)
         variant = get_active_strategy_config()
         print("\n" + "=" * 72)
         print(f"🧪 Strategy suite: {strategy_id} ({variant.get('label', strategy_id)})")
         print(f"   state: {get_strategy_state_dir(strategy_id) / 'state.json'}")
-        if not strategy_suite_entries_enabled(strategy_id):
-            print(f"   new entries: disabled ({variant.get('disabled_reason', 'disabled')}); running exits only")
-            run_paper_exit_check_cycle(
+        try:
+            if not strategy_suite_entries_enabled(strategy_id):
+                print(f"   new entries: disabled ({variant.get('disabled_reason', 'disabled')}); running exits only")
+                run_paper_exit_check_cycle(
+                    dry_run=False,
+                    use_safeguards=not args.no_safeguards,
+                    quiet=args.quiet,
+                )
+                print(f"✅ Strategy suite exits completed: {strategy_id}")
+                continue
+            run_weather_strategy(
                 dry_run=False,
+                positions_only=args.positions,
+                show_config=args.config,
+                smart_sizing=args.smart_sizing,
                 use_safeguards=not args.no_safeguards,
+                use_trends=not args.no_trends,
                 quiet=args.quiet,
+                vol_targeting=args.vol_targeting or VOL_TARGETING,
+                paper=True,
+                record_dataset=args.record_dataset and index == 0,
+                dataset_output=args.dataset_output,
+                skip_discovery=index > 0,
             )
-            print(f"✅ Strategy suite exits completed: {strategy_id}")
+            print(f"✅ Strategy suite completed: {strategy_id}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            failed_strategies.append(strategy_id)
+            print(f"❌ Strategy suite failed: {strategy_id}: {exc}")
+            traceback.print_exc()
             continue
-        run_weather_strategy(
-            dry_run=False,
-            positions_only=args.positions,
-            show_config=args.config,
-            smart_sizing=args.smart_sizing,
-            use_safeguards=not args.no_safeguards,
-            use_trends=not args.no_trends,
-            quiet=args.quiet,
-            vol_targeting=args.vol_targeting or VOL_TARGETING,
-            paper=True,
-            record_dataset=args.record_dataset and index == 0,
-            dataset_output=args.dataset_output,
-            skip_discovery=index > 0,
-        )
-        print(f"✅ Strategy suite completed: {strategy_id}")
+    if failed_strategies:
+        print(f"⚠️  Strategy suite cycle completed with failures: {', '.join(failed_strategies)}")
 
 
 def run_strategy_suite_exit_check_cycle(args):

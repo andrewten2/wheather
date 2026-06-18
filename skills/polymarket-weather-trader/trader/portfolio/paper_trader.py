@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -93,15 +94,22 @@ class PaperTrader:
     def _save_state(self, state: Optional[dict] = None) -> None:
         if state is not None:
             self.state = state
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state["updated_at"] = self._now()
         if self.state_path.exists() and self.state_path.stat().st_size > 0:
             shutil.copy2(self.state_path, self._backup_path())
-        tmp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
-        with tmp_path.open("w") as f:
-            json.dump(self.state, f, indent=2, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_path.replace(self.state_path)
+        tmp_path = self.state_path.with_name(
+            f"{self.state_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with tmp_path.open("w") as f:
+                json.dump(self.state, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(self.state_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def _log_event(self, event: str, **fields) -> None:
         if self.logger:
