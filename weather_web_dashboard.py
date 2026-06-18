@@ -107,6 +107,8 @@ STRATEGY_ORDER = (
     "stop20_early",
     "no_reentry_after_stop",
     "selected_no_early_central",
+    "quality_mid_yes_safe_no",
+    "quality_mid_yes_safe_no_aggressive",
     "no_reentry_watchlist",
     "early_only",
     "low_risk_cities_only",
@@ -117,12 +119,14 @@ STRATEGY_ORDER = (
     "celsius_exact_direct",
 )
 
-STRATEGY_KEYS = dict(zip("abcdefghijkl", STRATEGY_ORDER))
+STRATEGY_KEYS = dict(zip("abcdefghijklmn", STRATEGY_ORDER))
 STRATEGY_LABELS = {
     "baseline": "Baseline",
     "stop20_early": "Stop20 Early",
     "no_reentry_after_stop": "No Reentry",
     "selected_no_early_central": "Selected No EC",
+    "quality_mid_yes_safe_no": "Quality Safe",
+    "quality_mid_yes_safe_no_aggressive": "Quality Aggro",
     "no_reentry_watchlist": "C + Watchlist",
     "early_only": "Early Only",
     "low_risk_cities_only": "Low Risk",
@@ -5560,7 +5564,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-l strategy · x compare · t period · m terminal/web · d theme · p paper · l live · o logs</span>
+        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-n strategy · x compare · t period · m terminal/web · d theme · p paper · l live · o logs</span>
       </div>
     </main>
   </div>

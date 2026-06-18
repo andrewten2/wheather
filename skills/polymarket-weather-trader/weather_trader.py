@@ -227,6 +227,16 @@ SELECTED_NO_EARLY_CENTRAL_CITIES = {
     "Los Angeles", "Ankara", "Chicago", "Dallas", "Denver", "Seattle",
     "Atlanta", "Sao Paulo", "Buenos Aires", "Istanbul",
 }
+QUALITY_MID_YES_CITIES = {
+    "Munich", "Istanbul", "Shanghai", "Chongqing", "London",
+    "Toronto", "Warsaw", "Taipei", "Tel Aviv",
+}
+QUALITY_SAFE_NO_CITIES = {
+    "Miami", "Seattle", "Munich", "Chongqing", "Toronto",
+    "Milan", "Austin", "Denver", "Los Angeles",
+}
+QUALITY_STRATEGY_CITIES = QUALITY_MID_YES_CITIES | QUALITY_SAFE_NO_CITIES
+QUALITY_ENTRY_REASONS = {"mid_strong_edge_yes", "late far no"}
 STRATEGY_VARIANTS = {
     "baseline": {
         "label": "Baseline",
@@ -250,6 +260,36 @@ STRATEGY_VARIANTS = {
         "allowed_cities": SELECTED_NO_EARLY_CENTRAL_CITIES,
         "block_reentry_after_stop_loss": True,
         "disabled_entry_reasons": {"early_central_yes"},
+    },
+    "quality_mid_yes_safe_no": {
+        "label": "Quality Mid YES + Safe NO",
+        "forecast_mode": "primary",
+        "allowed_cities": QUALITY_STRATEGY_CITIES,
+        "allowed_side_cities": {
+            "yes": QUALITY_MID_YES_CITIES,
+            "no": QUALITY_SAFE_NO_CITIES,
+        },
+        "allowed_entry_reasons": QUALITY_ENTRY_REASONS,
+        "block_reentry_after_stop_loss": True,
+        "mid_yes_min_price": 0.12,
+        "mid_yes_max_price": 0.20,
+        "exact_yes_min_price": 0.12,
+        "exact_mid_yes_max_price": 0.20,
+    },
+    "quality_mid_yes_safe_no_aggressive": {
+        "label": "Quality Mid YES + Safe NO Aggressive",
+        "forecast_mode": "primary",
+        "allowed_cities": QUALITY_STRATEGY_CITIES,
+        "allowed_side_cities": {
+            "yes": QUALITY_MID_YES_CITIES,
+            "no": QUALITY_SAFE_NO_CITIES,
+        },
+        "allowed_entry_reasons": QUALITY_ENTRY_REASONS,
+        "block_reentry_after_stop_loss": True,
+        "mid_yes_min_price": 0.12,
+        "mid_yes_max_price": 0.25,
+        "exact_yes_min_price": 0.12,
+        "exact_mid_yes_max_price": 0.25,
     },
     "no_reentry_watchlist": {
         "label": "No Reentry Watchlist",
@@ -336,6 +376,7 @@ TP40_RUNNER_BASE_STRATEGIES = (
     "baseline",
     "stop20_early",
     "no_reentry_after_stop",
+    "selected_no_early_central",
     "no_reentry_watchlist",
     "early_only",
     "low_risk_cities_only",
@@ -993,14 +1034,18 @@ def _strategy_v1_early_yes_price_bounds(bucket) -> tuple:
 
 
 def _strategy_v1_mid_yes_thresholds(bucket) -> tuple:
+    strategy_config = get_active_strategy_config()
     if _is_exact_bucket(bucket):
-        strategy_config = get_active_strategy_config()
         return (
             float(strategy_config.get("exact_yes_min_price", STRATEGY_V1_EXACT_MID_YES_MIN_PRICE)),
             float(strategy_config.get("exact_mid_yes_max_price", STRATEGY_V1_EXACT_MID_YES_MAX_PRICE)),
-            STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
+            float(strategy_config.get("exact_mid_yes_min_edge", STRATEGY_V1_EXACT_MID_YES_MIN_EDGE)),
         )
-    return STRATEGY_V1_MID_YES_MIN_PRICE, STRATEGY_V1_MID_YES_MAX_PRICE, STRATEGY_V1_MID_YES_MIN_EDGE
+    return (
+        float(strategy_config.get("mid_yes_min_price", STRATEGY_V1_MID_YES_MIN_PRICE)),
+        float(strategy_config.get("mid_yes_max_price", STRATEGY_V1_MID_YES_MAX_PRICE)),
+        float(strategy_config.get("mid_yes_min_edge", STRATEGY_V1_MID_YES_MIN_EDGE)),
+    )
 
 
 def _is_celsius_unit(unit_label: str) -> bool:
@@ -1065,6 +1110,15 @@ def apply_strategy_side_reversal(decision: Optional[dict]) -> Optional[dict]:
 def apply_strategy_entry_reason_filter(decision: Optional[dict]) -> Optional[dict]:
     if not decision or decision.get("action") != "trade":
         return decision
+    allowed_reasons = get_active_strategy_config().get("allowed_entry_reasons")
+    if allowed_reasons:
+        original_reason = decision.get("reason")
+        if original_reason not in set(allowed_reasons):
+            filtered_decision = dict(decision)
+            filtered_decision["action"] = "skip"
+            filtered_decision["reason"] = f"{original_reason or 'entry'}_not_allowed"
+            filtered_decision["blocked_entry_reason"] = original_reason
+            return filtered_decision
     disabled_reasons = get_active_strategy_config().get("disabled_entry_reasons")
     if not disabled_reasons:
         return decision
@@ -1075,6 +1129,26 @@ def apply_strategy_entry_reason_filter(decision: Optional[dict]) -> Optional[dic
     filtered_decision["action"] = "skip"
     filtered_decision["reason"] = f"{original_reason}_disabled"
     filtered_decision["blocked_entry_reason"] = original_reason
+    return filtered_decision
+
+
+def apply_strategy_side_city_filter(decision: Optional[dict]) -> Optional[dict]:
+    if not decision or decision.get("action") != "trade":
+        return decision
+    selected_side = str(decision.get("selected_side") or "").lower()
+    side_cities = get_active_strategy_config().get("allowed_side_cities") or {}
+    allowed_cities = side_cities.get(selected_side)
+    if not allowed_cities:
+        return decision
+    candidate = decision.get("candidate")
+    location = getattr(candidate, "location", None)
+    if location in set(allowed_cities):
+        return decision
+    filtered_decision = dict(decision)
+    filtered_decision["action"] = "skip"
+    filtered_decision["reason"] = f"{selected_side or 'side'}_city_not_in_strategy_universe"
+    filtered_decision["blocked_entry_side"] = selected_side
+    filtered_decision["blocked_entry_city"] = location
     return filtered_decision
 
 
@@ -4508,6 +4582,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         active_strategy_config = get_active_strategy_config()
         allowed_strategy_cities = active_strategy_config.get("allowed_cities")
         disabled_entry_reasons = active_strategy_config.get("disabled_entry_reasons")
+        allowed_entry_reasons = active_strategy_config.get("allowed_entry_reasons")
+        allowed_side_cities = active_strategy_config.get("allowed_side_cities")
         if paper:
             log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
         else:
@@ -4521,6 +4597,11 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             strategy_style="forecast_first",
             allowed_cities=sorted(allowed_strategy_cities) if allowed_strategy_cities else "all_active_locations",
             disabled_entry_reasons=sorted(disabled_entry_reasons) if disabled_entry_reasons else [],
+            allowed_entry_reasons=sorted(allowed_entry_reasons) if allowed_entry_reasons else [],
+            allowed_side_cities={
+                side: sorted(cities)
+                for side, cities in (allowed_side_cities or {}).items()
+            },
             loop_interval_seconds=WEATHER_BOT_LOOP_SECONDS,
             exit_check_interval_seconds=WEATHER_BOT_EXIT_CHECK_SECONDS,
             forecast_cache_ttl_seconds=FORECAST_CACHE_TTL_SECONDS,
@@ -4550,15 +4631,21 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             forecast_fresh_max_hours=STRATEGY_V1_FORECAST_FRESH_MAX_HOURS,
             early_yes_min_price=STRATEGY_V1_EARLY_YES_MIN_PRICE,
             early_yes_max_price=STRATEGY_V1_EARLY_YES_MAX_PRICE,
-            mid_yes_min_price=STRATEGY_V1_MID_YES_MIN_PRICE,
-            mid_yes_max_price=STRATEGY_V1_MID_YES_MAX_PRICE,
-            mid_yes_min_edge=STRATEGY_V1_MID_YES_MIN_EDGE,
+            mid_yes_min_price=active_strategy_config.get("mid_yes_min_price", STRATEGY_V1_MID_YES_MIN_PRICE),
+            mid_yes_max_price=active_strategy_config.get("mid_yes_max_price", STRATEGY_V1_MID_YES_MAX_PRICE),
+            mid_yes_min_edge=active_strategy_config.get("mid_yes_min_edge", STRATEGY_V1_MID_YES_MIN_EDGE),
             exact_temperature_sigma=_config.get("exact_temperature_sigma", 1.0),
             exact_early_yes_min_price=STRATEGY_V1_EXACT_EARLY_YES_MIN_PRICE,
             exact_early_yes_max_price=STRATEGY_V1_EXACT_EARLY_YES_MAX_PRICE,
             exact_mid_yes_min_price=STRATEGY_V1_EXACT_MID_YES_MIN_PRICE,
-            exact_mid_yes_max_price=STRATEGY_V1_EXACT_MID_YES_MAX_PRICE,
-            exact_mid_yes_min_edge=STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
+            exact_mid_yes_max_price=active_strategy_config.get(
+                "exact_mid_yes_max_price",
+                STRATEGY_V1_EXACT_MID_YES_MAX_PRICE,
+            ),
+            exact_mid_yes_min_edge=active_strategy_config.get(
+                "exact_mid_yes_min_edge",
+                STRATEGY_V1_EXACT_MID_YES_MIN_EDGE,
+            ),
             late_far_max_probability=STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
             late_almost_impossible_max_probability=STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY,
             no_min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
@@ -4579,7 +4666,16 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "  Entry regimes:   early=central±1 YES, mid=strong-edge YES, "
             "late=far NO"
         )
+        active_strategy_config = get_active_strategy_config()
+        log(
+            "  YES mid price:   "
+            f"${float(active_strategy_config.get('mid_yes_min_price', STRATEGY_V1_MID_YES_MIN_PRICE)):.2f}-"
+            f"${float(active_strategy_config.get('mid_yes_max_price', STRATEGY_V1_MID_YES_MAX_PRICE)):.2f}"
+        )
         log(f"  NO entry price:  ${STRATEGY_V1_NO_MIN_ENTRY_PRICE:.2f}-${STRATEGY_V1_NO_MAX_ENTRY_PRICE:.2f}")
+        allowed_entry_reasons = active_strategy_config.get("allowed_entry_reasons")
+        if allowed_entry_reasons:
+            log(f"  Allowed entries: {', '.join(sorted(allowed_entry_reasons))}")
     requested_execution_mode = (
         ExecutionMode.PAPER if paper
         else ExecutionMode.LIVE_ENABLED if not dry_run
@@ -4835,6 +4931,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_side_city_filter(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_price_filter(strategy_v1_decision)
             drift_rotation_allowed = maybe_rotate_position_on_forecast_drift(
                 event_id=event_id,
@@ -4861,6 +4958,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
             strategy_v1_decision = apply_strategy_side_reversal(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_reason_filter(strategy_v1_decision)
+            strategy_v1_decision = apply_strategy_side_city_filter(strategy_v1_decision)
             strategy_v1_decision = apply_strategy_entry_price_filter(strategy_v1_decision)
             candidate = strategy_v1_decision.get("candidate") if strategy_v1_decision else None
             probability_estimate = strategy_v1_decision.get("probability_estimate") if strategy_v1_decision else None
