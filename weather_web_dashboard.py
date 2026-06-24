@@ -81,12 +81,13 @@ LIVE_LOG_CANDIDATES = [
     ROOT / "live_bot.log",
 ]
 
-VIEW_ORDER = ("old", "new", "all", "watchlist")
+VIEW_ORDER = ("old", "new", "all", "watchlist", "quality")
 VIEW_LABELS = {
     "old": "Old Cities",
     "new": "New Cities",
     "all": "All Cities",
     "watchlist": "Watchlist",
+    "quality": "Quality Cities",
 }
 
 SOURCE_ORDER = ("paper", "direct_paper", "live")
@@ -208,6 +209,24 @@ WATCHLIST_CITY_ALIASES = {
     "Panama City": NEW_CITY_ALIASES["Panama City"],
     "Paris": NEW_CITY_ALIASES["Paris"],
     "Milan": NEW_CITY_ALIASES["Milan"],
+}
+
+QUALITY_CITY_ALIASES = {
+    "Austin": NEW_CITY_ALIASES["Austin"],
+    "Chongqing": NEW_CITY_ALIASES["Chongqing"],
+    "Denver": NEW_CITY_ALIASES["Denver"],
+    "Istanbul": NEW_CITY_ALIASES["Istanbul"],
+    "London": OLD_CITY_ALIASES["London"],
+    "Los Angeles": NEW_CITY_ALIASES["Los Angeles"],
+    "Miami": OLD_CITY_ALIASES["Miami"],
+    "Milan": NEW_CITY_ALIASES["Milan"],
+    "Munich": OLD_CITY_ALIASES["Munich"],
+    "Seattle": OLD_CITY_ALIASES["Seattle"],
+    "Shanghai": NEW_CITY_ALIASES["Shanghai"],
+    "Taipei": NEW_CITY_ALIASES["Taipei"],
+    "Tel Aviv": OLD_CITY_ALIASES["Tel Aviv"],
+    "Toronto": NEW_CITY_ALIASES["Toronto"],
+    "Warsaw": NEW_CITY_ALIASES["Warsaw"],
 }
 
 
@@ -1848,6 +1867,12 @@ def filter_by_view(items, view: str):
             item
             for item in items
             if question_matches_aliases(item.get("question") or item.get("market_id"), WATCHLIST_CITY_ALIASES)
+        ]
+    if view == "quality":
+        return [
+            item
+            for item in items
+            if question_matches_aliases(item.get("question") or item.get("market_id"), QUALITY_CITY_ALIASES)
         ]
     return [
         item
@@ -5564,7 +5589,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer">
         <span id="state-path">state: ...</span>
-        <span>Shortcuts: 1-4 cities · 5 TP40 · 6 runner · a-n strategy · x compare · t period · m terminal/web · d theme · p paper · l live · o logs</span>
+        <span>Shortcuts: 1-5 cities · 6 TP40 · 7 runner · a-n strategy · x compare · t period · m terminal/web · d theme · p paper · l live · o logs</span>
       </div>
     </main>
   </div>
@@ -6722,9 +6747,9 @@ INDEX_HTML = r"""<!doctype html>
     document.addEventListener("keydown", e => {
       if (e.target.tagName === "INPUT") return;
       const key = e.key.toLowerCase();
-      if (["1","2","3","4"].includes(key)) setState({view: ["old","new","all","watchlist"][Number(key)-1]});
-      if (key === "5") setState({exit_mode: "tp40"});
-      if (key === "6") setState({exit_mode: "tp40_runner"});
+      if (["1","2","3","4","5"].includes(key)) setState({view: ["old","new","all","watchlist","quality"][Number(key)-1]});
+      if (key === "6") setState({exit_mode: "tp40"});
+      if (key === "7") setState({exit_mode: "tp40_runner"});
       if (key === "x") setState({strategy: "compare"});
       if (key === "t") setState({lookback: nextLookback()});
       if (key === "d") applyTheme(state.theme === "dark" ? "light" : "dark");
