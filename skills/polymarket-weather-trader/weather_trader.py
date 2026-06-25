@@ -291,6 +291,8 @@ STRATEGY_VARIANTS = {
         "mid_yes_max_price": 0.25,
         "exact_yes_min_price": 0.12,
         "exact_mid_yes_max_price": 0.25,
+        "yes_take_profit_pct": 0.30,
+        "max_buys_per_market": 2,
     },
     "no_reentry_watchlist": {
         "label": "No Reentry Watchlist",
@@ -681,6 +683,7 @@ def record_live_buy(
     next_shares = existing_shares + float(shares)
     next_cost = existing_cost + float(amount or 0.0)
     signal_data = signal_data or {}
+    is_dust_position = next_shares < MIN_SHARES_PER_ORDER
     position.update(
         {
             "side": side,
@@ -701,6 +704,7 @@ def record_live_buy(
             "entry_forecast_unit": signal_data.get("entry_forecast_unit"),
             "entry_forecast_source": signal_data.get("entry_forecast_source"),
             "runner_after_partial_exit": bool(position.get("runner_after_partial_exit", False)),
+            "is_dust_position": is_dust_position,
         }
     )
     state["positions"][market_id] = position
@@ -717,6 +721,8 @@ def record_live_buy(
             "strategy_id": ACTIVE_STRATEGY_ID,
             "trade_id": trade_id,
             "order_status": order_status,
+            "dust_fill": float(shares) < MIN_SHARES_PER_ORDER,
+            "is_dust_position": is_dust_position,
             "entry_regime": position.get("entry_regime"),
             "entry_bucket_relation": position.get("entry_bucket_relation"),
             "entry_forecast_value": position.get("entry_forecast_value"),
@@ -827,6 +833,7 @@ def record_live_sell(
             {
                 "shares": remaining_shares,
                 "cost_basis": remaining_cost,
+                "is_dust_position": remaining_shares < MIN_SHARES_PER_ORDER,
                 "partial_take_profit_done": bool(position.get("partial_take_profit_done", False) or partial_exit),
                 "partial_take_profit_at": now if partial_exit else position.get("partial_take_profit_at"),
                 "partial_take_profit_price": exit_price if partial_exit else position.get("partial_take_profit_price"),
@@ -1619,6 +1626,26 @@ def build_live_strategy_position_map(positions: list[Position]) -> dict:
     }
 
 
+def get_strategy_max_buys_per_market() -> int:
+    try:
+        return max(1, int(get_active_strategy_config().get("max_buys_per_market", STRATEGY_V1_MAX_BUYS_PER_MARKET)))
+    except (TypeError, ValueError):
+        return STRATEGY_V1_MAX_BUYS_PER_MARKET
+
+
+def live_buy_count_for_market(market_id: str) -> int:
+    state = load_live_strategy_state()
+    count = 0
+    for trade in state.get("trades", []) or []:
+        if not isinstance(trade, dict):
+            continue
+        if trade.get("market_id") != market_id:
+            continue
+        if trade.get("action") == "buy":
+            count += 1
+    return count
+
+
 def _apply_strategy_v1_rebuy_guard(
     entry: dict,
     selected_side: str,
@@ -1643,6 +1670,25 @@ def _apply_strategy_v1_rebuy_guard(
                 "open_position_exists": False,
                 "historical_trade_exists": None,
                 "buy_count": None,
+                "last_buy_at": None,
+                "last_buy_price": None,
+                "position_cost_usd": None,
+                "current_side_price": current_side_price,
+            }
+        buy_count = live_buy_count_for_market(market_id)
+        max_buys_per_market = get_strategy_max_buys_per_market()
+        if buy_count >= max_buys_per_market:
+            return {
+                "action": "skip",
+                "reason": "max_buys_per_market",
+                "selected_side": selected_side,
+                "price_yes": entry["yes_price"],
+                "gaussian_probability": entry["gaussian_probability"],
+                "edge_yes": entry["edge_yes"],
+                "edge_no": entry["edge_no"],
+                "open_position_exists": False,
+                "historical_trade_exists": True,
+                "buy_count": buy_count,
                 "last_buy_at": None,
                 "last_buy_price": None,
                 "position_cost_usd": None,
@@ -2564,6 +2610,7 @@ def filter_live_strategy_positions(positions: list[Position]) -> list[Position]:
 # Polymarket constraints
 MIN_SHARES_PER_ORDER = 5.0  # Polymarket requires minimum 5 shares
 MIN_TICK_SIZE = 0.01        # Minimum tradeable price
+LIVE_SKIP_DUST_EXITS = os.environ.get("WEATHER_BOT_LIVE_SKIP_DUST_EXITS", "1") != "0"
 
 
 def _clob_request(url: str, timeout: int = 5) -> Optional[dict]:
@@ -3534,9 +3581,10 @@ def get_exit_targets(
         take_profit = STRATEGY_V1_NO_TAKE_PROFIT_PRICE
         stop_loss = max(0.0, entry_price - 0.10)
     else:
-        take_profit = min(1.0, entry_price * (1.0 + STRATEGY_V1_YES_TAKE_PROFIT_PCT))
-        stop_pct = STRATEGY_V1_YES_STOP_LOSS_PCT
         strategy_config = get_active_strategy_config()
+        take_profit_pct = float(strategy_config.get("yes_take_profit_pct", STRATEGY_V1_YES_TAKE_PROFIT_PCT))
+        take_profit = min(1.0, entry_price * (1.0 + take_profit_pct))
+        stop_pct = STRATEGY_V1_YES_STOP_LOSS_PCT
         if str(entry_regime or "").lower() == "early":
             stop_pct = float(strategy_config.get("early_yes_stop_loss_pct", stop_pct))
         stop_loss = max(0.01, entry_price * (1.0 - stop_pct))
@@ -4216,6 +4264,29 @@ def check_exit_opportunities(
         if execution_mode != ExecutionMode.PAPER and shares <= 0:
             continue
 
+        if (
+            execution_mode == ExecutionMode.LIVE_ENABLED
+            and LIVE_SKIP_DUST_EXITS
+            and 0 < shares < MIN_SHARES_PER_ORDER
+        ):
+            print(f"  📊 {question}...")
+            print(
+                f"     ⏭️  Skip live dust exit: {shares:.2f} shares < "
+                f"{MIN_SHARES_PER_ORDER:.0f} minimum shares"
+            )
+            if logger is not None:
+                logger.event(
+                    "live_dust_exit_skipped",
+                    market_id=market_id,
+                    side=position_side,
+                    shares=round(shares, 6),
+                    entry_price=round(entry_price, 6),
+                    current_price=round(current_price, 6) if current_price is not None else None,
+                    min_shares=MIN_SHARES_PER_ORDER,
+                    reason="dust_position_below_min_shares",
+                )
+            continue
+
         if current_price is None:
             print(f"  📊 {question}...")
             print(f"     ⏭️  Skip exit: price not found")
@@ -4616,15 +4687,16 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             min_market_price=STRATEGY_V1_MIN_PRICE,
             max_market_price=STRATEGY_V1_MAX_PRICE,
             max_position_per_market_usd=STRATEGY_V1_MAX_POSITION_PER_MARKET_USD,
-            max_buys_per_market=STRATEGY_V1_MAX_BUYS_PER_MARKET,
+            max_buys_per_market=get_strategy_max_buys_per_market(),
             cooldown_between_buys_minutes=STRATEGY_V1_COOLDOWN_BETWEEN_BUYS_MINUTES,
             rebuy_price_improvement_factor=STRATEGY_V1_REBUY_PRICE_IMPROVEMENT_FACTOR,
             paper_max_trades_per_run=STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN,
             max_trades_per_run=MAX_TRADES_PER_RUN,
             market_exit_cooldown_minutes=MARKET_EXIT_COOLDOWN_MINUTES,
-            yes_take_profit_pct=STRATEGY_V1_YES_TAKE_PROFIT_PCT,
+            yes_take_profit_pct=active_strategy_config.get("yes_take_profit_pct", STRATEGY_V1_YES_TAKE_PROFIT_PCT),
             yes_stop_loss_pct=STRATEGY_V1_YES_STOP_LOSS_PCT,
             live_entry_max_spread=LIVE_ENTRY_MAX_SPREAD,
+            live_skip_dust_exits=LIVE_SKIP_DUST_EXITS,
             early_yes_stop_loss_pct=active_strategy_config.get(
                 "early_yes_stop_loss_pct",
                 STRATEGY_V1_YES_STOP_LOSS_PCT,
@@ -4662,8 +4734,10 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
     log(f"\n⚙️  Configuration:")
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
     if strategy_v1_requested:
-        early_stop_pct = float(get_active_strategy_config().get("early_yes_stop_loss_pct", STRATEGY_V1_YES_STOP_LOSS_PCT))
-        log(f"  Exit rules:      YES +40% / -{STRATEGY_V1_YES_STOP_LOSS_PCT:.0%}, EARLY YES -{early_stop_pct:.0%}, NO @0.98 / -0.10")
+        active_strategy_config = get_active_strategy_config()
+        yes_tp_pct = float(active_strategy_config.get("yes_take_profit_pct", STRATEGY_V1_YES_TAKE_PROFIT_PCT))
+        early_stop_pct = float(active_strategy_config.get("early_yes_stop_loss_pct", STRATEGY_V1_YES_STOP_LOSS_PCT))
+        log(f"  Exit rules:      YES +{yes_tp_pct:.0%} / -{STRATEGY_V1_YES_STOP_LOSS_PCT:.0%}, EARLY YES -{early_stop_pct:.0%}, NO @0.98 / -0.10")
     else:
         log("  Exit rules:      YES +0.15 / -0.08, NO +0.12 / -0.10, edge<0 exit")
     if strategy_v1_requested:
@@ -4671,7 +4745,6 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "  Entry regimes:   early=central±1 YES, mid=strong-edge YES, "
             "late=far NO"
         )
-        active_strategy_config = get_active_strategy_config()
         log(
             "  YES mid price:   "
             f"${float(active_strategy_config.get('mid_yes_min_price', STRATEGY_V1_MID_YES_MIN_PRICE)):.2f}-"
@@ -4692,6 +4765,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         log(f"  NO position:     ${STRATEGY_V1_NO_MAX_POSITION_USD:.2f}")
     effective_max_trades_per_run = STRATEGY_V1_PAPER_MAX_TRADES_PER_RUN if paper else MAX_TRADES_PER_RUN
     log(f"  Max trades/run:  {effective_max_trades_per_run}")
+    if strategy_v1_requested:
+        log(f"  Max buys/market: {get_strategy_max_buys_per_market()}")
     log(f"  Loop interval:   {WEATHER_BOT_LOOP_SECONDS}s")
     if paper:
         log(f"  Exit check:      {WEATHER_BOT_EXIT_CHECK_SECONDS}s (open positions only)")
