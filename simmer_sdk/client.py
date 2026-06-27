@@ -210,6 +210,8 @@ class SimmerClient:
         self._held_markets_cache: Optional[dict] = None  # {market_id: [source_tags]}
         self._held_markets_ts: float = 0  # Cache timestamp
         self._clob_client = None  # Cached ClobClient for local CLOB operations
+        self._polymarket_signature_type = self._read_polymarket_signature_type()
+        self._polymarket_funder_address: Optional[str] = None
 
         # EVM key: Use provided private_key, or auto-detect from environment
         # Check WALLET_PRIVATE_KEY first, fall back to deprecated SIMMER_PRIVATE_KEY
@@ -299,6 +301,38 @@ class SimmerClient:
                 self._process_risk_alerts()
             except Exception as e:
                 logger.warning("Risk alert check failed: %s", e)
+
+    def _read_polymarket_signature_type(self) -> int:
+        raw = os.environ.get("POLYMARKET_CLOB_SIGNATURE_TYPE", "0").strip()
+        try:
+            signature_type = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid POLYMARKET_CLOB_SIGNATURE_TYPE=%r; using 0", raw)
+            return 0
+        if signature_type not in (0, 1, 2):
+            logger.warning("Invalid POLYMARKET_CLOB_SIGNATURE_TYPE=%r; using 0", raw)
+            return 0
+        return signature_type
+
+    def _get_polymarket_funder_address(self) -> str:
+        if self._polymarket_funder_address:
+            return self._polymarket_funder_address
+        funder = (
+            os.environ.get("POLYMARKET_CLOB_FUNDER")
+            or os.environ.get("POLYMARKET_FUNDER_ADDRESS")
+            or os.environ.get("POLYMARKET_PROXY_WALLET")
+            or os.environ.get("POLYMARKET_DEPOSIT_WALLET")
+            or self._wallet_address
+        )
+        self._polymarket_funder_address = funder.strip() if isinstance(funder, str) else funder
+        return self._polymarket_funder_address
+
+    def _polymarket_linked_wallet_candidates(self) -> set[str]:
+        candidates = {
+            self._wallet_address,
+            self._get_polymarket_funder_address(),
+        }
+        return {value.lower() for value in candidates if isinstance(value, str) and value.strip()}
 
     def __repr__(self):
         return f"SimmerClient(venue={self.venue!r}, base_url={self.base_url!r})"
@@ -481,8 +515,8 @@ class SimmerClient:
             host="https://clob.polymarket.com",
             key=self._private_key,
             chain_id=137,
-            signature_type=0,
-            funder=self._wallet_address,
+            signature_type=self._polymarket_signature_type,
+            funder=self._get_polymarket_funder_address(),
         )
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
@@ -519,7 +553,7 @@ class SimmerClient:
             settings = self._request("GET", "/api/sdk/settings")
             linked_address = settings.get("linked_wallet_address") or settings.get("wallet_address")
 
-            if linked_address and linked_address.lower() == self._wallet_address.lower():
+            if linked_address and linked_address.lower() in self._polymarket_linked_wallet_candidates():
                 self._wallet_linked = True
                 logger.debug("Wallet %s already linked", self._wallet_address[:10] + "...")
                 self._ensure_clob_credentials()
@@ -530,7 +564,7 @@ class SimmerClient:
         # Wallet not linked - attempt to link automatically
         print(f"Auto-linking wallet {self._wallet_address[:10]}... to Simmer account...")
         try:
-            result = self.link_wallet(signature_type=0)
+            result = self.link_wallet(signature_type=self._polymarket_signature_type)
             if result.get("success"):
                 self._wallet_linked = True
                 print("Wallet linked successfully")
@@ -586,8 +620,8 @@ class SimmerClient:
                 host="https://clob.polymarket.com",
                 key=self._private_key,
                 chain_id=137,
-                signature_type=0,  # EOA
-                funder=self._wallet_address
+                signature_type=self._polymarket_signature_type,
+                funder=self._get_polymarket_funder_address()
             )
 
             creds = client.create_or_derive_api_creds()
@@ -2266,7 +2300,8 @@ class SimmerClient:
             price=price,
             size=size,
             neg_risk=neg_risk,
-            signature_type=0,  # EOA
+            signature_type=self._polymarket_signature_type,
+            funder_address=self._get_polymarket_funder_address(),
             tick_size=tick_size,
             fee_rate_bps=fee_rate_bps,
             order_type=order_type,
@@ -2512,6 +2547,7 @@ class SimmerClient:
         signature = sign_message(self._private_key, message)
 
         # Step 3: Submit signed challenge
+        funder_address = self._get_polymarket_funder_address()
         result = self._request(
             "POST",
             "/api/sdk/wallet/link",
@@ -2519,7 +2555,9 @@ class SimmerClient:
                 "address": self._wallet_address,
                 "signature": signature,
                 "nonce": nonce,
-                "signature_type": signature_type
+                "signature_type": signature_type,
+                "funder_address": funder_address,
+                "proxy_wallet_address": funder_address,
             }
         )
 

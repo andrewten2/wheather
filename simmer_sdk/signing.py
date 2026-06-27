@@ -8,7 +8,7 @@ SECURITY NOTE: The private key should NEVER be logged, transmitted, or stored
 outside of memory. It is only used for signing operations.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
 # Polymarket token/USDC decimals (1 share = 1e6 raw units, 1 USDC = 1e6 raw units)
@@ -69,6 +69,7 @@ def build_and_sign_order(
     size: float,
     neg_risk: bool = False,
     signature_type: int = 0,  # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
+    funder_address: Optional[str] = None,
     tick_size: float = 0.01,
     fee_rate_bps: int = 0,
     order_type: str = "FAK",  # "FAK", "FOK", "GTC", "GTD"
@@ -86,6 +87,7 @@ def build_and_sign_order(
         size: Number of shares to trade
         neg_risk: Whether this is a neg-risk market
         signature_type: Signature type (0=EOA default)
+        funder_address: Polymarket maker/funder address for proxy wallets
         tick_size: Market tick size (e.g., 0.01 or 0.001)
 
     Returns:
@@ -154,10 +156,11 @@ def build_and_sign_order(
     # Map signature type
     sig_type_map = {0: EOA, 1: POLY_PROXY, 2: GNOSIS_SAFE}
     sig_type = sig_type_map.get(signature_type, EOA)
+    maker_address = funder_address or wallet_address
 
     # Build OrderData
     data = OrderData(
-        maker=wallet_address,
+        maker=maker_address,
         taker=ZERO_ADDRESS,
         tokenId=token_id,
         makerAmount=str(maker_raw),
