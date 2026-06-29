@@ -22,6 +22,7 @@ import sys
 import re
 import json
 import argparse
+import gc
 import time
 import math
 import traceback
@@ -199,6 +200,7 @@ WEATHER_BOT_EXIT_CHECK_SECONDS = _get_positive_int_env("WEATHER_BOT_EXIT_CHECK_S
 FORECAST_CACHE_TTL_SECONDS = _get_positive_int_env("FORECAST_CACHE_TTL_SECONDS", 300)
 LIVE_ENTRY_ORDER_TTL_SECONDS = _get_non_negative_int_env("WEATHER_BOT_LIVE_ORDER_TTL_SECONDS", 900)
 LIVE_ENTRY_MAX_SPREAD = _get_positive_float_env("WEATHER_BOT_LIVE_MAX_ENTRY_SPREAD", 0.03)
+MAX_CLOB_BOOK_LEVELS = _get_positive_int_env("WEATHER_BOT_CLOB_BOOK_LEVELS", 20)
 
 # SDK adapter / execution singletons
 _adapter = None
@@ -213,6 +215,49 @@ _weather_markets_cache = {}
 _clob_orderbook_cache = {}
 _market_clob_token_cache = {}
 _live_open_order_market_ids_cache = (datetime.min.replace(tzinfo=timezone.utc), set())
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prune_ttl_cache(cache: dict, ttl_seconds: int, *, now: datetime = None, max_items: int = None) -> None:
+    """Drop expired entries from small in-process caches used by long live loops."""
+    if not isinstance(cache, dict) or not cache:
+        return
+    now = now or datetime.now(timezone.utc)
+    stale_keys = []
+    for key, value in list(cache.items()):
+        fetched_at = value[0] if isinstance(value, tuple) and value else None
+        if not isinstance(fetched_at, datetime):
+            continue
+        if (now - fetched_at).total_seconds() > ttl_seconds:
+            stale_keys.append(key)
+    for key in stale_keys:
+        cache.pop(key, None)
+    if max_items and len(cache) > max_items:
+        dated_items = [
+            (value[0], key)
+            for key, value in cache.items()
+            if isinstance(value, tuple) and value and isinstance(value[0], datetime)
+        ]
+        dated_items.sort()
+        for _, key in dated_items[: max(0, len(cache) - max_items)]:
+            cache.pop(key, None)
+
+
+def cleanup_long_running_cycle_memory() -> None:
+    """Keep the 24/7 live process from retaining stale market/orderbook data."""
+    now = datetime.now(timezone.utc)
+    _prune_ttl_cache(_weather_markets_cache, 60, now=now, max_items=4)
+    _prune_ttl_cache(_clob_orderbook_cache, 60, now=now, max_items=256)
+    _prune_ttl_cache(_market_clob_token_cache, 1800, now=now, max_items=512)
+    if len(_actual_temperature_cache) > 512:
+        _actual_temperature_cache.clear()
+    gc.collect()
 
 BASELINE_STRATEGY_ID = "baseline"
 ACTIVE_STRATEGY_ID = BASELINE_STRATEGY_ID
@@ -2653,6 +2698,8 @@ def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
     asks = _book_levels(result.get("asks", []), reverse=False)
     if not bids or not asks:
         return None
+    bids = bids[:MAX_CLOB_BOOK_LEVELS]
+    asks = asks[:MAX_CLOB_BOOK_LEVELS]
 
     best_bid = bids[0][0]
     best_ask = asks[0][0]
@@ -2669,6 +2716,7 @@ def fetch_orderbook_summary(token_id: str) -> Optional[dict]:
         "ask_depth_usd": sum(price * size for price, size in asks[:5]),
     }
     _clob_orderbook_cache[cache_key] = (datetime.now(timezone.utc), summary)
+    _prune_ttl_cache(_clob_orderbook_cache, 60, max_items=256)
     return summary
 
 
@@ -2734,6 +2782,7 @@ def _fetch_market_clob_tokens(market_id: str) -> Optional[dict]:
     }
     if tokens.get("yes") or tokens.get("no"):
         _market_clob_token_cache[str(market_id)] = (datetime.now(timezone.utc), tokens)
+        _prune_ttl_cache(_market_clob_token_cache, 1800, max_items=512)
         return tokens
     return None
 
@@ -5689,6 +5738,8 @@ def guarded_cycle_call(fn, *args, **kwargs):
         print(f"⚠️  Cycle error in {getattr(fn, '__name__', 'call')}: {exc}")
         time.sleep(5)
         return None
+    finally:
+        cleanup_long_running_cycle_memory()
 
 
 def run_strategy_suite(args):
@@ -5873,7 +5924,7 @@ if __name__ == "__main__":
         "paper": args.paper,
         "record_dataset": args.record_dataset,
         "dataset_output": args.dataset_output,
-        "skip_discovery": False,
+        "skip_discovery": _env_flag_enabled("WEATHER_BOT_SKIP_DISCOVERY", False),
     }
 
     if args.paper and not args.positions and not args.config:
