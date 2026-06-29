@@ -31,5 +31,4 @@ source venv/bin/activate
 exec python3 skills/polymarket-weather-trader/weather_trader.py \
   --live \
   --live-loop \
-  --strategy "${LIVE_STRATEGY}" \
-  --record-dataset
+  --strategy "${LIVE_STRATEGY}"
