@@ -4609,6 +4609,39 @@ def check_exit_opportunities(
             else:
                 error = result.get("error", "Unknown error")
                 print(f"     ❌ Sell failed: {error}")
+                if (
+                    execution_mode == ExecutionMode.LIVE_ENABLED
+                    and "market is resolved" in str(error).lower()
+                ):
+                    try:
+                        redeem_result = get_adapter(live=True).get_client().redeem(
+                            market_id,
+                            position_side,
+                        )
+                    except Exception as exc:
+                        redeem_result = {"success": False, "error": str(exc)}
+                    if redeem_result.get("success"):
+                        exits_executed += 1
+                        redeem_price = 1.0 if current_price >= 0.99 else current_price
+                        tx_hash = redeem_result.get("tx_hash") or redeem_result.get("transaction_hash")
+                        print(
+                            f"     ✅ Redeemed resolved {position_side.upper()} position"
+                            f"{f' ({tx_hash})' if tx_hash else ''}"
+                        )
+                        record_live_sell(
+                            market_id=market_id,
+                            side=position_side,
+                            shares=shares_to_sell,
+                            exit_price=redeem_price,
+                            question=stored_question,
+                            exit_reason="market_redeem",
+                            partial_exit=False,
+                            runner_after_partial_exit=False,
+                            trade_id=tx_hash,
+                            order_status="redeemed",
+                        )
+                    else:
+                        print(f"     ❌ Redeem failed: {redeem_result.get('error', redeem_result)}")
         else:
             print(f"  📊 {question}...")
             if hold_runner_to_settlement:

@@ -212,6 +212,8 @@ class SimmerClient:
         self._clob_client = None  # Cached ClobClient for local CLOB operations
         self._polymarket_signature_type = self._read_polymarket_signature_type()
         self._polymarket_funder_address: Optional[str] = None
+        self._uses_deposit_wallet: bool = False
+        self._deposit_wallet_address: Optional[str] = None
 
         # EVM key: Use provided private_key, or auto-detect from environment
         # Check WALLET_PRIVATE_KEY first, fall back to deprecated SIMMER_PRIVATE_KEY
@@ -309,7 +311,7 @@ class SimmerClient:
         except (TypeError, ValueError):
             logger.warning("Invalid POLYMARKET_CLOB_SIGNATURE_TYPE=%r; using 0", raw)
             return 0
-        if signature_type not in (0, 1, 2):
+        if signature_type not in (0, 1, 2, 3):
             logger.warning("Invalid POLYMARKET_CLOB_SIGNATURE_TYPE=%r; using 0", raw)
             return 0
         return signature_type
@@ -515,8 +517,8 @@ class SimmerClient:
             host="https://clob.polymarket.com",
             key=self._private_key,
             chain_id=137,
-            signature_type=self._polymarket_signature_type,
-            funder=self._get_polymarket_funder_address(),
+            signature_type=0,
+            funder=self._wallet_address,
         )
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
@@ -552,8 +554,13 @@ class SimmerClient:
         try:
             settings = self._request("GET", "/api/sdk/settings")
             linked_address = settings.get("linked_wallet_address") or settings.get("wallet_address")
+            self._uses_deposit_wallet = bool(settings.get("wallet_uses_deposit_wallet", False))
+            self._deposit_wallet_address = settings.get("deposit_wallet_address")
+            linked_candidates = {self._wallet_address.lower()}
+            if self._uses_deposit_wallet and self._deposit_wallet_address:
+                linked_candidates.add(self._deposit_wallet_address.lower())
 
-            if linked_address and linked_address.lower() in self._polymarket_linked_wallet_candidates():
+            if linked_address and linked_address.lower() in linked_candidates:
                 self._wallet_linked = True
                 logger.debug("Wallet %s already linked", self._wallet_address[:10] + "...")
                 self._ensure_clob_credentials()
@@ -564,7 +571,7 @@ class SimmerClient:
         # Wallet not linked - attempt to link automatically
         print(f"Auto-linking wallet {self._wallet_address[:10]}... to Simmer account...")
         try:
-            result = self.link_wallet(signature_type=self._polymarket_signature_type)
+            result = self.link_wallet(signature_type=0)
             if result.get("success"):
                 self._wallet_linked = True
                 print("Wallet linked successfully")
@@ -620,8 +627,8 @@ class SimmerClient:
                 host="https://clob.polymarket.com",
                 key=self._private_key,
                 chain_id=137,
-                signature_type=self._polymarket_signature_type,
-                funder=self._get_polymarket_funder_address()
+                signature_type=0,
+                funder=self._wallet_address,
             )
 
             creds = client.create_or_derive_api_creds()
@@ -2291,6 +2298,27 @@ class SimmerClient:
         tick_size = market_data.get("tick_size", 0.01)
         fee_rate_bps = market_data.get("fee_rate_bps", 0)
 
+        # V2 CLOB uses only EOA (0) or deposit-wallet POLY_1271 (3).
+        # Do not infer DW mode from old POLY_PROXY env vars alone: the Simmer
+        # backend must know the deposit wallet too, otherwise its security
+        # check rejects the order maker as "not linked".
+        uses_deposit_wallet = bool(self._uses_deposit_wallet and self._deposit_wallet_address)
+        if not uses_deposit_wallet and self._polymarket_signature_type == 3:
+            funder_address = self._get_polymarket_funder_address()
+            uses_deposit_wallet = bool(
+                isinstance(funder_address, str)
+                and isinstance(self._wallet_address, str)
+                and funder_address.lower() != self._wallet_address.lower()
+            )
+            self._deposit_wallet_address = funder_address if uses_deposit_wallet else None
+
+        order_signature_type = 3 if uses_deposit_wallet else 0
+        deposit_wallet_address = self._deposit_wallet_address if uses_deposit_wallet else None
+
+        # For V2 FAK/FOK BUY, pass the original USDC amount so the V2 market
+        # order builder rounds maker dollars, not derived size*price drift.
+        amount_usdc = float(amount) if (not is_sell and amount > 0) else None
+
         # Build and sign the order
         signed = build_and_sign_order(
             private_key=self._private_key,
@@ -2300,12 +2328,12 @@ class SimmerClient:
             price=price,
             size=size,
             neg_risk=neg_risk,
-            signature_type=self._polymarket_signature_type,
-            funder_address=self._get_polymarket_funder_address(),
+            signature_type=order_signature_type,
             tick_size=tick_size,
             fee_rate_bps=fee_rate_bps,
             order_type=order_type,
-            action=action,
+            amount_usdc=amount_usdc,
+            deposit_wallet_address=deposit_wallet_address,
         )
 
         return signed.to_dict()
