@@ -321,6 +321,7 @@ STRATEGY_VARIANTS = {
         "mid_yes_max_price": 0.20,
         "exact_yes_min_price": 0.12,
         "exact_mid_yes_max_price": 0.20,
+        "block_event_reentry_after_any_trade": True,
     },
     "quality_mid_yes_safe_no_aggressive": {
         "label": "Quality Mid YES + Safe NO Aggressive",
@@ -338,6 +339,7 @@ STRATEGY_VARIANTS = {
         "exact_mid_yes_max_price": 0.25,
         "yes_take_profit_pct": 0.30,
         "max_buys_per_market": 2,
+        "block_event_reentry_after_any_trade": True,
     },
     "no_reentry_watchlist": {
         "label": "No Reentry Watchlist",
@@ -565,6 +567,28 @@ def live_last_exit_reason(market_id: str) -> Optional[str]:
 def live_last_exit_time(market_id: str) -> Optional[str]:
     last_exit = load_live_strategy_state().get("last_exits", {}).get(market_id) or {}
     return last_exit.get("timestamp")
+
+
+def live_last_trade_for_markets(market_ids: set[str]) -> Optional[dict]:
+    """Return the most recent recorded live trade among a set of event markets."""
+    if not market_ids:
+        return None
+    state = load_live_strategy_state()
+    best = None
+    best_dt = None
+    for trade in state.get("trades", []) or []:
+        if not isinstance(trade, dict):
+            continue
+        market_id = trade.get("market_id")
+        if market_id not in market_ids:
+            continue
+        trade_dt = _parse_live_state_timestamp(trade.get("timestamp"))
+        if trade_dt is None:
+            trade_dt = datetime.min.replace(tzinfo=timezone.utc)
+        if best is None or trade_dt > best_dt:
+            best = dict(trade)
+            best_dt = trade_dt
+    return best
 
 
 def _order_field(order: dict, *names: str):
@@ -1264,6 +1288,8 @@ def log_strategy_v1_decision(
     event_open_position_exists: bool = None,
     event_open_order_exists: bool = None,
     blocking_market_id: str = None,
+    last_trade_action: str = None,
+    last_trade_at: str = None,
 ) -> None:
     bucket_type = getattr(candidate.bucket, "bucket_type", None) if candidate and candidate.bucket else None
     logger.event(
@@ -1291,6 +1317,8 @@ def log_strategy_v1_decision(
         event_open_position_exists=event_open_position_exists,
         event_open_order_exists=event_open_order_exists,
         blocking_market_id=blocking_market_id,
+        last_trade_action=last_trade_action,
+        last_trade_at=last_trade_at,
     )
 
 
@@ -1691,6 +1719,18 @@ def live_buy_count_for_market(market_id: str) -> int:
     return count
 
 
+def _parse_live_state_timestamp(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def _apply_strategy_v1_rebuy_guard(
     entry: dict,
     selected_side: str,
@@ -1972,6 +2012,30 @@ def select_strategy_v1_event_trade(
             for item in ranked_candidates
             if item.get("candidate") is not None and getattr(item["candidate"], "market_id", None)
         }
+        strategy_config = get_active_strategy_config()
+        if strategy_config.get("block_event_reentry_after_any_trade"):
+            event_last_trade = live_last_trade_for_markets(event_market_ids)
+            if event_last_trade is not None:
+                first = ranked_candidates[0]
+                return {
+                    "action": "skip",
+                    "reason": "event_blocked_after_trade",
+                    "mode": regime_mode,
+                    "forecast_fresh": forecast_fresh,
+                    "candidate": first["candidate"],
+                    "probability_estimate": first["probability_estimate"],
+                    "bucket_relation": first["bucket_relation"],
+                    "price_yes": first["yes_price"],
+                    "gaussian_probability": first["gaussian_probability"],
+                    "edge_yes": first["edge_yes"],
+                    "edge_no": first["edge_no"],
+                    "entry_bucket_relation": first.get("entry_bucket_relation"),
+                    "event_open_position_exists": False,
+                    "event_open_order_exists": False,
+                    "blocking_market_id": event_last_trade.get("market_id"),
+                    "last_trade_action": event_last_trade.get("action"),
+                    "last_trade_at": event_last_trade.get("timestamp"),
+                }
         live_positions_by_market = live_positions_by_market or {}
         blocking_position = next(
             (
@@ -4814,9 +4878,9 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
 
     log(f"\n⚙️  Configuration:")
+    active_strategy_config = get_active_strategy_config()
     log(f"  Entry threshold: {ENTRY_THRESHOLD:.0%} (buy below this)")
     if strategy_v1_requested:
-        active_strategy_config = get_active_strategy_config()
         yes_tp_pct = float(active_strategy_config.get("yes_take_profit_pct", STRATEGY_V1_YES_TAKE_PROFIT_PCT))
         early_stop_pct = float(active_strategy_config.get("early_yes_stop_loss_pct", STRATEGY_V1_YES_STOP_LOSS_PCT))
         log(f"  Exit rules:      YES +{yes_tp_pct:.0%} / -{STRATEGY_V1_YES_STOP_LOSS_PCT:.0%}, EARLY YES -{early_stop_pct:.0%}, NO @0.98 / -0.10")
@@ -4855,7 +4919,6 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         if direct_polymarket_paper_enabled():
             log("  Price source:    direct Polymarket CLOB bids")
     log(f"  Forecast TTL:    {FORECAST_CACHE_TTL_SECONDS}s")
-    active_strategy_config = get_active_strategy_config()
     allowed_strategy_cities = active_strategy_config.get("allowed_cities")
     locations_label = sorted(allowed_strategy_cities) if allowed_strategy_cities else ACTIVE_LOCATIONS
     log(f"  Locations:       {', '.join(locations_label)}")
@@ -5296,6 +5359,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 event_open_position_exists=strategy_v1_decision.get("event_open_position_exists"),
                 event_open_order_exists=strategy_v1_decision.get("event_open_order_exists"),
                 blocking_market_id=strategy_v1_decision.get("blocking_market_id"),
+                last_trade_action=strategy_v1_decision.get("last_trade_action"),
+                last_trade_at=strategy_v1_decision.get("last_trade_at"),
             )
 
         should_trade = False
