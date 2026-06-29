@@ -5525,7 +5525,6 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             )
 
             if result.get("success"):
-                trades_executed += 1
                 try:
                     shares = float(result.get("shares_bought") or result.get("shares") or 0)
                 except (TypeError, ValueError):
@@ -5543,12 +5542,27 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 spent_for_summary = fill_cost_usd
                 if spent_for_summary is None:
                     spent_for_summary = 0.0 if result.get("is_submitted_only") else position_size
-                total_usd_spent += spent_for_summary
-                log(
-                    f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {selected_side.upper()} "
-                    f"{shares:.1f} shares @ ${fill_entry_price:.4f}",
-                    force=True,
-                )
+                has_filled_shares = shares > 0
+                if has_filled_shares:
+                    trades_executed += 1
+                    total_usd_spent += spent_for_summary
+                    log(
+                        f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {selected_side.upper()} "
+                        f"{shares:.1f} shares @ ${fill_entry_price:.4f}",
+                        force=True,
+                    )
+                elif result.get("is_submitted_only"):
+                    log(
+                        f"  📬 Submitted {selected_side.upper()} bid @ ${fill_entry_price:.4f}; "
+                        "0.0 shares filled yet",
+                        force=True,
+                    )
+                else:
+                    log(
+                        f"  ⚠️  Buy returned success but filled 0.0 {selected_side.upper()} shares; "
+                        "not counting as a trade",
+                        force=True,
+                    )
                 if execution_mode == ExecutionMode.LIVE_ENABLED:
                     if shares > 0:
                         if result.get("is_submitted_only"):
@@ -5585,7 +5599,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                         log("  ⚠️  Live buy returned success but no filled shares; local live state was not updated.", force=True)
 
                 # Log trade context for journal (skip for paper trades)
-                if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
+                if has_filled_shares and trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
                     # Confidence based on price gap from threshold (guard against div by zero)
                     if ENTRY_THRESHOLD > 0:
                         confidence = min(0.95, (ENTRY_THRESHOLD - price) / ENTRY_THRESHOLD + 0.5)
