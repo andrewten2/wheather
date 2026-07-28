@@ -25,7 +25,6 @@ import argparse
 import gc
 import time
 import math
-import subprocess
 import traceback
 from pathlib import Path
 from dataclasses import asdict
@@ -5842,81 +5841,48 @@ def guarded_cycle_call(fn, *args, **kwargs):
         cleanup_long_running_cycle_memory()
 
 
-def _strategy_suite_child_command(strategy_id: str, args, *, exit_only: bool = False) -> list[str]:
-    """Build an isolated one-shot paper command for a strategy-suite variant."""
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--paper",
-        "--strategy",
-        strategy_id,
-    ]
-    if exit_only:
-        command.append("--paper-exit-cycle")
-    elif args.positions or args.config:
-        # These modes already perform one run and exit; preserve their CLI behavior.
-        if args.positions:
-            command.append("--positions")
-        if args.config:
-            command.append("--config")
-    else:
-        command.append("--paper-cycle")
-    if args.no_safeguards:
-        command.append("--no-safeguards")
-    if args.no_trends:
-        command.append("--no-trends")
-    if args.quiet:
-        command.append("--quiet")
-    if args.smart_sizing and not exit_only:
-        command.append("--smart-sizing")
-    if args.vol_targeting and not exit_only:
-        command.append("--vol-targeting")
-    return command
-
-
-def _run_strategy_suite_child(
-    strategy_id: str,
-    args,
-    *,
-    exit_only: bool = False,
-    record_dataset: bool = False,
-    skip_discovery: bool = False,
-) -> None:
-    """Run one variant out-of-process so its market data is released on exit."""
-    command = _strategy_suite_child_command(strategy_id, args, exit_only=exit_only)
-    if record_dataset and not exit_only:
-        command.append("--record-dataset")
-        if args.dataset_output:
-            command.extend(["--dataset-output", args.dataset_output])
-    child_env = None
-    if skip_discovery:
-        child_env = os.environ.copy()
-        child_env["WEATHER_BOT_SKIP_DISCOVERY"] = "1"
-    result = subprocess.run(command, check=False, env=child_env)
-    if result.returncode:
-        raise RuntimeError(f"paper child exited with status {result.returncode}")
+def cleanup_strategy_suite_variant_memory(strategy_id: str) -> None:
+    """Release per-strategy state while retaining shared market and forecast caches."""
+    _paper_traders.pop(strategy_id, None)
+    for key in [key for key in _execution_engines if key[0] == strategy_id]:
+        _execution_engines.pop(key, None)
+    gc.collect()
 
 
 def run_strategy_suite(args):
-    """Run paper variants in isolated processes to avoid cumulative RSS growth."""
+    """Run all paper variants with shared market/forecast caches and bounded state."""
     failed_strategies = []
     for index, strategy_id in enumerate(STRATEGY_VARIANTS):
+        set_active_strategy(strategy_id)
         variant = STRATEGY_VARIANTS[strategy_id]
         print("\n" + "=" * 72)
         print(f"🧪 Strategy suite: {strategy_id} ({variant.get('label', strategy_id)})")
         print(f"   state: {get_strategy_state_dir(strategy_id) / 'state.json'}")
         try:
-            exit_only = not strategy_suite_entries_enabled(strategy_id)
-            if exit_only:
+            if not strategy_suite_entries_enabled(strategy_id):
                 print(f"   new entries: disabled ({variant.get('disabled_reason', 'disabled')}); running exits only")
-            _run_strategy_suite_child(
-                strategy_id,
-                args,
-                exit_only=exit_only,
+                run_paper_exit_check_cycle(
+                    dry_run=False,
+                    use_safeguards=not args.no_safeguards,
+                    quiet=args.quiet,
+                )
+                print(f"✅ Strategy suite exits completed: {strategy_id}")
+                continue
+            run_weather_strategy(
+                dry_run=False,
+                positions_only=args.positions,
+                show_config=args.config,
+                smart_sizing=args.smart_sizing,
+                use_safeguards=not args.no_safeguards,
+                use_trends=not args.no_trends,
+                quiet=args.quiet,
+                vol_targeting=args.vol_targeting or VOL_TARGETING,
+                paper=True,
                 record_dataset=args.record_dataset and index == 0,
+                dataset_output=args.dataset_output,
                 skip_discovery=index > 0,
             )
-            print(f"✅ Strategy suite {'exits ' if exit_only else ''}completed: {strategy_id}")
+            print(f"✅ Strategy suite completed: {strategy_id}")
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -5924,17 +5890,26 @@ def run_strategy_suite(args):
             print(f"❌ Strategy suite failed: {strategy_id}: {exc}")
             traceback.print_exc()
             continue
+        finally:
+            cleanup_strategy_suite_variant_memory(strategy_id)
     if failed_strategies:
         print(f"⚠️  Strategy suite cycle completed with failures: {', '.join(failed_strategies)}")
 
 
 def run_strategy_suite_exit_check_cycle(args):
-    """Run isolated lightweight exit checks for every paper strategy variant."""
+    """Run lightweight exit checks while releasing each strategy's transient state."""
     for strategy_id in STRATEGY_VARIANTS:
+        set_active_strategy(strategy_id)
         try:
-            _run_strategy_suite_child(strategy_id, args, exit_only=True)
+            run_paper_exit_check_cycle(
+                dry_run=False,
+                use_safeguards=not args.no_safeguards,
+                quiet=args.quiet,
+            )
         except Exception as exc:
             print(f"⚠️  Strategy suite exit check failed: {strategy_id}: {exc}")
+        finally:
+            cleanup_strategy_suite_variant_memory(strategy_id)
 
 
 # =============================================================================
@@ -5951,10 +5926,6 @@ if __name__ == "__main__":
                         help="Paper strategy variant/state to run")
     parser.add_argument("--strategy-suite", action="store_true",
                         help="Run all paper strategy variants with separate state files")
-    parser.add_argument("--paper-cycle", action="store_true",
-                        help="Run one paper strategy cycle then exit (used internally by --strategy-suite)")
-    parser.add_argument("--paper-exit-cycle", action="store_true",
-                        help="Run one paper exit-check cycle then exit (used internally by --strategy-suite)")
     parser.add_argument("--backtest-file", help="Run a deterministic backtest from a local JSON dataset")
     parser.add_argument("--compare-models", action="store_true", help="Run a side-by-side model comparison on a backtest dataset")
     parser.add_argument("--experiment-config", help="JSON experiment config file for model comparison runs")
@@ -6011,35 +5982,6 @@ if __name__ == "__main__":
             globals()["_strategy_v1_probability_model"] = None
 
     set_active_strategy(args.strategy)
-
-    if args.paper_cycle or args.paper_exit_cycle:
-        if not args.paper or args.strategy_suite or (args.paper_cycle and args.paper_exit_cycle):
-            print("Error: --paper-cycle and --paper-exit-cycle require exactly one --paper strategy")
-            sys.exit(1)
-        if args.paper_exit_cycle:
-            guarded_cycle_call(
-                run_paper_exit_check_cycle,
-                dry_run=False,
-                use_safeguards=not args.no_safeguards,
-                quiet=args.quiet,
-            )
-        else:
-            guarded_cycle_call(
-                run_weather_strategy,
-                dry_run=False,
-                positions_only=False,
-                show_config=False,
-                smart_sizing=args.smart_sizing,
-                use_safeguards=not args.no_safeguards,
-                use_trends=not args.no_trends,
-                quiet=args.quiet,
-                vol_targeting=args.vol_targeting or VOL_TARGETING,
-                paper=True,
-                record_dataset=args.record_dataset,
-                dataset_output=args.dataset_output,
-                skip_discovery=_env_flag_enabled("WEATHER_BOT_SKIP_DISCOVERY", False),
-            )
-        sys.exit(0)
 
     if args.strategy_suite:
         if not args.paper:
