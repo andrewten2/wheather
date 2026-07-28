@@ -25,6 +25,7 @@ import argparse
 import gc
 import time
 import math
+import subprocess
 import traceback
 from pathlib import Path
 from dataclasses import asdict
@@ -339,6 +340,8 @@ STRATEGY_VARIANTS = {
         "exact_mid_yes_max_price": 0.25,
         "yes_take_profit_pct": 0.30,
         "max_buys_per_market": 2,
+        "no_min_entry_price": 0.88,
+        "no_max_entry_price": 0.94,
         "block_event_reentry_after_any_trade": True,
     },
     "no_reentry_watchlist": {
@@ -1240,11 +1243,25 @@ def no_entry_price_block_reason(no_price: Optional[float]) -> Optional[str]:
         price = float(no_price)
     except (TypeError, ValueError):
         return "no_entry_price_invalid"
-    if price < STRATEGY_V1_NO_MIN_ENTRY_PRICE:
+    no_min_entry_price, no_max_entry_price = get_strategy_no_entry_price_range()
+    if price < no_min_entry_price:
         return "no_entry_price_below_min"
-    if price > STRATEGY_V1_NO_MAX_ENTRY_PRICE:
+    if price > no_max_entry_price:
         return "no_entry_price_above_max"
     return None
+
+
+def get_strategy_no_entry_price_range() -> tuple[float, float]:
+    strategy_config = get_active_strategy_config()
+    try:
+        no_min_entry_price = float(strategy_config.get("no_min_entry_price", STRATEGY_V1_NO_MIN_ENTRY_PRICE))
+    except (TypeError, ValueError):
+        no_min_entry_price = STRATEGY_V1_NO_MIN_ENTRY_PRICE
+    try:
+        no_max_entry_price = float(strategy_config.get("no_max_entry_price", STRATEGY_V1_NO_MAX_ENTRY_PRICE))
+    except (TypeError, ValueError):
+        no_max_entry_price = STRATEGY_V1_NO_MAX_ENTRY_PRICE
+    return no_min_entry_price, no_max_entry_price
 
 
 def entry_price_block_reason(side: str, current_side_price: Optional[float]) -> Optional[str]:
@@ -2234,15 +2251,16 @@ def select_strategy_v1_event_trade(
         has_far_bucket = False
         has_no_below_min = False
         has_no_above_max = False
+        no_min_entry_price, no_max_entry_price = get_strategy_no_entry_price_range()
         for item in ranked_candidates:
             relation = item["bucket_relation"]
             if relation not in {"far", "almost_impossible"}:
                 continue
             has_far_bucket = True
-            if item["no_price"] < STRATEGY_V1_NO_MIN_ENTRY_PRICE:
+            if item["no_price"] < no_min_entry_price:
                 has_no_below_min = True
                 continue
-            if item["no_price"] > STRATEGY_V1_NO_MAX_ENTRY_PRICE:
+            if item["no_price"] > no_max_entry_price:
                 has_no_above_max = True
                 continue
             max_probability = (
@@ -4806,6 +4824,7 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
         disabled_entry_reasons = active_strategy_config.get("disabled_entry_reasons")
         allowed_entry_reasons = active_strategy_config.get("allowed_entry_reasons")
         allowed_side_cities = active_strategy_config.get("allowed_side_cities")
+        no_min_entry_price, no_max_entry_price = get_strategy_no_entry_price_range()
         if paper:
             log("\n  [PAPER MODE] Trades will be simulated and persisted to the paper ledger.")
         else:
@@ -4871,8 +4890,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             ),
             late_far_max_probability=STRATEGY_V1_LATE_FAR_MAX_PROBABILITY,
             late_almost_impossible_max_probability=STRATEGY_V1_LATE_ALMOST_IMPOSSIBLE_MAX_PROBABILITY,
-            no_min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
-            no_max_entry_price=STRATEGY_V1_NO_MAX_ENTRY_PRICE,
+            no_min_entry_price=no_min_entry_price,
+            no_max_entry_price=no_max_entry_price,
         )
     elif dry_run:
         log("\n  [PAPER MODE] Trades will be simulated with real prices. Use --live for real trades.")
@@ -4891,12 +4910,13 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
             "  Entry regimes:   early=central±1 YES, mid=strong-edge YES, "
             "late=far NO"
         )
+        no_min_entry_price, no_max_entry_price = get_strategy_no_entry_price_range()
         log(
             "  YES mid price:   "
             f"${float(active_strategy_config.get('mid_yes_min_price', STRATEGY_V1_MID_YES_MIN_PRICE)):.2f}-"
             f"${float(active_strategy_config.get('mid_yes_max_price', STRATEGY_V1_MID_YES_MAX_PRICE)):.2f}"
         )
-        log(f"  NO entry price:  ${STRATEGY_V1_NO_MIN_ENTRY_PRICE:.2f}-${STRATEGY_V1_NO_MAX_ENTRY_PRICE:.2f}")
+        log(f"  NO entry price:  ${no_min_entry_price:.2f}-${no_max_entry_price:.2f}")
         allowed_entry_reasons = active_strategy_config.get("allowed_entry_reasons")
         if allowed_entry_reasons:
             log(f"  Allowed entries: {', '.join(sorted(allowed_entry_reasons))}")
@@ -5394,9 +5414,10 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                 selected_side_price = price
             price_block_reason = entry_price_block_reason(selected_side, selected_side_price)
             if price_block_reason:
+                no_min_entry_price, no_max_entry_price = get_strategy_no_entry_price_range()
                 log(
                     f"  ⏸️  NO entry price guard: ${float(selected_side_price):.4f} outside "
-                    f"${STRATEGY_V1_NO_MIN_ENTRY_PRICE:.2f}-${STRATEGY_V1_NO_MAX_ENTRY_PRICE:.2f}"
+                    f"${no_min_entry_price:.2f}-${no_max_entry_price:.2f}"
                 )
                 if logger is not None:
                     logger.event(
@@ -5407,8 +5428,8 @@ def run_weather_strategy(dry_run: bool = True, positions_only: bool = False,
                         outcome_name=outcome_name,
                         selected_side=str(selected_side or "").lower(),
                         current_side_price=round(float(selected_side_price), 6),
-                        min_entry_price=STRATEGY_V1_NO_MIN_ENTRY_PRICE,
-                        max_entry_price=STRATEGY_V1_NO_MAX_ENTRY_PRICE,
+                        min_entry_price=no_min_entry_price,
+                        max_entry_price=no_max_entry_price,
                         reason=price_block_reason,
                     )
                 skip_reasons.append(price_block_reason)
@@ -5821,40 +5842,81 @@ def guarded_cycle_call(fn, *args, **kwargs):
         cleanup_long_running_cycle_memory()
 
 
+def _strategy_suite_child_command(strategy_id: str, args, *, exit_only: bool = False) -> list[str]:
+    """Build an isolated one-shot paper command for a strategy-suite variant."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--paper",
+        "--strategy",
+        strategy_id,
+    ]
+    if exit_only:
+        command.append("--paper-exit-cycle")
+    elif args.positions or args.config:
+        # These modes already perform one run and exit; preserve their CLI behavior.
+        if args.positions:
+            command.append("--positions")
+        if args.config:
+            command.append("--config")
+    else:
+        command.append("--paper-cycle")
+    if args.no_safeguards:
+        command.append("--no-safeguards")
+    if args.no_trends:
+        command.append("--no-trends")
+    if args.quiet:
+        command.append("--quiet")
+    if args.smart_sizing and not exit_only:
+        command.append("--smart-sizing")
+    if args.vol_targeting and not exit_only:
+        command.append("--vol-targeting")
+    return command
+
+
+def _run_strategy_suite_child(
+    strategy_id: str,
+    args,
+    *,
+    exit_only: bool = False,
+    record_dataset: bool = False,
+    skip_discovery: bool = False,
+) -> None:
+    """Run one variant out-of-process so its market data is released on exit."""
+    command = _strategy_suite_child_command(strategy_id, args, exit_only=exit_only)
+    if record_dataset and not exit_only:
+        command.append("--record-dataset")
+        if args.dataset_output:
+            command.extend(["--dataset-output", args.dataset_output])
+    child_env = None
+    if skip_discovery:
+        child_env = os.environ.copy()
+        child_env["WEATHER_BOT_SKIP_DISCOVERY"] = "1"
+    result = subprocess.run(command, check=False, env=child_env)
+    if result.returncode:
+        raise RuntimeError(f"paper child exited with status {result.returncode}")
+
+
 def run_strategy_suite(args):
-    """Run all configured paper strategy variants with separate ledgers."""
+    """Run paper variants in isolated processes to avoid cumulative RSS growth."""
     failed_strategies = []
     for index, strategy_id in enumerate(STRATEGY_VARIANTS):
-        set_active_strategy(strategy_id)
-        variant = get_active_strategy_config()
+        variant = STRATEGY_VARIANTS[strategy_id]
         print("\n" + "=" * 72)
         print(f"🧪 Strategy suite: {strategy_id} ({variant.get('label', strategy_id)})")
         print(f"   state: {get_strategy_state_dir(strategy_id) / 'state.json'}")
         try:
-            if not strategy_suite_entries_enabled(strategy_id):
+            exit_only = not strategy_suite_entries_enabled(strategy_id)
+            if exit_only:
                 print(f"   new entries: disabled ({variant.get('disabled_reason', 'disabled')}); running exits only")
-                run_paper_exit_check_cycle(
-                    dry_run=False,
-                    use_safeguards=not args.no_safeguards,
-                    quiet=args.quiet,
-                )
-                print(f"✅ Strategy suite exits completed: {strategy_id}")
-                continue
-            run_weather_strategy(
-                dry_run=False,
-                positions_only=args.positions,
-                show_config=args.config,
-                smart_sizing=args.smart_sizing,
-                use_safeguards=not args.no_safeguards,
-                use_trends=not args.no_trends,
-                quiet=args.quiet,
-                vol_targeting=args.vol_targeting or VOL_TARGETING,
-                paper=True,
+            _run_strategy_suite_child(
+                strategy_id,
+                args,
+                exit_only=exit_only,
                 record_dataset=args.record_dataset and index == 0,
-                dataset_output=args.dataset_output,
                 skip_discovery=index > 0,
             )
-            print(f"✅ Strategy suite completed: {strategy_id}")
+            print(f"✅ Strategy suite {'exits ' if exit_only else ''}completed: {strategy_id}")
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -5867,14 +5929,12 @@ def run_strategy_suite(args):
 
 
 def run_strategy_suite_exit_check_cycle(args):
-    """Run lightweight exit checks for every paper strategy variant."""
+    """Run isolated lightweight exit checks for every paper strategy variant."""
     for strategy_id in STRATEGY_VARIANTS:
-        set_active_strategy(strategy_id)
-        run_paper_exit_check_cycle(
-            dry_run=False,
-            use_safeguards=not args.no_safeguards,
-            quiet=args.quiet,
-        )
+        try:
+            _run_strategy_suite_child(strategy_id, args, exit_only=True)
+        except Exception as exc:
+            print(f"⚠️  Strategy suite exit check failed: {strategy_id}: {exc}")
 
 
 # =============================================================================
@@ -5891,6 +5951,10 @@ if __name__ == "__main__":
                         help="Paper strategy variant/state to run")
     parser.add_argument("--strategy-suite", action="store_true",
                         help="Run all paper strategy variants with separate state files")
+    parser.add_argument("--paper-cycle", action="store_true",
+                        help="Run one paper strategy cycle then exit (used internally by --strategy-suite)")
+    parser.add_argument("--paper-exit-cycle", action="store_true",
+                        help="Run one paper exit-check cycle then exit (used internally by --strategy-suite)")
     parser.add_argument("--backtest-file", help="Run a deterministic backtest from a local JSON dataset")
     parser.add_argument("--compare-models", action="store_true", help="Run a side-by-side model comparison on a backtest dataset")
     parser.add_argument("--experiment-config", help="JSON experiment config file for model comparison runs")
@@ -5947,6 +6011,35 @@ if __name__ == "__main__":
             globals()["_strategy_v1_probability_model"] = None
 
     set_active_strategy(args.strategy)
+
+    if args.paper_cycle or args.paper_exit_cycle:
+        if not args.paper or args.strategy_suite or (args.paper_cycle and args.paper_exit_cycle):
+            print("Error: --paper-cycle and --paper-exit-cycle require exactly one --paper strategy")
+            sys.exit(1)
+        if args.paper_exit_cycle:
+            guarded_cycle_call(
+                run_paper_exit_check_cycle,
+                dry_run=False,
+                use_safeguards=not args.no_safeguards,
+                quiet=args.quiet,
+            )
+        else:
+            guarded_cycle_call(
+                run_weather_strategy,
+                dry_run=False,
+                positions_only=False,
+                show_config=False,
+                smart_sizing=args.smart_sizing,
+                use_safeguards=not args.no_safeguards,
+                use_trends=not args.no_trends,
+                quiet=args.quiet,
+                vol_targeting=args.vol_targeting or VOL_TARGETING,
+                paper=True,
+                record_dataset=args.record_dataset,
+                dataset_output=args.dataset_output,
+                skip_discovery=_env_flag_enabled("WEATHER_BOT_SKIP_DISCOVERY", False),
+            )
+        sys.exit(0)
 
     if args.strategy_suite:
         if not args.paper:
