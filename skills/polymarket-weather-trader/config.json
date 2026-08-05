@@ -1,3 +1,4 @@
 {
-  "max_position_usd": 2.0
+  "max_position_usd": 5.0,
+  "locations": "NYC,Chicago,Seattle,Atlanta,Dallas,Miami,Tel Aviv,Munich,London,Tokyo,Seoul,Ankara,Lucknow,Wellington,Austin,Denver,Houston,Los Angeles,San Francisco,Amsterdam,Beijing,Buenos Aires,Busan,Cape Town,Chengdu,Chongqing,Guangzhou,Helsinki,Hong Kong,Istanbul,Jakarta,Jeddah,Karachi,Kuala Lumpur,Lagos,Madrid,Manila,Mexico City,Milan,Moscow,Panama City,Paris,Qingdao,Sao Paulo,Shanghai,Shenzhen,Singapore,Taipei,Toronto,Warsaw,Wuhan"
 }
