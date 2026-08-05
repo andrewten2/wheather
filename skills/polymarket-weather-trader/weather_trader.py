@@ -25,6 +25,7 @@ import argparse
 import gc
 import time
 import math
+import subprocess
 import traceback
 from pathlib import Path
 from dataclasses import asdict
@@ -5849,10 +5850,23 @@ def cleanup_strategy_suite_variant_memory(strategy_id: str) -> None:
     gc.collect()
 
 
-def run_strategy_suite(args):
-    """Run all paper variants with shared market/forecast caches and bounded state."""
+def _strategy_suite_batch_size() -> int:
+    """Keep shared-cache batches below the memory ceiling of small servers."""
+    return min(_get_positive_int_env("WEATHER_BOT_SUITE_BATCH_SIZE", 3), 8)
+
+
+def _parse_strategy_suite_batch(raw: str) -> list[str]:
+    strategy_ids = [item.strip() for item in str(raw or "").split(",") if item.strip()]
+    unknown_ids = [strategy_id for strategy_id in strategy_ids if strategy_id not in STRATEGY_VARIANTS]
+    if not strategy_ids or unknown_ids:
+        raise ValueError(f"Invalid strategy suite batch: {raw}")
+    return strategy_ids
+
+
+def _run_strategy_suite_local(args, strategy_ids: list[str]) -> None:
+    """Run one shared-cache batch; the parent exits after each batch to release RSS."""
     failed_strategies = []
-    for index, strategy_id in enumerate(STRATEGY_VARIANTS):
+    for index, strategy_id in enumerate(strategy_ids):
         set_active_strategy(strategy_id)
         variant = STRATEGY_VARIANTS[strategy_id]
         print("\n" + "=" * 72)
@@ -5896,9 +5910,9 @@ def run_strategy_suite(args):
         print(f"⚠️  Strategy suite cycle completed with failures: {', '.join(failed_strategies)}")
 
 
-def run_strategy_suite_exit_check_cycle(args):
-    """Run lightweight exit checks while releasing each strategy's transient state."""
-    for strategy_id in STRATEGY_VARIANTS:
+def _run_strategy_suite_exit_batch_local(args, strategy_ids: list[str]) -> None:
+    """Run one shared-cache batch of exit checks."""
+    for strategy_id in strategy_ids:
         set_active_strategy(strategy_id)
         try:
             run_paper_exit_check_cycle(
@@ -5910,6 +5924,82 @@ def run_strategy_suite_exit_check_cycle(args):
             print(f"⚠️  Strategy suite exit check failed: {strategy_id}: {exc}")
         finally:
             cleanup_strategy_suite_variant_memory(strategy_id)
+
+
+def _strategy_suite_batch_command(strategy_ids: list[str], args, *, exit_only: bool = False) -> list[str]:
+    """Build a child command that keeps cache sharing within a bounded batch."""
+    option = "--strategy-suite-exit-batch" if exit_only else "--strategy-suite-batch"
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--paper",
+        option,
+        ",".join(strategy_ids),
+    ]
+    if args.no_safeguards:
+        command.append("--no-safeguards")
+    if args.no_trends:
+        command.append("--no-trends")
+    if args.quiet:
+        command.append("--quiet")
+    if args.smart_sizing and not exit_only:
+        command.append("--smart-sizing")
+    if args.vol_targeting and not exit_only:
+        command.append("--vol-targeting")
+    if args.positions and not exit_only:
+        command.append("--positions")
+    if args.config and not exit_only:
+        command.append("--config")
+    return command
+
+
+def _run_strategy_suite_batch_child(
+    strategy_ids: list[str],
+    args,
+    *,
+    exit_only: bool = False,
+    record_dataset: bool = False,
+) -> None:
+    command = _strategy_suite_batch_command(strategy_ids, args, exit_only=exit_only)
+    if record_dataset and not exit_only:
+        command.append("--record-dataset")
+        if args.dataset_output:
+            command.extend(["--dataset-output", args.dataset_output])
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        raise RuntimeError(f"strategy suite batch exited with status {result.returncode}")
+
+
+def run_strategy_suite(args):
+    """Run bounded shared-cache batches so the full suite cannot exhaust memory."""
+    strategy_ids = list(STRATEGY_VARIANTS)
+    batch_size = _strategy_suite_batch_size()
+    for start in range(0, len(strategy_ids), batch_size):
+        batch = strategy_ids[start:start + batch_size]
+        print(f"\n📦 Strategy suite batch {start // batch_size + 1}: {', '.join(batch)}")
+        try:
+            _run_strategy_suite_batch_child(
+                batch,
+                args,
+                record_dataset=args.record_dataset and start == 0,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"❌ Strategy suite batch failed: {', '.join(batch)}: {exc}")
+            traceback.print_exc()
+
+
+def run_strategy_suite_exit_check_cycle(args):
+    """Run bounded shared-cache batches of paper exit checks."""
+    strategy_ids = list(STRATEGY_VARIANTS)
+    batch_size = _strategy_suite_batch_size()
+    for start in range(0, len(strategy_ids), batch_size):
+        batch = strategy_ids[start:start + batch_size]
+        try:
+            _run_strategy_suite_batch_child(batch, args, exit_only=True)
+        except Exception as exc:
+            print(f"⚠️  Strategy suite exit batch failed: {', '.join(batch)}: {exc}")
 
 
 # =============================================================================
@@ -5926,6 +6016,8 @@ if __name__ == "__main__":
                         help="Paper strategy variant/state to run")
     parser.add_argument("--strategy-suite", action="store_true",
                         help="Run all paper strategy variants with separate state files")
+    parser.add_argument("--strategy-suite-batch", help=argparse.SUPPRESS)
+    parser.add_argument("--strategy-suite-exit-batch", help=argparse.SUPPRESS)
     parser.add_argument("--backtest-file", help="Run a deterministic backtest from a local JSON dataset")
     parser.add_argument("--compare-models", action="store_true", help="Run a side-by-side model comparison on a backtest dataset")
     parser.add_argument("--experiment-config", help="JSON experiment config file for model comparison runs")
@@ -5982,6 +6074,26 @@ if __name__ == "__main__":
             globals()["_strategy_v1_probability_model"] = None
 
     set_active_strategy(args.strategy)
+
+    if args.strategy_suite_batch or args.strategy_suite_exit_batch:
+        if not args.paper or args.strategy_suite or (args.strategy_suite_batch and args.strategy_suite_exit_batch):
+            print("Error: strategy suite batch modes require exactly one --paper batch")
+            sys.exit(1)
+        try:
+            if args.strategy_suite_exit_batch:
+                _run_strategy_suite_exit_batch_local(
+                    args,
+                    _parse_strategy_suite_batch(args.strategy_suite_exit_batch),
+                )
+            else:
+                _run_strategy_suite_local(
+                    args,
+                    _parse_strategy_suite_batch(args.strategy_suite_batch),
+                )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        sys.exit(0)
 
     if args.strategy_suite:
         if not args.paper:
